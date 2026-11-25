@@ -91,8 +91,9 @@
 ## Start the sync service again.
 [invoke setup_electric]
 [shell electric]
+  ??[notice] Loaded shape metadata for 1 completed shapes
   # no invalid shapes because the items2 shape wasn't persisted
-  ??[notice] Found 1 existing valid shapes and 0 shapes in an invalid state
+  ??[notice] Refreshing shape metadata: 1 valid shapes, 0 invalid
   ??[notice] Starting replication from postgres
 
 # Client should be able to continue same with old offset or 0_inf offset

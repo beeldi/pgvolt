@@ -9,6 +9,7 @@ defmodule Electric.Shapes.DnfPlan do
   """
 
   alias Electric.Replication.Eval.Decomposer
+  alias Electric.Replication.Eval.Expr
   alias Electric.Replication.Eval.Parser.{Func, Ref, RowExpr}
   alias Electric.Replication.Eval.SqlGenerator
   alias Electric.Utils
@@ -26,6 +27,7 @@ defmodule Electric.Shapes.DnfPlan do
   @type tag_columns :: [String.t()] | {:hash_together, [String.t()]}
 
   @type position_info :: %{
+          optional(:direct_text_pair?) => boolean(),
           ast: term(),
           sql: String.t(),
           subquery?: boolean(),
@@ -62,7 +64,8 @@ defmodule Electric.Shapes.DnfPlan do
   end
 
   defp do_compile(shape) do
-    with {:ok, decomposition} <- Decomposer.decompose(shape.where.eval) do
+    with :ok <- SqlGenerator.validate_collation(shape.where.eval),
+         {:ok, decomposition} <- Decomposer.decompose(shape.where.eval) do
       positions = enrich_positions(decomposition.subexpressions, shape)
 
       case build_dependency_polarities(positions) do
@@ -190,7 +193,7 @@ defmodule Electric.Shapes.DnfPlan do
         selected_columns <>
         " FROM " <>
         Utils.relation_to_sql(dependency.root_table) <>
-        if(dependency.where, do: " WHERE " <> dependency.where.query, else: "")
+        if(dependency.where, do: " WHERE " <> Expr.sql(dependency.where), else: "")
 
     SqlGenerator.to_sql(testexpr) <> " IN (" <> dependency_sql <> ")"
   end

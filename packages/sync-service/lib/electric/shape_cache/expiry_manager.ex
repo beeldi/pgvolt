@@ -9,6 +9,15 @@ defmodule Electric.ShapeCache.ExpiryManager do
 
   @schema NimbleOptions.new!(
             max_shapes: [type: {:or, [:non_neg_integer, nil]}, default: nil],
+            # Removal is a serial fold that holds this process and the shape-db pool for the length of
+            # the list, and a long list is enough to make checkouts start
+            # failing. A store that has had a limit all along only ever exceeds it by a few shapes,
+            # but the first run after a limit is applied to a store already grown past one asks for
+            # the entire excess at once. Draining it over several periods costs time nobody is
+            # waiting on. Between batches the manager does not wait out the period: while the store
+            # is still over its limit and a batch made progress, it queues the next one behind
+            # whatever is already in its mailbox.
+            max_expired_per_run: [type: :pos_integer, default: 1_000],
             period: [type: :non_neg_integer, default: 60_000],
             stack_id: [type: :string, required: true]
           )
@@ -33,10 +42,23 @@ defmodule Electric.ShapeCache.ExpiryManager do
       %{
         stack_id: stack_id,
         max_shapes: Keyword.fetch!(opts, :max_shapes),
-        period: Keyword.fetch!(opts, :period)
+        max_expired_per_run: Keyword.fetch!(opts, :max_expired_per_run),
+        period: Keyword.fetch!(opts, :period),
+        continuing?: false
       }
 
-    if not is_nil(state.max_shapes), do: schedule_next_check(state)
+    case state.max_shapes do
+      nil ->
+        Logger.warning(
+          "Shape expiry is disabled: no shape ceiling is configured, so the store grows without " <>
+            "bound. Nothing reclaims a shape no client has asked for since, and the same unset " <>
+            "ceiling sizes the consumer partitions, so a store that grows large is also the one " <>
+            "sized as though it had not."
+        )
+
+      _ ->
+        schedule_next_check(state)
+    end
 
     {:ok, state}
   end
@@ -46,9 +68,31 @@ defmodule Electric.ShapeCache.ExpiryManager do
   end
 
   def handle_info(:maybe_expire_shapes, state) do
-    maybe_expire_shapes(state)
+    # Schedule before removing: removal stops each consumer serially and one slow batch can hold
+    # this process for minutes. Arming the next check first keeps the cadence tied to the period
+    # instead of the period plus however long the removal took.
     schedule_next_check(state)
-    {:noreply, state}
+    {:noreply, expire_and_continue(state)}
+  end
+
+  def handle_info(:continue_expiring_shapes, state) do
+    {:noreply, expire_and_continue(%{state | continuing?: false})}
+  end
+
+  # One batch is capped, so a store that is far over its limit, or that grows faster than a batch
+  # per period, would stay over it for as long as the manager idled out each period. While it is
+  # still over after a batch that removed something, the next batch is queued straight away. A
+  # batch that removed nothing waits for the period, so the manager cannot spin on candidates it
+  # is unable to expire.
+  defp expire_and_continue(state) do
+    case maybe_expire_shapes(state) do
+      :over_limit when not state.continuing? ->
+        send(self(), :continue_expiring_shapes)
+        %{state | continuing?: true}
+
+      _ ->
+        state
+    end
   end
 
   defp maybe_expire_shapes(%{max_shapes: nil}), do: :ok
@@ -59,7 +103,8 @@ defmodule Electric.ShapeCache.ExpiryManager do
         shape_count = shape_count(state)
 
         if shape_count > max_shapes do
-          expire_shapes(shape_count, state)
+          removed = expire_shapes(shape_count, state)
+          if removed > 0 and shape_count(state) > max_shapes, do: :over_limit, else: :ok
         end
 
       status ->
@@ -71,7 +116,7 @@ defmodule Electric.ShapeCache.ExpiryManager do
   end
 
   defp expire_shapes(shape_count, state) do
-    number_to_expire = shape_count - state.max_shapes
+    number_to_expire = min(shape_count - state.max_shapes, state.max_expired_per_run)
     {handles_to_expire, min_age} = least_recently_used(state, number_to_expire)
 
     Logger.info(
@@ -92,6 +137,10 @@ defmodule Electric.ShapeCache.ExpiryManager do
         Electric.ShapeCache.ShapeCleaner.remove_shapes(state.stack_id, handles_to_expire)
       end
     )
+
+    # Shapes created while the batch ran hold the count where it was, so progress is what this
+    # batch took out, not how far the count moved.
+    Enum.count(handles_to_expire, &(not ShapeStatus.has_shape_handle?(state.stack_id, &1)))
   end
 
   defp least_recently_used(%{stack_id: stack_id}, number_to_expire) do

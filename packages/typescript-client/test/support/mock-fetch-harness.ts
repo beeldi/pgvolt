@@ -110,6 +110,9 @@ export class MockFetchHarness {
         return this.#responses[idx].clone()
       }
       if (this.#fallback) {
+        // Yield a macrotask so an always-responding fallback (a live long-poll) cannot starve
+        // vi.waitFor's timers between poll cycles.
+        await new Promise((resolve) => setTimeout(resolve, 0))
         return this.#fallback(input, init)
       }
       throw new Error(

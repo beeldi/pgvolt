@@ -19,7 +19,10 @@ defmodule Support.IntegrationSetup do
     server can be built with the same router/client configuration
   """
   def with_electric_client(ctx, opts \\ []) do
-    :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 2000)
+    :ok =
+      Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+        timeout: ExUnit.configuration()[:assert_receive_timeout]
+      )
 
     num_clients = Keyword.get(opts, :num_clients, 1)
 

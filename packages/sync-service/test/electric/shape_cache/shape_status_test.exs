@@ -1,5 +1,6 @@
 defmodule Electric.ShapeCache.ShapeStatusTest do
   use ExUnit.Case, async: true
+  use Repatch.ExUnit
 
   alias Electric.ShapeCache.ShapeStatus
   alias Electric.Shapes.Shape
@@ -10,11 +11,10 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
   # Using a real module instead of {Mock.Storage, []} prevents crashes when
   # Repatch cleanup from concurrent async tests removes shared hooks.
   #
-  # NOTE: cleanup_all! uses Process.get to notify the test process. This works
-  # because ShapeStatus.initialize calls it synchronously in the test process.
-  # If that ever changes to a spawned process, switch to an Agent or ETS-based
-  # approach instead.
+  # cleanup_all! notifies the test process during a synchronous refresh.
   defmodule NoopStorage do
+    def get_all_stored_shape_handles(_opts), do: {:ok, MapSet.new()}
+
     def cleanup_all!(_opts) do
       if pid = Process.get(:cleanup_all_test_pid) do
         send(pid, :cleanup_all_called)
@@ -47,9 +47,28 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
     assert [] = ShapeStatus.list_shapes(state)
   end
 
-  test "deletes any orphaned shape data if empty", ctx do
+  test "disabling full transaction provenance invalidates only those persisted shapes", ctx do
+    legacy = shape!()
+    full = %{legacy | source_positions: :full_xid, source_generation: "source-generation-a"}
+    {:ok, state, [legacy_handle, full_handle]} = new_state(ctx, shapes: [legacy, full])
+    ShapeStatus.ShapeDb.mark_snapshot_complete(state, legacy_handle)
+    ShapeStatus.ShapeDb.mark_snapshot_complete(state, full_handle)
+    Electric.StackConfig.put(state, :feature_flags, ["full_xid_source_positions"])
+    assert {:ok, [], 2} = ShapeStatus.ShapeDb.validate_existing_shapes(state)
+    Electric.StackConfig.put(state, :feature_flags, [])
+    assert {:ok, [^full_handle], 1} = ShapeStatus.ShapeDb.validate_existing_shapes(state)
+    assert ShapeStatus.ShapeDb.handle_exists?(state, legacy_handle)
+    refute ShapeStatus.ShapeDb.handle_exists?(state, full_handle)
+    Electric.StackConfig.put(state, :feature_flags, ["full_xid_source_positions"])
+    assert {:ok, [], 1} = ShapeStatus.ShapeDb.validate_existing_shapes(state)
+  end
+
+  test "deletes orphaned shape data for an empty catalog during the first refresh", ctx do
     Process.put(:cleanup_all_test_pid, self())
-    {:ok, _state, []} = new_state(ctx)
+    {:ok, state, []} = new_state(ctx)
+    refute_received :cleanup_all_called
+
+    assert {:ok, 0} = ShapeStatus.refresh_shape_meta(state, initial?: true)
     assert_received :cleanup_all_called
   end
 
@@ -141,6 +160,68 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
     assert :error = ShapeStatus.validate_shape_handle(state, shape_handle1, shape2)
   end
 
+  test "validate_shape_handle/3 rejects a different shape sharing a Shape.hash/1 bucket", ctx do
+    {value, colliding_value} = shape_hash_collision()
+    shape = shape!(value)
+    colliding_shape = shape!(colliding_value)
+
+    # The pair is a regression fixture only while it really is two different shapes landing in one
+    # hash bucket. Assert both halves, so a change to the hashing fails here loudly rather than
+    # leaving the case below passing for the wrong reason.
+    assert Shape.hash(shape) == Shape.hash(colliding_shape)
+    refute Shape.comparable(shape) == Shape.comparable(colliding_shape)
+
+    {:ok, state, [shape_handle]} = new_state(ctx, shapes: [shape])
+
+    assert :ok = ShapeStatus.validate_shape_handle(state, shape_handle, shape)
+    assert :error = ShapeStatus.validate_shape_handle(state, shape_handle, colliding_shape)
+  end
+
+  # Two `value = '...'` predicates whose shapes share a `Shape.hash/1` value. `:erlang.phash2/1`
+  # ranges over 2^27, so the birthday search settles around 14.5k candidates and the bound below is
+  # slack rather than tight. Only the query string moves, which keeps the search off the parser;
+  # the two winners are parsed normally by `shape!/1` and rechecked by the caller.
+  defp shape_hash_collision do
+    template = shape!("collide-0")
+
+    1..200_000
+    |> Enum.reduce_while(%{}, fn n, seen ->
+      query = String.replace_suffix(template.where.query, "0'", "#{n}'")
+      hash = Shape.hash(%{template | where: %{template.where | query: query}})
+
+      case Map.fetch(seen, hash) do
+        {:ok, prior} -> {:halt, {"collide-#{prior}", "collide-#{n}"}}
+        :error -> {:cont, Map.put(seen, hash, n)}
+      end
+    end)
+    |> case do
+      {_value, _colliding_value} = pair -> pair
+      %{} -> flunk("no Shape.hash/1 collision within 200_000 candidates")
+    end
+  end
+
+  # The table goes with its owner while the stack restarts it, and the shape cache stamps the
+  # consumer it has just started then: a raise would fail the routing of the change the consumer
+  # was started for.
+  test "a read time the table of shapes is gone for is not taken", ctx do
+    test_pid = self()
+
+    owner =
+      spawn(fn ->
+        {:ok, _state, [handle]} = new_state(ctx, shapes: [shape!()])
+        send(test_pid, {:added, handle})
+        receive(do: (:stop -> :ok))
+      end)
+
+    assert_receive {:added, handle}
+    ref = Process.monitor(owner)
+    send(owner, :stop)
+    assert_receive {:DOWN, ^ref, :process, ^owner, :normal}
+    refute ShapeStatus.available?(ctx.stack_id)
+
+    refute ShapeStatus.update_last_read_time_to_now(ctx.stack_id, handle)
+  end
+
   describe "list_shapes/2" do
     test "returns shapes with dependencies in a topological order", ctx do
       {:ok, state, []} = new_state(ctx)
@@ -157,6 +238,37 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
       {:ok, outer_handle} = ShapeStatus.add_shape(state, outer)
 
       assert [{^inner_handle, _}, {^outer_handle, _}] = ShapeStatus.list_shapes(state)
+    end
+
+    test "returns a shape whose dependency is not in the store rather than looping", ctx do
+      {:ok, state, []} = new_state(ctx)
+
+      outer =
+        Shape.new!("public.items",
+          where: "id IN (SELECT id FROM other_table)",
+          inspector: @inspector
+        )
+
+      outer = %{outer | shape_dependencies_handles: ["a-handle-no-shape-in-this-store-has"]}
+      {:ok, outer_handle} = ShapeStatus.add_shape(state, outer)
+
+      parent = self()
+
+      {pid, ref} =
+        spawn_monitor(fn -> send(parent, {:listed, ShapeStatus.list_shapes(state)}) end)
+
+      receive do
+        {:listed, shapes} ->
+          Process.demonitor(ref, [:flush])
+          assert [{^outer_handle, _}] = shapes
+
+        {:DOWN, ^ref, :process, ^pid, reason} ->
+          flunk("listing raised: #{inspect(reason)}")
+      after
+        2_000 ->
+          Process.exit(pid, :kill)
+          flunk("listing did not terminate: a dependency handle no shape holds has no ordering")
+      end
     end
   end
 
@@ -249,6 +361,35 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
       ShapeStatus.update_last_read_time(state, shape3, now + 10)
 
       assert {[^shape1, ^shape2, ^shape3], _} = ShapeStatus.least_recently_used(state, _count = 3)
+    end
+
+    test "a refresh keeps the read times its clients earned", %{state: state} do
+      {:ok, shape1} = ShapeStatus.add_shape(state, shape!("a"))
+      {:ok, shape2} = ShapeStatus.add_shape(state, shape!("b"))
+      {:ok, shape3} = ShapeStatus.add_shape(state, shape!("c"))
+
+      # Only a completed snapshot survives the refresh's validation; without this the shapes are dropped
+      # as half-built and the refresh has nothing to restamp.
+      for handle <- [shape1, shape2, shape3] do
+        :ok = ShapeStatus.ShapeDb.mark_snapshot_complete(state, handle)
+      end
+
+      # Read them so the use order is exactly the reverse of the handle order. A shared stamp leaves the
+      # tree nothing but the handle to sort on, and a real handle leads with a hash — so reversing the two
+      # is what tells "evicted by use" apart from "evicted by name".
+      [most_recent, middle, least_recent] = Enum.sort([shape1, shape2, shape3])
+      now = System.monotonic_time()
+      ShapeStatus.update_last_read_time(state, least_recent, now)
+      ShapeStatus.update_last_read_time(state, middle, now + 5)
+      ShapeStatus.update_last_read_time(state, most_recent, now + 10)
+
+      assert {[^least_recent, ^middle, ^most_recent], _} =
+               ShapeStatus.least_recently_used(state, _count = 3)
+
+      :ok = ShapeStatus.refresh(state)
+
+      assert {[^least_recent, ^middle, ^most_recent], _} =
+               ShapeStatus.least_recently_used(state, _count = 3)
     end
 
     test "returns shapes with same timestamp in arbitrary order", %{state: state} do
@@ -345,6 +486,28 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
     end
   end
 
+  # The purge that follows a timeline change resets the catalog, and retries when that fails. A
+  # read-only request serves only a shape the in-memory tables hold.
+  describe "reset/1" do
+    for {step, failing_sql} <- [{"statement", "DELETE FROM shapes"}, {"commit", "COMMIT"}] do
+      test "a reset whose #{step} fails returns the failure with no shape left to serve", ctx do
+        {:ok, state, [handle]} = new_state(ctx, shapes: [shape!()])
+        :ok = ShapeStatus.ShapeDb.WriteBuffer.flush_sync(state)
+        assert ShapeStatus.has_shape_handle?(state, handle)
+
+        Repatch.patch(ShapeStatus.ShapeDb.Sqlite3, :execute, fn conn, sql ->
+          if sql == unquote(failing_sql),
+            do: {:error, "database or disk is full"},
+            else: Repatch.real(ShapeStatus.ShapeDb.Sqlite3.execute(conn, sql))
+        end)
+
+        assert {:error, _} = ShapeStatus.reset(state)
+        refute ShapeStatus.has_shape_handle?(state, handle)
+        assert ShapeStatus.ShapeDb.handle_exists?(state, handle)
+      end
+    end
+  end
+
   describe "refresh/1" do
     test "picks up new shapes added to SQLite", ctx do
       {:ok, state, [handle]} = new_state(ctx, shapes: [shape!()])
@@ -410,6 +573,65 @@ defmodule Electric.ShapeCache.ShapeStatusTest do
 
       assert ShapeStatus.has_shape_handle?(state, handle)
       assert ShapeStatus.snapshot_started?(state, handle)
+    end
+
+    # Validation keeps a shape whose snapshot-complete mark a failed flush left queued. Read back
+    # from the catalog alone, its snapshot was not started, and its next request, which found no
+    # consumer for it after a restart of the shape subsystem, removed the shape.
+    test "keeps the snapshot of a shape whose completion is still queued", ctx do
+      {:ok, state, [handle]} = new_state(ctx, shapes: [shape!()])
+      :ok = ShapeStatus.ShapeDb.WriteBuffer.flush_sync(state)
+      :ok = ShapeStatus.mark_snapshot_started(state, handle)
+      {:ok, path} = ShapeStatus.ShapeDb.Connection.db_path(storage_dir: ctx.tmp_dir)
+      {:ok, other} = ShapeStatus.ShapeDb.Sqlite3.open(path, [])
+
+      :ok =
+        ShapeStatus.ShapeDb.Connection.execute(other, """
+        CREATE TRIGGER refuse_mark BEFORE UPDATE OF snapshot_complete ON shapes
+        BEGIN SELECT RAISE(ABORT, 'refused'); END
+        """)
+
+      :ok = ShapeStatus.ShapeDb.mark_snapshot_complete(state, handle)
+
+      try do
+        {result, _log} = ExUnit.CaptureLog.with_log(fn -> ShapeStatus.refresh(state) end)
+        assert :ok = result
+        assert ShapeStatus.has_shape_handle?(state, handle)
+        assert ShapeStatus.snapshot_started?(state, handle)
+      after
+        :ok = ShapeStatus.ShapeDb.Connection.execute(other, "DROP TRIGGER refuse_mark")
+        :ok = ShapeStatus.ShapeDb.Connection.close(other)
+      end
+    end
+
+    # A complete shape whose removal is still queued is gone, though the catalog keeps its row
+    # until the removal commits. The refresh put it back, its snapshot complete, and a request for
+    # its handle read the storage its removal had taken.
+    test "leaves out a complete shape whose removal is queued", ctx do
+      {:ok, state, [handle]} = new_state(ctx, shapes: [shape!()])
+      :ok = ShapeStatus.mark_snapshot_started(state, handle)
+      :ok = ShapeStatus.ShapeDb.mark_snapshot_complete(state, handle)
+      :ok = ShapeStatus.ShapeDb.WriteBuffer.flush_sync(state)
+      {:ok, path} = ShapeStatus.ShapeDb.Connection.db_path(storage_dir: ctx.tmp_dir)
+      {:ok, other} = ShapeStatus.ShapeDb.Sqlite3.open(path, [])
+
+      :ok =
+        ShapeStatus.ShapeDb.Connection.execute(other, """
+        CREATE TRIGGER refuse_removal BEFORE DELETE ON shapes
+        BEGIN SELECT RAISE(ABORT, 'refused'); END
+        """)
+
+      :ok = ShapeStatus.remove_shape(state, handle)
+
+      try do
+        {result, _log} = ExUnit.CaptureLog.with_log(fn -> ShapeStatus.refresh(state) end)
+        assert :ok = result
+        refute ShapeStatus.has_shape_handle?(state, handle)
+        refute ShapeStatus.snapshot_started?(state, handle)
+      after
+        :ok = ShapeStatus.ShapeDb.Connection.execute(other, "DROP TRIGGER refuse_removal")
+        :ok = ShapeStatus.ShapeDb.Connection.close(other)
+      end
     end
   end
 

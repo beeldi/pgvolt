@@ -145,4 +145,45 @@ defmodule Electric.Client.Fetch.RequestTest do
       assert %{"columns" => ^column_list} = params
     end
   end
+
+  describe "loggable/1" do
+    test "redacts sensitive headers and query params" do
+      base = Client.request(client!(), params: %{"token" => "query-secret", "custom" => "keep"})
+
+      request = %{
+        base
+        | headers: %{"authorization" => "Bearer super-secret-token", "x-custom" => "keep-me"}
+      }
+
+      loggable = Request.loggable(request)
+      dump = inspect(loggable)
+
+      refute dump =~ "super-secret-token"
+      refute dump =~ "query-secret"
+      assert loggable.headers["authorization"] == "[REDACTED]"
+      assert loggable.headers["x-custom"] == "keep-me"
+      assert loggable.params["token"] == "[REDACTED]"
+      assert loggable.params["custom"] == "keep"
+    end
+
+    test "redacts credentials embedded in the endpoint uri" do
+      base = Client.request(client!(), [])
+
+      request = %{
+        base
+        | endpoint:
+            URI.parse(
+              "https://user:endpoint-secret@example.com/v1/shape?token=url-secret&keep=yes"
+            )
+      }
+
+      loggable = Request.loggable(request)
+      dump = inspect(loggable)
+
+      refute dump =~ "endpoint-secret"
+      refute dump =~ "url-secret"
+      assert loggable.endpoint =~ "example.com"
+      assert loggable.endpoint =~ "keep=yes"
+    end
+  end
 end

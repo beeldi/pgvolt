@@ -184,6 +184,8 @@ describe(`shape stream state machine`, () => {
     const transition = live.handleSseConnectionClosed({
       connectionDuration: 5000,
       wasAborted: false,
+      hadUnflushedMessages: false,
+      advancedOffset: false,
       minConnectionDuration: 1000,
       maxShortConnections: 3,
     })
@@ -203,6 +205,8 @@ describe(`shape stream state machine`, () => {
     const transition = live.handleSseConnectionClosed({
       connectionDuration: 100,
       wasAborted: false,
+      hadUnflushedMessages: false,
+      advancedOffset: false,
       minConnectionDuration: 1000,
       maxShortConnections: 3,
     })
@@ -222,6 +226,8 @@ describe(`shape stream state machine`, () => {
     const transition = live.handleSseConnectionClosed({
       connectionDuration: 100,
       wasAborted: false,
+      hadUnflushedMessages: false,
+      advancedOffset: false,
       minConnectionDuration: 1000,
       maxShortConnections: 3,
     })
@@ -242,12 +248,61 @@ describe(`shape stream state machine`, () => {
     const transition = live.handleSseConnectionClosed({
       connectionDuration: 100, // short duration, but aborted intentionally
       wasAborted: true,
+      hadUnflushedMessages: false,
+      advancedOffset: false,
       minConnectionDuration: 1000,
       maxShortConnections: 3,
     })
 
     expect(transition.state).toBeInstanceOf(LiveState)
     expect(transition.state.consecutiveShortSseConnections).toBe(1) // unchanged
+    expect(transition.wasShortConnection).toBe(false)
+    expect(transition.fellBackToLongPolling).toBe(false)
+  })
+
+  // A short connection that moved the offset is a catch-up the server
+  // closed after sending it, not a sign that a proxy is buffering.
+  it(`short connection that advanced the offset leaves the counter unchanged`, () => {
+    const live = new LiveState(makeShared(), {
+      consecutiveShortSseConnections: 2,
+    })
+
+    const transition = live.handleSseConnectionClosed({
+      connectionDuration: 10,
+      wasAborted: false,
+      hadUnflushedMessages: false,
+      advancedOffset: true,
+      minConnectionDuration: 1000,
+      maxShortConnections: 3,
+    })
+
+    expect(transition.state).toBeInstanceOf(LiveState)
+    expect(transition.state.consecutiveShortSseConnections).toBe(2)
+    expect(transition.state.sseFallbackToLongPolling).toBe(false)
+    expect(transition.wasShortConnection).toBe(false)
+    expect(transition.fellBackToLongPolling).toBe(false)
+  })
+
+  // A body that ends inside a catch-up chunk, before its up-to-date, leaves the
+  // offset where it was. It is still a catch-up the server closed, and the
+  // next request is a long poll, so it must not count towards the fallback.
+  it(`short connection that ended with unflushed messages leaves the counter unchanged`, () => {
+    const live = new LiveState(makeShared(), {
+      consecutiveShortSseConnections: 2,
+    })
+
+    const transition = live.handleSseConnectionClosed({
+      connectionDuration: 10,
+      wasAborted: false,
+      hadUnflushedMessages: true,
+      advancedOffset: false,
+      minConnectionDuration: 1000,
+      maxShortConnections: 3,
+    })
+
+    expect(transition.state).toBeInstanceOf(LiveState)
+    expect(transition.state.consecutiveShortSseConnections).toBe(2)
+    expect(transition.state.sseFallbackToLongPolling).toBe(false)
     expect(transition.wasShortConnection).toBe(false)
     expect(transition.fellBackToLongPolling).toBe(false)
   })
@@ -538,6 +593,8 @@ describe(`shape stream state machine`, () => {
     const transition = syncing.handleSseConnectionClosed({
       connectionDuration: 100,
       wasAborted: false,
+      hadUnflushedMessages: false,
+      advancedOffset: false,
       minConnectionDuration: 1000,
       maxShortConnections: 3,
     })
@@ -1064,6 +1121,78 @@ describe(`scenario builder`, () => {
     expect(state.offset).toBe(`42_5`)
   })
 
+  it(`SSE up-to-date offset behind header offset is ignored`, () => {
+    const { state } = scenario()
+      .response({ responseHandle: `h1`, responseOffset: `1_285` })
+      .expectKind(`syncing`)
+      .messages({
+        isSse: true,
+        upToDateOffset: `1_0`,
+        currentCursor: `cursor-1`,
+      })
+      .done()
+
+    expect(state.offset).toBe(`1_285`)
+  })
+
+  it(`SSE up-to-date offset ahead of header offset is accepted`, () => {
+    const { state } = scenario()
+      .response({ responseHandle: `h1`, responseOffset: `1_285` })
+      .expectKind(`syncing`)
+      .messages({
+        isSse: true,
+        upToDateOffset: `2_0`,
+        currentCursor: `cursor-1`,
+      })
+      .done()
+
+    expect(state.offset).toBe(`2_0`)
+  })
+
+  it(`SSE up-to-date offset with higher op at same LSN is accepted`, () => {
+    const { state } = scenario()
+      .response({ responseHandle: `h1`, responseOffset: `1_285` })
+      .expectKind(`syncing`)
+      .messages({
+        isSse: true,
+        upToDateOffset: `1_290`,
+        currentCursor: `cursor-1`,
+      })
+      .done()
+
+    expect(state.offset).toBe(`1_290`)
+  })
+
+  it(`SSE up-to-date offset ahead of the 0_inf snapshot boundary is accepted`, () => {
+    // 0_inf is the offset at the end of the initial snapshot, before any
+    // change has been logged. Any logged offset is ahead of it.
+    const { state } = scenario()
+      .response({ responseHandle: `h1`, responseOffset: `0_inf` })
+      .expectKind(`syncing`)
+      .messages({
+        isSse: true,
+        upToDateOffset: `5_0`,
+        currentCursor: `cursor-1`,
+      })
+      .done()
+
+    expect(state.offset).toBe(`5_0`)
+  })
+
+  it(`SSE up-to-date offset behind the 0_inf snapshot boundary is ignored`, () => {
+    const { state } = scenario()
+      .response({ responseHandle: `h1`, responseOffset: `0_inf` })
+      .expectKind(`syncing`)
+      .messages({
+        isSse: true,
+        upToDateOffset: `0_5`,
+        currentCursor: `cursor-1`,
+      })
+      .done()
+
+    expect(state.offset).toBe(`0_inf`)
+  })
+
   it(`non-SSE up-to-date message preserves existing offset`, () => {
     const { state } = scenario()
       .response({ responseHandle: `h1`, responseOffset: `5_0` })
@@ -1076,6 +1205,111 @@ describe(`scenario builder`, () => {
       .done()
 
     expect(state.offset).toBe(`5_0`)
+  })
+
+  it(`SSE response keeps the offset until an up-to-date`, () => {
+    const live = new LiveState(makeShared({ offset: `2_0` }))
+
+    const opened = live.handleResponseMetadata(
+      makeResponseInput({ isSse: true, responseOffset: `9_0` })
+    )
+    expect(opened.state.offset).toBe(`2_0`)
+
+    const flushed = opened.state.handleMessageBatch(
+      makeMessageBatchInput({ isSse: true, upToDateOffset: `9_0` })
+    )
+    expect(flushed.state.offset).toBe(`9_0`)
+  })
+
+  it(`SSE up-to-date without an offset takes the response's header`, () => {
+    const opened = new LiveState(
+      makeShared({ offset: `2_0` })
+    ).handleResponseMetadata(
+      makeResponseInput({ isSse: true, responseOffset: `9_0` })
+    )
+
+    const flushed = opened.state.handleMessageBatch(
+      makeMessageBatchInput({ isSse: true, upToDateOffset: undefined })
+    )
+    expect(flushed.state.offset).toBe(`9_0`)
+
+    // The header belongs to that response only.
+    const next = flushed.state.handleMessageBatch(
+      makeMessageBatchInput({ isSse: true, upToDateOffset: undefined })
+    )
+    expect(next.state.offset).toBe(`9_0`)
+  })
+
+  // After a multi-operation transaction at LSN 7 the header is `7_2` but the
+  // up-to-date gives `7_0`. Taking it would move the offset back and replay
+  // operations the client already holds.
+  it(`SSE up-to-date offset behind the response's header is ignored`, () => {
+    const opened = new LiveState(
+      makeShared({ offset: `5_0` })
+    ).handleResponseMetadata(
+      makeResponseInput({ isSse: true, responseOffset: `7_2` })
+    )
+
+    const flushed = opened.state.handleMessageBatch(
+      makeMessageBatchInput({ isSse: true, upToDateOffset: `7_0` })
+    )
+    expect(flushed.state.offset).toBe(`7_2`)
+  })
+
+  it(`SSE up-to-date offset ahead of the response's header is accepted`, () => {
+    const opened = new LiveState(
+      makeShared({ offset: `5_0` })
+    ).handleResponseMetadata(
+      makeResponseInput({ isSse: true, responseOffset: `7_2` })
+    )
+
+    const flushed = opened.state.handleMessageBatch(
+      makeMessageBatchInput({ isSse: true, upToDateOffset: `8_0` })
+    )
+    expect(flushed.state.offset).toBe(`8_0`)
+  })
+
+  it(`long polls after an SSE body ends with unflushed messages, until an up-to-date`, () => {
+    const sseOpts = {
+      liveSseEnabled: true,
+      isRefreshing: false,
+      resumingFromPause: false,
+    }
+    const closeInput = {
+      connectionDuration: 5000,
+      wasAborted: false,
+      advancedOffset: false,
+      minConnectionDuration: 1000,
+      maxShortConnections: 3,
+    }
+    const live = new LiveState(makeShared({ offset: `2_0` }))
+
+    expect(
+      live
+        .handleSseConnectionClosed({
+          ...closeInput,
+          hadUnflushedMessages: false,
+        })
+        .state.shouldUseSse(sseOpts)
+    ).toBe(true)
+
+    const closed = live.handleSseConnectionClosed({
+      ...closeInput,
+      hadUnflushedMessages: true,
+    }).state
+    expect(closed.offset).toBe(`2_0`)
+    expect(closed.shouldUseSse(sseOpts)).toBe(false)
+
+    // A catch-up chunk without an up-to-date keeps long polling from its end.
+    const chunk = closed.handleResponseMetadata(
+      makeResponseInput({ responseOffset: `5_0` })
+    ).state
+    expect(chunk.offset).toBe(`5_0`)
+    expect(chunk.shouldUseSse(sseOpts)).toBe(false)
+
+    const upToDate = chunk.handleMessageBatch(makeMessageBatchInput()).state
+    expect(upToDate.offset).toBe(`5_0`)
+    expect(upToDate.shouldUseSse(sseOpts)).toBe(true)
   })
 
   it(`stale response when local handle matches expired handle`, () => {
@@ -1128,6 +1362,8 @@ describe(`tier-2: transition truth table`, () => {
       input: {
         connectionDuration: 5000,
         wasAborted: false,
+        hadUnflushedMessages: false,
+        advancedOffset: false,
         minConnectionDuration: 1000,
         maxShortConnections: 3,
       },

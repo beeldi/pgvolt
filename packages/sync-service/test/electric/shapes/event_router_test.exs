@@ -64,6 +64,7 @@ defmodule Electric.Shapes.EventRouterTest do
 
       batch = %TransactionFragment{
         xid: 100,
+        full_xid: 4_294_967_396,
         has_begin?: true,
         commit: %Commit{commit_timestamp: ~U[2024-01-01 00:00:00Z]},
         changes: [
@@ -824,6 +825,43 @@ defmodule Electric.Shapes.EventRouterTest do
                  changes: [^insert2c]
                }
              } = result3
+    end
+
+    test "a shape added after a commit is not treated as added mid-transaction" do
+      # Arrange
+      router =
+        EventRouter.new()
+        |> EventRouter.add_shape("s1", Shape.new!("t1", where: "id = 1", inspector: @inspector))
+
+      insert1 = %NewRecord{relation: {"public", "t1"}, record: %{"id" => "1"}}
+      commit1 = %Commit{commit_timestamp: ~U[2024-01-01 00:00:00Z]}
+
+      {_result, router} =
+        EventRouter.event_by_shape_handle(
+          router,
+          %TransactionFragment{xid: 100, has_begin?: true, commit: commit1, changes: [insert1]}
+        )
+
+      # Act: no transaction is open here, so this shape has missed nothing
+      router =
+        EventRouter.add_shape(
+          router,
+          "s2",
+          Shape.new!("t1", where: "id = 2", inspector: @inspector)
+        )
+
+      insert2 = %NewRecord{relation: {"public", "t1"}, record: %{"id" => "2"}}
+
+      # A fragment carrying no BEGIN is what a resume delivers, so it must not be the only
+      # thing that can clear the exclusion.
+      {result, _router} =
+        EventRouter.event_by_shape_handle(
+          router,
+          %TransactionFragment{xid: 101, has_begin?: false, changes: [insert2]}
+        )
+
+      # Assert
+      assert %{"s2" => %TransactionFragment{changes: [^insert2]}} = result
     end
 
     test "adding multiple shapes during transaction skips current transaction for all new shapes" do

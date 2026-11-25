@@ -11,6 +11,7 @@ defmodule Electric.Shapes.Shape do
   alias Electric.Shapes.DnfPlan
   alias Electric.Shapes.SubqueryTags
   alias Electric.Shapes.WhereClause
+  alias Electric.Telemetry.RequestValues
   alias Electric.Utils
   alias Electric.Shapes.Shape.Validators
   require Logger
@@ -38,11 +39,17 @@ defmodule Electric.Shapes.Shape do
     :selected_columns,
     :explicitly_selected_columns,
     :queryable_columns,
+    locale: nil,
+    localized_columns: [],
+    localized_backing_columns: [],
     shape_dependencies: [],
     shape_dependencies_handles: [],
     tag_structure: [],
+    composite_tag_encoding: :length_prefixed,
     subquery_comparison_expressions: %{},
     log_mode: :full,
+    source_positions: :legacy,
+    source_generation: nil,
     flags: %{},
     storage: %{compaction: :disabled},
     replica: @default_replica
@@ -72,10 +79,13 @@ defmodule Electric.Shapes.Shape do
           explicitly_selected_columns: [String.t(), ...],
           queryable_columns: [String.t(), ...] | nil,
           tag_structure: [String.t() | [String.t(), ...]],
+          composite_tag_encoding: SubqueryTags.encoding(),
           replica: replica(),
           storage: storage_config() | nil,
           shape_dependencies: [t(), ...],
-          log_mode: log_mode()
+          log_mode: log_mode(),
+          source_positions: :legacy | :full_xid,
+          source_generation: String.t() | nil
         }
 
   @type json_relation() :: [String.t(), ...]
@@ -93,7 +103,10 @@ defmodule Electric.Shapes.Shape do
           replica: String.t(),
           storage: storage_config() | nil,
           shape_dependencies: [json_safe(), ...],
-          log_mode: log_mode()
+          composite_tag_encoding: SubqueryTags.encoding(),
+          log_mode: log_mode(),
+          source_positions: :legacy | :full_xid,
+          source_generation: String.t() | nil
         }
   @type comparable() :: term()
 
@@ -111,12 +124,56 @@ defmodule Electric.Shapes.Shape do
   """
   @spec comparable(t()) :: comparable()
   def comparable(%__MODULE__{} = shape) do
-    {:shape, {shape.root_table_id, shape.root_table}, shape.root_pk,
-     Comparable.comparable(shape.where), shape.selected_columns,
-     shape.explicitly_selected_columns,
-     Enum.flat_map(shape.flags, fn {k, v} -> if(v, do: [k], else: []) end) |> Enum.sort(),
-     shape.replica, shape.log_mode}
+    legacy =
+      {:shape, {shape.root_table_id, shape.root_table}, shape.root_pk,
+       Comparable.comparable(shape.where), shape.selected_columns,
+       shape.explicitly_selected_columns,
+       Enum.flat_map(shape.flags, fn {k, v} -> if(v, do: [k], else: []) end) |> Enum.sort(),
+       shape.replica, shape.log_mode}
+
+    # Two languages must never share a handle, but a shape asking for none must keep the identity it had:
+    # widening the tuple unconditionally would recreate every existing shape, localized or not.
+    comparable =
+      case {Map.get(shape, :locale), Map.get(shape, :localized_columns, [])} do
+        {nil, _} -> legacy
+        {_, []} -> legacy
+        {locale, localized} -> {:localized, legacy, locale, localized}
+      end
+
+    if Map.get(shape, :source_positions, :legacy) == :full_xid,
+      do: {:full_xid, Map.get(shape, :source_generation), comparable},
+      else: comparable
   end
+
+  @doc """
+  Key identifying shapes whose conversion and encoding of a change are byte-identical, so that a
+  fan-out group can convert and encode once instead of once per participating shape.
+
+  Membership is deliberately absent from the key. By the time a change reaches a shape the router
+  has already decided membership exactly -- it evaluates the residual where clause itself rather
+  than over-approximating -- so re-deriving it per shape recomputes a settled answer. What is left
+  of `convert_change/3` for a shape in a class is the column projection, which depends only on
+  `selected_columns`, plus row metadata that is constant when there are no move tags.
+
+  Returns `nil` for shapes that must convert individually: those with subquery dependencies, whose
+  routing is conservative by design and whose membership genuinely is refined per shape, and those
+  with move tags, whose values are derived per shape handle.
+  """
+  @spec fanout_class(t()) :: term() | nil
+  def fanout_class(%__MODULE__{tag_structure: [], shape_dependencies: []} = shape) do
+    legacy =
+      {shape.root_table, is_nil(shape.where), Map.get(shape.flags, :selects_all_columns, false),
+       shape.selected_columns, shape.root_pk, shape.replica, shape.log_mode,
+       Map.get(shape, :source_positions, :legacy), Map.get(shape, :source_generation)}
+
+    case {Map.get(shape, :locale), Map.get(shape, :localized_columns, [])} do
+      {nil, _} -> legacy
+      {_, []} -> legacy
+      {locale, localized} -> {:localized, legacy, locale, localized}
+    end
+  end
+
+  def fanout_class(%__MODULE__{}), do: nil
 
   defguard has_dependencies(shape) when shape.shape_dependencies != []
 
@@ -126,6 +183,10 @@ defmodule Electric.Shapes.Shape do
   def dependency_handles_known?(%__MODULE__{} = shape),
     do: shape.shape_dependencies_handles != []
 
+  # The shape catalog decodes stored structs as Erlang terms, without applying struct defaults.
+  def composite_tag_encoding(%__MODULE__{} = shape),
+    do: Map.get(shape, :composite_tag_encoding, :legacy)
+
   def hash(%__MODULE__{} = shape) do
     {_comparable, hash} = comparable_hash(shape)
     hash
@@ -134,6 +195,22 @@ defmodule Electric.Shapes.Shape do
   def comparable_hash(%__MODULE__{} = shape) do
     comparable = comparable(shape)
     {comparable, :erlang.phash2(comparable)}
+  end
+
+  @doc """
+  Collision-resistant identity for a shape, for any comparison that decides whether a handle may be
+  served a shape's data.
+
+  `hash/1` is a bucketing key, not an identity: `:erlang.phash2/1` ranges over 2^27, so distinct
+  shapes start sharing a value after roughly 13k of them and a colliding pair is cheap to construct
+  offline.
+  """
+  @spec comparable_digest(t()) :: binary()
+  def comparable_digest(%__MODULE__{} = shape), do: shape |> comparable() |> digest_comparable()
+
+  @spec digest_comparable(term()) :: binary()
+  def digest_comparable(comparable) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(comparable, [:deterministic]))
   end
 
   def generate_id(%__MODULE__{} = shape) do
@@ -189,13 +266,33 @@ defmodule Electric.Shapes.Shape do
       default: nil,
       type_spec: quote(do: nil | Electric.Shapes.Shape.storage_config())
     ],
-    log_mode: [type: {:in, [:changes_only, :full]}, default: :full]
+    log_mode: [type: {:in, [:changes_only, :full]}, default: :full],
+    source_positions: [type: {:in, [:legacy, :full_xid]}, default: :legacy],
+    source_generation: [type: {:or, [:string, nil]}, default: nil],
+    locale: [type: {:custom, __MODULE__, :validate_locale, []}, default: nil],
+    localized_columns: [type: {:list, :string}, default: []]
   ]
   @shape_schema NimbleOptions.new!(@schema_options)
 
   def schema_options do
     @schema_options
   end
+
+  # The locale reaches a single-quoted SQL literal in the snapshot query, and it comes from the caller.
+  # A language tag is letters, digits, hyphens and underscores; anything else is refused here rather than
+  # escaped further down, so no second caller can forget.
+  @locale_format ~r/^[A-Za-z0-9_-]{1,35}$/
+
+  @doc false
+  def validate_locale(nil), do: {:ok, nil}
+
+  def validate_locale(locale) when is_binary(locale) do
+    if Regex.match?(@locale_format, locale),
+      do: {:ok, locale},
+      else: {:error, "expected a language tag, got: #{inspect(locale)}"}
+  end
+
+  def validate_locale(other), do: {:error, "expected a string or nil, got: #{inspect(other)}"}
 
   def default_replica_mode, do: @default_replica
 
@@ -230,6 +327,7 @@ defmodule Electric.Shapes.Shape do
   defp make_new(opts) when is_list(opts) or is_map(opts) do
     with {:ok, opts} <- NimbleOptions.validate(opts, @shape_schema),
          opts = Map.new(opts),
+         :ok <- validate_source_positions(opts),
          inspector = Map.fetch!(opts, :inspector),
          {:ok, {oid, table} = relation} <- validate_relation(opts, inspector),
          {:ok, column_info, pk_cols} <- load_column_info(relation, inspector),
@@ -250,7 +348,15 @@ defmodule Electric.Shapes.Shape do
           if(is_nil(Map.get(opts, :columns)) and is_nil(Map.get(opts, :queryable_columns)),
             do: :selects_all_columns
           ),
-          if(any_columns_generated?(column_info, selected_columns),
+          if(
+            any_columns_generated?(
+              column_info,
+              selected_columns ++
+                localized_backing_columns(
+                  column_info,
+                  localized_columns(opts, selected_columns, column_info)
+                )
+            ),
             do: :selects_generated_columns
           ),
           if(any_columns_non_primitive?(column_info, where),
@@ -274,10 +380,99 @@ defmodule Electric.Shapes.Shape do
          replica: Map.get(opts, :replica, :default),
          storage: Map.get(opts, :storage) || %{compaction: :disabled},
          shape_dependencies: shape_dependencies,
-         log_mode: Map.fetch!(opts, :log_mode)
+         log_mode: Map.fetch!(opts, :log_mode),
+         source_positions: Map.fetch!(opts, :source_positions),
+         source_generation: Map.fetch!(opts, :source_generation),
+         locale: Map.get(opts, :locale),
+         localized_columns: localized_columns(opts, selected_columns, column_info),
+         localized_backing_columns:
+           localized_backing_columns(
+             column_info,
+             localized_columns(opts, selected_columns, column_info)
+           )
        }
        |> fill_tag_structure()}
     end
+  end
+
+  @doc """
+  The generated columns that exist only to hold one language of a localized one. Taken from the catalogue
+  rather than from the name: a real column called `name_short` beside a localized `name` shares the prefix
+  but is not a translation, and dropping it would lose data.
+  """
+  @spec localized_backing_columns([map()], [String.t()]) :: [String.t()]
+  def localized_backing_columns(_column_info, []), do: []
+
+  def localized_backing_columns(column_info, localized_columns) do
+    column_info
+    |> Enum.filter(fn column ->
+      Map.get(column, :is_generated, false) and column.name not in localized_columns and
+        Enum.any?(localized_columns, &String.starts_with?(column.name, "#{&1}_"))
+    end)
+    |> Enum.map(& &1.name)
+    |> Enum.sort()
+  end
+
+  @doc """
+  The catalogue as a reader of this shape sees it. A localized column carries the type of the generated
+  column holding its language, under its own name, since that is the value the shape serves; the backing
+  columns the shape hides are left out. Without this the response schema would announce `jsonb` for a value
+  that is plain text, and a client parsing by that schema would fail on it.
+  """
+  @spec projected_column_info(t(), [map()]) :: [map()]
+  def projected_column_info(%__MODULE__{localized_columns: []}, column_info), do: column_info
+
+  def projected_column_info(%__MODULE__{} = shape, column_info) do
+    by_name = Map.new(column_info, &{&1.name, &1})
+
+    column_info
+    |> Enum.reject(&(&1.name in shape.localized_backing_columns))
+    |> Enum.map(fn column ->
+      case column.name in shape.localized_columns &&
+             Map.get(by_name, "#{column.name}_#{shape.locale}") do
+        %{} = backing -> %{backing | name: column.name, pk_position: column.pk_position}
+        _ -> column
+      end
+    end)
+  end
+
+  @doc """
+  The columns this shape projects to a single locale: those the caller declared as locale-keyed JSON and
+  that the shape actually selects. Declaring a column the shape does not carry is a caller mistake that
+  would otherwise sit unnoticed in the shape identity. Under `queryable_columns`, the column backing the
+  locale has to be queryable too.
+  """
+  @spec localized_columns(map(), [String.t()], [map()]) :: [String.t()]
+  def localized_columns(opts, selected_columns, column_info) do
+    case Map.get(opts, :locale) do
+      nil ->
+        []
+
+      locale ->
+        queryable_columns = Map.get(opts, :queryable_columns)
+
+        opts
+        |> Map.get(:localized_columns, [])
+        |> Enum.filter(
+          &(&1 in selected_columns and
+              backed_by_generated_column?(column_info, &1, locale, queryable_columns))
+        )
+        |> Enum.sort()
+    end
+  end
+
+  # A locale nobody migrated the table for, or a typo in one, would otherwise have the snapshot query name a
+  # column that does not exist and fail with undefined_column. The column keeps its stored object instead,
+  # which the reader resolves as it did before any projection. A request held to `queryable_columns` sees
+  # only those columns, so a backing column left off that list is missing for it in the same way: else the
+  # locale, which the caller picks, would serve any generated `<column>_<suffix>` under a queryable name.
+  defp backed_by_generated_column?(column_info, column, locale, queryable_columns) do
+    backing = "#{column}_#{locale}"
+
+    (is_nil(queryable_columns) or backing in queryable_columns) and
+      Enum.any?(column_info, fn candidate ->
+        candidate.name == backing and Map.get(candidate, :is_generated, false)
+      end)
   end
 
   defp fill_tag_structure(shape) do
@@ -317,6 +512,18 @@ defmodule Electric.Shapes.Shape do
     end
   end
 
+  defp validate_source_positions(%{source_positions: :full_xid, source_generation: generation})
+       when not is_binary(generation) or generation == "" do
+    {:error,
+     {:source_positions, "Full transaction source positions require a verified source generation"}}
+  end
+
+  defp validate_source_positions(%{source_positions: :full_xid, storage: %{compaction: :enabled}}) do
+    {:error, {:source_positions, "Full transaction source positions do not support compaction"}}
+  end
+
+  defp validate_source_positions(_opts), do: :ok
+
   defp make_opts_from_select(select, opts) do
     with {:ok, {columns, from, where}} <- Parser.extract_parts_from_select(select) do
       {:ok,
@@ -325,19 +532,33 @@ defmodule Electric.Shapes.Shape do
   end
 
   defp build_shape_dependencies(subqueries, opts) do
-    shared_opts = Map.drop(opts, [:where, :columns, :queryable_columns, :relation])
+    # A dependency shape decides subquery membership, so it must read the stored value: projecting it would
+    # compare on one language, and its table may carry no backing column at all.
+    shared_opts =
+      Map.drop(opts, [
+        :where,
+        :columns,
+        :queryable_columns,
+        :relation,
+        :locale,
+        :localized_columns
+      ])
 
     subqueries
     |> Enum.with_index()
     |> Utils.reduce_while_ok({[], %{}, %{}}, fn {subquery, occurrence_idx},
                                                 {shape_dependencies, dependency_index_by_shape,
                                                  occurrence_to_dependency} ->
-      with {:ok, shape_dependency} <-
+      with {:ok, {columns, _from, _where}} <- Parser.extract_parts_from_select(subquery),
+           {:ok, shape_dependency} <-
              shared_opts
              |> Map.put(:select, subquery)
              |> Map.put(:autofill_pk_select?, true)
              |> Map.put(:log_mode, :full)
              |> new() do
+        # The row left of a subquery pairs with its select list in the order the list names its
+        # columns, so a dependency keeps that order where a shape sorts its own.
+        shape_dependency = %{shape_dependency | explicitly_selected_columns: columns}
         comparable_shape = comparable(shape_dependency)
 
         case dependency_index_by_shape do
@@ -372,17 +593,15 @@ defmodule Electric.Shapes.Shape do
       relation = {shape.root_table_id, shape.root_table}
 
       with {:ok, column_info, _} <- load_column_info(relation, inspector) do
-        type =
-          column_info
-          |> Enum.filter(&(&1.name in shape.explicitly_selected_columns))
-          |> Inspector.columns_to_expr()
-          |> Map.to_list()
-          |> case do
-            [{_, type}] ->
-              type
+        types = Inspector.columns_to_expr(column_info)
 
-            multiple ->
-              {:row, Enum.map(multiple, &elem(&1, 1))}
+        type =
+          shape.explicitly_selected_columns
+          |> Enum.uniq()
+          |> Enum.map(&Map.fetch!(types, [&1]))
+          |> case do
+            [type] -> type
+            multiple -> {:row, multiple}
           end
 
         {:ok, Map.put(acc, ["$sublink", "#{i}"], {:array, type})}
@@ -670,12 +889,64 @@ defmodule Electric.Shapes.Shape do
     do_convert_change(shape, change, opts)
   end
 
+  @doc """
+  Convert an insert or delete whose shape membership routing has already decided.
+
+  `convert_change/3` re-evaluates the where clause to derive membership, but on the router's
+  shared-conversion path that answer is already known: the change reaches this shape because
+  `Filter.affected_shapes_exact/2` reported it as an exact match, not as a shape routing
+  could not rule out. Re-running the predicate interpreter there is the single largest cost
+  on the routing path at storm fan-out.
+
+  Restricted to fan-out-class shapes (no move tags, no dependencies) and to inserts and
+  deletes, where membership is the only thing the where clause decides — the exact
+  eligibility the router's prepare path already enforces. The empty metadata matches what
+  `convert_change/3` computes for a tag-less shape.
+  """
+  def convert_routed_change(%__MODULE__{root_table: table}, %{relation: relation})
+      when table != relation,
+      do: []
+
+  def convert_routed_change(
+        %__MODULE__{
+          tag_structure: [],
+          shape_dependencies: [],
+          where: nil,
+          locale: nil,
+          flags: %{selects_all_columns: true}
+        },
+        change
+      )
+      when is_struct(change, Changes.NewRecord) or is_struct(change, Changes.DeletedRecord) do
+    # Mirrors the whole-table clause of `do_convert_change/3`: no column projection at
+    # all, so columns the inspector didn't know at shape creation still pass through.
+    [%{change | move_tags: [], active_conditions: []}]
+  end
+
+  def convert_routed_change(
+        %__MODULE__{tag_structure: [], shape_dependencies: []} = shape,
+        change
+      )
+      when is_struct(change, Changes.NewRecord) or is_struct(change, Changes.DeletedRecord) do
+    [
+      %{change | move_tags: [], active_conditions: []}
+      |> filter_change_columns(shape)
+    ]
+  end
+
+  # Already converted by the router on behalf of this change's whole fan-out class. Membership and
+  # column projection are both settled, and re-deriving either would only reproduce them. This
+  # clause has to come first: the `where: nil, selects_all_columns: true` clause below matches any
+  # change at all, so without it a prepared change would fall through to `from_change/4`, and the
+  # clauses after that match on concrete change structs and would raise.
+  defp do_convert_change(%__MODULE__{}, %Changes.PreparedChange{} = prepared, _), do: [prepared]
+
   defp do_convert_change(%__MODULE__{root_table: table}, %{relation: relation}, _)
        when table != relation,
        do: []
 
   defp do_convert_change(
-         %__MODULE__{where: nil, flags: %{selects_all_columns: true}} = shape,
+         %__MODULE__{where: nil, locale: nil, flags: %{selects_all_columns: true}} = shape,
          change,
          opts
        ) do
@@ -691,7 +962,7 @@ defmodule Electric.Shapes.Shape do
     do: [change]
 
   defp do_convert_change(
-         %__MODULE__{selected_columns: selected_columns} = shape,
+         %__MODULE__{} = shape,
          %Changes.NewRecord{record: record} = change,
          opts
        ) do
@@ -699,7 +970,7 @@ defmodule Electric.Shapes.Shape do
 
     case project_row_metadata(shape, record, new_refs, opts) do
       {:ok, true, metadata} ->
-        [change |> put_row_metadata(metadata) |> filter_change_columns(selected_columns)]
+        [change |> put_row_metadata(metadata) |> filter_change_columns(shape)]
 
       {:ok, false, _metadata} ->
         []
@@ -707,7 +978,7 @@ defmodule Electric.Shapes.Shape do
   end
 
   defp do_convert_change(
-         %__MODULE__{selected_columns: selected_columns} = shape,
+         %__MODULE__{} = shape,
          %Changes.DeletedRecord{old_record: record} = change,
          opts
        ) do
@@ -715,7 +986,7 @@ defmodule Electric.Shapes.Shape do
 
     case project_row_metadata(shape, record, old_refs, opts) do
       {:ok, true, metadata} ->
-        [change |> put_row_metadata(metadata) |> filter_change_columns(selected_columns)]
+        [change |> put_row_metadata(metadata) |> filter_change_columns(shape)]
 
       {:ok, false, _metadata} ->
         []
@@ -723,7 +994,7 @@ defmodule Electric.Shapes.Shape do
   end
 
   defp do_convert_change(
-         %__MODULE__{selected_columns: selected_columns} = shape,
+         %__MODULE__{} = shape,
          %Changes.UpdatedRecord{old_record: old_record, record: record} = change,
          opts
        ) do
@@ -758,24 +1029,26 @@ defmodule Electric.Shapes.Shape do
       end
 
     converted_changes
-    |> Enum.map(&filter_change_columns(&1, selected_columns))
+    |> Enum.map(&filter_change_columns(&1, shape))
     |> Enum.filter(&should_keep_change?/1)
   end
 
   defp project_row_metadata(
-         %__MODULE__{where: where},
+         %__MODULE__{where: where} = shape,
          record,
          refs,
          %{dnf_plan: %DnfPlan{} = dnf_plan, stack_id: stack_id, shape_handle: shape_handle}
        ) do
-    case get_row_metadata(dnf_plan, record, refs, where, stack_id, shape_handle) do
+    encoding = composite_tag_encoding(shape)
+
+    case get_row_metadata(dnf_plan, record, refs, where, stack_id, shape_handle, encoding) do
       {:ok, included?, move_tags, active_conditions} ->
         {:ok, included?, %{move_tags: move_tags, active_conditions: active_conditions}}
     end
   end
 
   defp project_row_metadata(
-         %__MODULE__{where: where, tag_structure: tag_structure},
+         %__MODULE__{where: where, tag_structure: tag_structure} = shape,
          record,
          refs,
          opts
@@ -783,16 +1056,26 @@ defmodule Electric.Shapes.Shape do
     {:ok,
      WhereClause.includes_record?(where, record, WhereClause.subquery_member_from_refs(refs)),
      %{
-       move_tags:
-         make_tags_from_pattern(tag_structure, record, opts[:stack_id], opts[:shape_handle]),
+       move_tags: make_tags_from_pattern(shape, record, opts[:stack_id], opts[:shape_handle]),
        active_conditions: make_active_conditions(tag_structure)
      }}
   end
 
-  defp filter_change_columns(change, nil), do: change
-
-  defp filter_change_columns(change, selected_columns) do
-    Changes.filter_columns(change, selected_columns)
+  # Projection comes first: a shape selecting ["id", "name"] does not list the backing "name_EN", so
+  # filtering ahead of the rename would discard the very column the rename reads.
+  defp filter_change_columns(change, %__MODULE__{} = shape) do
+    change
+    |> Changes.project_locale(
+      shape.locale,
+      shape.localized_columns,
+      Map.get(shape, :localized_backing_columns, [])
+    )
+    |> then(
+      &if(shape.selected_columns,
+        do: Changes.filter_columns(&1, shape.selected_columns),
+        else: &1
+      )
+    )
   end
 
   defp put_row_metadata(change, %{move_tags: move_tags, active_conditions: active_conditions}) do
@@ -820,27 +1103,25 @@ defmodule Electric.Shapes.Shape do
 
   def fill_move_tags(
         %Changes.NewRecord{record: record} = change,
-        %__MODULE__{
-          tag_structure: tag_structure
-        },
+        %__MODULE__{tag_structure: tag_structure} = shape,
         stack_id,
         shape_handle
       ) do
-    move_tags = make_tags_from_pattern(tag_structure, record, stack_id, shape_handle)
+    move_tags = make_tags_from_pattern(shape, record, stack_id, shape_handle)
     active_conditions = make_active_conditions(tag_structure)
     %{change | move_tags: move_tags, active_conditions: active_conditions}
   end
 
   def fill_move_tags(
         %Changes.UpdatedRecord{record: record, old_record: old_record} = change,
-        %__MODULE__{tag_structure: tag_structure},
+        %__MODULE__{tag_structure: tag_structure} = shape,
         stack_id,
         shape_handle
       ) do
-    move_tags = make_tags_from_pattern(tag_structure, record, stack_id, shape_handle)
+    move_tags = make_tags_from_pattern(shape, record, stack_id, shape_handle)
 
     old_move_tags =
-      make_tags_from_pattern(tag_structure, old_record, stack_id, shape_handle) --
+      make_tags_from_pattern(shape, old_record, stack_id, shape_handle) --
         move_tags
 
     active_conditions = make_active_conditions(tag_structure)
@@ -855,9 +1136,7 @@ defmodule Electric.Shapes.Shape do
 
   def fill_move_tags(
         %Changes.DeletedRecord{old_record: record} = change,
-        %__MODULE__{
-          tag_structure: tag_structure
-        },
+        %__MODULE__{tag_structure: tag_structure} = shape,
         stack_id,
         shape_handle
       ) do
@@ -865,19 +1144,26 @@ defmodule Electric.Shapes.Shape do
 
     %{
       change
-      | move_tags: make_tags_from_pattern(tag_structure, record, stack_id, shape_handle),
+      | move_tags: make_tags_from_pattern(shape, record, stack_id, shape_handle),
         active_conditions: active_conditions
     }
   end
 
-  def get_row_metadata(dnf_plan, record, views, where_expr, stack_id, shape_handle) do
-    with {:ok, ref_values} <- Runner.record_to_ref_values(where_expr.used_refs, record) do
-      refs = Map.merge(ref_values, views)
-      active_conditions = compute_active_conditions(dnf_plan, refs)
-      tags = compute_tags(dnf_plan, record, stack_id, shape_handle)
-      included? = compute_inclusion(dnf_plan, active_conditions)
-      {:ok, included?, tags, active_conditions}
-    end
+  def get_row_metadata(
+        dnf_plan,
+        record,
+        views,
+        where_expr,
+        stack_id,
+        shape_handle,
+        encoding \\ :length_prefixed
+      ) do
+    {:ok, ref_values} = Runner.record_to_ref_values(where_expr.used_refs, record)
+    active_conditions = compute_active_conditions(dnf_plan, Map.merge(ref_values, views))
+
+    tags = compute_tags(dnf_plan, record, stack_id, shape_handle, encoding)
+    included? = compute_inclusion(dnf_plan, active_conditions)
+    {:ok, included?, tags, active_conditions}
   end
 
   defp compute_active_conditions(dnf_plan, refs) do
@@ -885,23 +1171,38 @@ defmodule Electric.Shapes.Shape do
       info = dnf_plan.positions[pos]
       pos_expr = Expr.wrap_parser_part(info.ast)
 
-      base_result =
-        case Runner.execute(pos_expr, refs) do
-          {:ok, value} when value not in [nil, false] -> true
-          _ -> false
-        end
+      case Runner.execute(pos_expr, refs) do
+        # Negation must not turn "could not be evaluated" into inclusion: a row would enter the
+        # shape because its predicate was unreadable, which is a leak rather than a match.
+        {:error, _func} ->
+          # The same signal `WhereClause.includes_record?/3` gives a shape without subqueries.
+          :telemetry.execute(
+            [:electric, :shape, :unevaluable_row_excluded],
+            %{count: 1},
+            %{refs: pos_expr.used_refs}
+          )
 
-      if info.negated?, do: not base_result, else: base_result
+          false
+
+        # `NOT unknown` is unknown, not true: a predicate evaluating to SQL NULL never activates a
+        # position, negated or not, or the negation admits a row the 3VL snapshot SQL excludes.
+        {:ok, nil} ->
+          false
+
+        {:ok, value} ->
+          active? = value not in [nil, false]
+          if info.negated?, do: not active?, else: active?
+      end
     end)
   end
 
-  defp compute_tags(dnf_plan, record, stack_id, shape_handle) do
+  defp compute_tags(dnf_plan, record, stack_id, shape_handle, encoding) do
     Enum.map(dnf_plan.disjuncts, fn conj ->
       positions_in_disjunct = MapSet.new(conj, &elem(&1, 0))
 
       Enum.map(0..(dnf_plan.position_count - 1), fn pos ->
         if MapSet.member?(positions_in_disjunct, pos) do
-          compute_tag_slot(dnf_plan.positions[pos], record, stack_id, shape_handle)
+          compute_tag_slot(dnf_plan.positions[pos], record, stack_id, shape_handle, encoding)
         else
           ""
         end
@@ -910,7 +1211,13 @@ defmodule Electric.Shapes.Shape do
     end)
   end
 
-  defp compute_tag_slot(%{subquery?: true, tag_columns: [col]}, record, stack_id, shape_handle) do
+  defp compute_tag_slot(
+         %{subquery?: true, tag_columns: [col]},
+         record,
+         stack_id,
+         shape_handle,
+         _encoding
+       ) do
     SubqueryTags.make_value_hash(stack_id, shape_handle, Map.get(record, col))
   end
 
@@ -918,17 +1225,13 @@ defmodule Electric.Shapes.Shape do
          %{subquery?: true, tag_columns: {:hash_together, cols}},
          record,
          stack_id,
-         shape_handle
+         shape_handle,
+         encoding
        ) do
-    parts =
-      Enum.map(cols, fn col ->
-        col <> ":" <> SubqueryTags.namespace_value(Map.get(record, col))
-      end)
-
-    SubqueryTags.make_value_hash_raw(stack_id, shape_handle, Enum.join(parts))
+    composite_tag_hash(cols, record, stack_id, shape_handle, encoding)
   end
 
-  defp compute_tag_slot(%{subquery?: false}, _record, _stack_id, _shape_handle) do
+  defp compute_tag_slot(%{subquery?: false}, _record, _stack_id, _shape_handle, _encoding) do
     "1"
   end
 
@@ -943,22 +1246,29 @@ defmodule Electric.Shapes.Shape do
   defp make_active_conditions([]), do: []
   defp make_active_conditions(tag_structure), do: List.duplicate(true, length(tag_structure))
 
-  defp make_tags_from_pattern(patterns, record, stack_id, shape_handle) do
+  defp make_tags_from_pattern(
+         %__MODULE__{tag_structure: patterns} = shape,
+         record,
+         stack_id,
+         shape_handle
+       ) do
+    encoding = composite_tag_encoding(shape)
+
     Enum.map(patterns, fn pattern ->
       Enum.map(pattern, fn
         column_name when is_binary(column_name) ->
           SubqueryTags.make_value_hash(stack_id, shape_handle, Map.get(record, column_name))
 
         {:hash_together, columns} ->
-          column_parts =
-            Enum.map(columns, fn col ->
-              col <> ":" <> SubqueryTags.namespace_value(Map.get(record, col))
-            end)
-
-          SubqueryTags.make_value_hash_raw(stack_id, shape_handle, Enum.join(column_parts))
+          composite_tag_hash(columns, record, stack_id, shape_handle, encoding)
       end)
       |> Enum.join("/")
     end)
+  end
+
+  defp composite_tag_hash(columns, record, stack_id, shape_handle, encoding) do
+    fields = Enum.map(columns, &{&1, Map.get(record, &1)})
+    SubqueryTags.make_composite_hash(stack_id, shape_handle, fields, encoding)
   end
 
   defp should_keep_change?(%Changes.UpdatedRecord{removed_move_tags: removed_move_tags})
@@ -1010,10 +1320,15 @@ defmodule Electric.Shapes.Shape do
       do: true
 
   def is_affected_by_relation_change?(
-        %__MODULE__{selected_columns: columns},
+        %__MODULE__{selected_columns: columns} = shape,
         %Changes.Relation{affected_columns: affected_columns}
       ) do
-    Enum.any?(columns, &(&1 in affected_columns))
+    # The backing columns are read by the snapshot without appearing in the selection, so a change to one of
+    # them would otherwise leave the shape live while its rows stop being projectable.
+    Enum.any?(
+      columns ++ Map.get(shape, :localized_backing_columns, []),
+      &(&1 in affected_columns)
+    )
   end
 
   @doc false
@@ -1033,7 +1348,13 @@ defmodule Electric.Shapes.Shape do
       storage: shape.storage,
       replica: shape.replica,
       shape_dependencies: Enum.map(shape.shape_dependencies, &to_json_safe/1),
-      log_mode: shape.log_mode
+      composite_tag_encoding: composite_tag_encoding(shape),
+      log_mode: shape.log_mode,
+      source_positions: Map.get(shape, :source_positions, :legacy),
+      source_generation: Map.get(shape, :source_generation),
+      locale: Map.get(shape, :locale),
+      localized_columns: Map.get(shape, :localized_columns, []),
+      localized_backing_columns: Map.get(shape, :localized_backing_columns, [])
     }
   end
 
@@ -1074,7 +1395,14 @@ defmodule Electric.Shapes.Shape do
          storage: storage_config_from_json(storage),
          replica: String.to_existing_atom(replica),
          shape_dependencies: shape_dependencies,
-         log_mode: String.to_existing_atom(Map.get(data, "log_mode", "full"))
+         composite_tag_encoding:
+           String.to_existing_atom(Map.get(data, "composite_tag_encoding", "legacy")),
+         log_mode: String.to_existing_atom(Map.get(data, "log_mode", "full")),
+         source_positions: String.to_existing_atom(Map.get(data, "source_positions", "legacy")),
+         source_generation: Map.get(data, "source_generation"),
+         locale: Map.get(data, "locale"),
+         localized_columns: Map.get(data, "localized_columns", []),
+         localized_backing_columns: Map.get(data, "localized_backing_columns", [])
        }
        |> fill_tag_structure()}
     end
@@ -1142,6 +1470,7 @@ defmodule Electric.Shapes.Shape do
        where: where,
        selected_columns: actual_selected_columns,
        queryable_columns: Map.get(data, "queryable_columns"),
+       composite_tag_encoding: :legacy,
        replica: String.to_atom(Map.get(data, "replica", "default")),
        storage: storage_config_from_json(Map.get(data, "storage"))
      }}
@@ -1156,13 +1485,24 @@ defmodule Electric.Shapes.Shape do
   defp column_info_from_json({"type", type}), do: {:type, String.to_atom(type)}
   defp column_info_from_json({key, value}), do: {String.to_atom(key), value}
 
+  @doc false
+  def log_description(%__MODULE__{} = shape) do
+    if RequestValues.enabled?(), do: inspect(shape.root_table), else: inspect(shape)
+  end
+
   def otel_attrs(handle, shape, extra \\ []) do
+    where = if(shape.where, do: shape.where.query)
+
+    where_attrs =
+      if RequestValues.enabled?(),
+        do: [
+          "shape.where.present": not is_nil(where),
+          "shape.where.bytes": RequestValues.bytes(where)
+        ],
+        else: ["shape.where": where]
+
     Keyword.merge(
-      [
-        "shape.handle": handle,
-        "shape.root_table": shape.root_table,
-        "shape.where": if(where = shape.where, do: where.query)
-      ],
+      ["shape.handle": handle, "shape.root_table": shape.root_table] ++ where_attrs,
       extra_attrs(extra)
     )
   end

@@ -538,7 +538,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # key2 is owned — skip_row? returns true for it unconditionally
         owned_keys = MapSet.new(["key2"])
 
-        skip_row? = fn key, _tags ->
+        skip_row? = fn key, _tags, _json ->
           MapSet.member?(owned_keys, key)
         end
 
@@ -575,7 +575,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # key2 should be skipped
         owned_keys = MapSet.new(["key2"])
 
-        skip_row? = fn key, _tags ->
+        skip_row? = fn key, _tags, _json ->
           MapSet.member?(owned_keys, key)
         end
 
@@ -614,7 +614,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # Skip rows where ALL tags are in this set
         tags_to_skip = MapSet.new(["tag1", "tag2"])
 
-        skip_row? = fn _key, tags ->
+        skip_row? = fn _key, tags, _json ->
           tags != [] and Enum.all?(tags, &MapSet.member?(tags_to_skip, &1))
         end
 
@@ -655,7 +655,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # Only skip if ALL tags are in this set
         tags_to_skip = MapSet.new(["tag1", "tag2"])
 
-        skip_row? = fn _key, tags ->
+        skip_row? = fn _key, tags, _json ->
           tags != [] and Enum.all?(tags, &MapSet.member?(tags_to_skip, &1))
         end
 
@@ -696,7 +696,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # key3 will be filtered by tags (all tags in skip set)
         tags_to_skip = MapSet.new(["tag1"])
 
-        skip_row? = fn key, tags ->
+        skip_row? = fn key, tags, _json ->
           (tags != [] and Enum.all?(tags, &MapSet.member?(tags_to_skip, &1))) or
             MapSet.member?(owned_keys, key)
         end
@@ -735,7 +735,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
 
         Storage.write_move_in_snapshot!(move_in_data, "test-move-in", opts)
 
-        skip_row? = fn _key, _tags -> false end
+        skip_row? = fn _key, _tags, _json -> false end
 
         {inserted_range, _writer} =
           Storage.append_move_in_snapshot_to_log!(
@@ -768,7 +768,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
 
         tags_to_skip = MapSet.new(["skip_tag"])
 
-        skip_row? = fn _key, tags ->
+        skip_row? = fn _key, tags, _json ->
           tags != [] and Enum.all?(tags, &MapSet.member?(tags_to_skip, &1))
         end
 
@@ -802,7 +802,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         # Tags to skip set is non-empty, but rows have no tags
         tags_to_skip = MapSet.new(["tag1"])
 
-        skip_row? = fn _key, tags ->
+        skip_row? = fn _key, tags, _json ->
           tags != [] and Enum.all?(tags, &MapSet.member?(tags_to_skip, &1))
         end
 
@@ -929,7 +929,7 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
     @moduletag mod: module
 
     # FS is occasionally slow so we set a high timeout for compaction
-    @default_compaction_timeout 2000
+    @default_compaction_timeout ExUnit.configuration()[:assert_receive_timeout]
 
     describe "#{module_name}.compact/1" do
       setup :start_storage
@@ -1120,6 +1120,8 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
       @describetag skip_initialise: true
       setup :start_storage
 
+      # The reopen raises rather than rebuild the shape under its handle, and leaves the files to
+      # the removal its consumer's exit starts.
       test "removes the shape if pg_snapshot has not been set", %{storage: opts} do
         writer = Storage.init_writer!(opts, @shape)
         Storage.mark_snapshot_as_started(opts)
@@ -1127,9 +1129,12 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         assert Storage.snapshot_started?(opts)
 
         Storage.terminate(writer)
-        _writer = Storage.init_writer!(opts, @shape)
 
-        refute Storage.snapshot_started?(opts)
+        assert_raise Storage.Error, ~r/no snapshot position/, fn ->
+          Storage.init_writer!(opts, @shape)
+        end
+
+        assert Storage.snapshot_started?(opts)
       end
 
       test "removes the shape if the snapshot has not finished", %{storage: opts} do
@@ -1138,9 +1143,12 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         Storage.set_pg_snapshot(%{xmin: 22, xmax: 23, xip_list: []}, opts)
 
         Storage.terminate(writer)
-        _writer = Storage.init_writer!(opts, @shape)
 
-        refute Storage.snapshot_started?(opts)
+        assert_raise Storage.Error, ~r/no complete snapshot/, fn ->
+          Storage.init_writer!(opts, @shape)
+        end
+
+        assert Storage.snapshot_started?(opts)
       end
 
       test "removes all shapes if the storage version has changed", %{storage: opts} do
@@ -1150,11 +1158,22 @@ defmodule Electric.ShapeCache.StorageImplimentationsTest do
         Storage.set_pg_snapshot(%{xmin: 22, xmax: 23, xip_list: []}, opts)
 
         Storage.terminate(writer)
-        {mod, arg} = opts
-        opts = {mod, %{arg | version: "different version"}}
-        _writer = Storage.init_writer!(opts, @shape)
 
-        refute Storage.snapshot_started?(opts)
+        # Driven through the recorded version, not the struct field: a build learns it cannot read a
+        # log from the marker on disk, and that marker is the only version an upgrade or a rollback
+        # actually moves.
+        {_mod, arg} = opts
+
+        arg
+        |> PureFileStorage.shape_data_dir(["metadata"])
+        |> Path.join("version.bin")
+        |> File.write!(:erlang.term_to_binary("different version"))
+
+        assert_raise Storage.Error, ~r/holds no version/, fn ->
+          Storage.init_writer!(opts, @shape)
+        end
+
+        assert Storage.snapshot_started?(opts)
       end
     end
 

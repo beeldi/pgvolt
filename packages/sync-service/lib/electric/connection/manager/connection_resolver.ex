@@ -122,11 +122,30 @@ defmodule Electric.Connection.Manager.ConnectionResolver do
         :disable ->
           false
 
-        _ ->
-          ssl_verify_opts(connection_opts[:hostname], connection_opts[:cacertfile])
+        sslmode ->
+          ssl_verify_opts(sslmode, connection_opts[:hostname], connection_opts[:cacertfile])
       end
 
     Keyword.put(connection_opts, :ssl, ssl_opts)
+  end
+
+  # `verify-full` and `verify-ca` are the sslmodes that ask for the server to be authenticated,
+  # so they verify its certificate chain whether or not a CA file was supplied - falling back to
+  # the system's trusted roots when it wasn't - rather than silently accepting any certificate.
+  # `verify-full` additionally requires the certificate to match the hostname.
+  defp ssl_verify_opts(:"verify-full", hostname, cacertfile) do
+    verify_peer_opts(hostname, cacertfile) ++
+      [customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]]
+  end
+
+  defp ssl_verify_opts(:"verify-ca", hostname, cacertfile) do
+    verify_peer_opts(hostname, cacertfile)
+  end
+
+  # A CA file opts the remaining sslmodes into verification too, matching psql, which performs
+  # full verification once sslrootcert is set.
+  defp ssl_verify_opts(_sslmode, hostname, cacertfile) when is_binary(cacertfile) do
+    verify_peer_opts(hostname, cacertfile)
   end
 
   # Unless explicitly requested by the user, Electric doesn't perform server certificate
@@ -158,7 +177,7 @@ defmodule Electric.Connection.Manager.ConnectionResolver do
   #
   # In Electric, specifying the path to a file containing trusted certificate(s) forces the
   # full verification to take place, equivalent to psql's sslmode=verify-full.
-  defp ssl_verify_opts(hostname, nil) do
+  defp ssl_verify_opts(_sslmode, hostname, nil) do
     # Even with `verify: :verify_none` we still need to include `server_name_indication`
     # since, for example, Neon relies on it being present in the client's TLS handshake.
     [
@@ -167,10 +186,18 @@ defmodule Electric.Connection.Manager.ConnectionResolver do
     ]
   end
 
-  defp ssl_verify_opts(hostname, cacertfile_path) when is_binary(cacertfile_path) do
+  defp verify_peer_opts(hostname, nil) do
     [
       verify: :verify_peer,
-      cacertfile: cacertfile_path,
+      cacerts: :public_key.cacerts_get(),
+      server_name_indication: String.to_charlist(hostname)
+    ]
+  end
+
+  defp verify_peer_opts(hostname, cacertfile) when is_binary(cacertfile) do
+    [
+      verify: :verify_peer,
+      cacertfile: cacertfile,
       server_name_indication: String.to_charlist(hostname)
     ]
   end
@@ -262,14 +289,14 @@ defmodule Electric.Connection.Manager.ConnectionResolver do
   defp maybe_fallback_to_no_ssl(conn_opts, error) do
     sslmode = conn_opts[:sslmode]
 
-    if sslmode != :require and is_nil(conn_opts[:cacertfile]) do
-      if not is_nil(sslmode) do
-        # Only log a warning when there's an explicit sslmode parameter in the database
-        # config, meaning the user has requested a certain sslmode.
-        Logger.warning(
-          "Failed to connect to the database using SSL. Trying again, using an unencrypted connection."
-        )
-      end
+    # Only the sslmodes that tolerate an unencrypted connection may retry without SSL, and never
+    # when a CA file has pinned verification. `require`, `verify-ca` and `verify-full` all mandate
+    # encryption, so their SSL failure is surfaced rather than silently downgraded. A downgrade is
+    # always logged, including when no sslmode was requested at all.
+    if sslmode in [nil, :allow, :prefer] and is_nil(conn_opts[:cacertfile]) do
+      Logger.warning(
+        "Failed to connect to the database using SSL. Trying again, using an unencrypted connection."
+      )
 
       {:cont, Keyword.put(conn_opts, :ssl, false)}
     else

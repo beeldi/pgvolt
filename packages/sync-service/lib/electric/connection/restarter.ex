@@ -56,10 +56,31 @@ defmodule Electric.Connection.Restarter do
   end
 
   @doc """
+  The connection manager running now, or `nil` while none runs: between a stop and the start that
+  follows it, or while the database connections sleep.
+
+  A connection manager stands for one run of the connection subsystem. It owns the admin pool and
+  the replication client, which sets the publication up as it starts. Once it stops, its
+  supervisor, or a new one, starts another in its place.
+  """
+  def connection_manager(stack_id) do
+    GenServer.whereis(Electric.Connection.Manager.name(stack_id))
+  end
+
+  @doc """
   Restart the connection subsystem.
+
+  A request names a connection manager, by default the one running when it is made. A caller that
+  decides from something it checked names the manager `connection_manager/1` returned before the
+  check. Once that manager has stopped, another has replaced it or will, and the request is
+  answered without restarting again.
   """
   def restart_connection_subsystem(stack_id) do
-    GenServer.call(name(stack_id), :restart_connection_subsystem)
+    restart_connection_subsystem(stack_id, connection_manager(stack_id))
+  end
+
+  def restart_connection_subsystem(stack_id, manager) do
+    GenServer.call(name(stack_id), {:restart_connection_subsystem, manager})
   end
 
   def start_link(opts) do
@@ -107,12 +128,64 @@ defmodule Electric.Connection.Restarter do
     {:noreply, state}
   end
 
-  def handle_call(:restart_connection_subsystem, _from, state) do
-    :ok = Electric.Connection.Manager.Supervisor.restart(stack_id: state.stack_id)
+  # A stop can take a while, and a caller that times out and asks again queues another request
+  # behind it. Each one would stop the subsystem that just started, as often as the requests came
+  # in, until the connection supervisor gave up on its restart limit and the stack stopped. A
+  # request made while no manager ran came during a restart, which answers it too, or while the
+  # database connections sleep, and the manager that wakes them sets the publication up.
+  def handle_call({:restart_connection_subsystem, manager}, _from, state) do
+    if is_pid(manager), do: stop_subsystem_of(manager, state.stack_id)
     {:reply, :ok, state}
   end
 
   def handle_info({{StatusMonitor, ref}, {:ok, :active}}, %{wait_until_conn_up_ref: ref} = state) do
+    Process.demonitor(ref, [:flush])
     {:noreply, %{state | wait_until_conn_up_ref: nil}}
+  end
+
+  # The wait can also end without the stack becoming active: there may be no status monitor to ask
+  # part-way through a restart, or it can die while the wait is outstanding. The latch has to clear
+  # either way — the `:restore_connection_subsystem` clause above drops every later request while it
+  # is set, so a latch that never clears leaves the connection subsystem unrestorable for good.
+  def handle_info(
+        {{StatusMonitor, ref}, {:error, :not_running}},
+        %{wait_until_conn_up_ref: ref} = state
+      ) do
+    {:noreply, %{state | wait_until_conn_up_ref: nil}}
+  end
+
+  def handle_info(
+        {{StatusMonitor, :down}, ref, :process, _pid, _reason},
+        %{wait_until_conn_up_ref: ref} = state
+      ) do
+    {:noreply, %{state | wait_until_conn_up_ref: nil}}
+  end
+
+  def handle_info({{StatusMonitor, ref}, _result}, state) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, state}
+  end
+
+  def handle_info({{StatusMonitor, :down}, _ref, :process, _pid, _reason}, state),
+    do: {:noreply, state}
+
+  # The manager's supervisor, as upstream stops it: it stops the connection resolver before the
+  # manager, which can be waiting on it, where a stop of the manager alone waits for that wait to
+  # end. Only while the named manager runs: the supervisor outlives a manager that stops on its
+  # own, and starts another, which sets the publication up again. And only the connection
+  # subsystem's supervisor, by the pid the registered manager names as its parent: once the
+  # subsystem has stopped, its name can already belong to the one started in its place.
+  defp stop_subsystem_of(manager, stack_id) do
+    subsystem = connection_subsystem(stack_id)
+
+    with ^manager <- connection_manager(stack_id),
+         {:parent, ^subsystem} when is_pid(subsystem) <- Process.info(manager, :parent),
+         do: Supervisor.stop(subsystem)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp connection_subsystem(stack_id) do
+    GenServer.whereis(Electric.Connection.Manager.Supervisor.name(stack_id: stack_id))
   end
 end

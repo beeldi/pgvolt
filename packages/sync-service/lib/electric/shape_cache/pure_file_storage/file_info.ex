@@ -58,6 +58,11 @@ defmodule Electric.ShapeCache.PureFileStorage.FileInfo do
 
   defdelegate rename(old, new), to: :prim_file
 
+  # Every branch that cannot add to the total returns the accumulator, never 0. This walk threads the
+  # running total through a reduce, so returning 0 for one unreadable entry discarded the size of
+  # every sibling already counted — and this directory is under constant churn from compaction and the
+  # async deleter, so a file vanishing between `ls` and `stat` is routine rather than exceptional.
+  # The metric this feeds is what warns an operator before the volume fills, so it may only err low.
   def recursive_disk_usage(path, acc \\ 0) do
     case stat(path) do
       {:ok, file_info(size: size, type: :regular)} ->
@@ -69,21 +74,21 @@ defmodule Electric.ShapeCache.PureFileStorage.FileInfo do
             Enum.reduce(files, acc, &recursive_disk_usage(Path.join(path, &1), &2))
 
           {:error, _} ->
-            0
+            acc
         end
 
       {:ok, _} ->
-        0
+        acc
 
       {:error, _} ->
-        0
+        acc
     end
   end
 
+  # A seek that fails leaves the file at its start, where the truncate emptied it.
   def truncate(path, size) do
     File.open!(path, [:read, :write, :raw], fn file ->
-      :file.position(file, size)
-      :file.truncate(file)
+      with {:ok, _} <- :file.position(file, size), do: :file.truncate(file)
     end)
   end
 

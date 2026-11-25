@@ -2,11 +2,11 @@
   "$schema": "https://unpkg.com/@changesets/config@3.0.2/schema.json",
   "changelog": "@changesets/cli/changelog",
   "commit": false,
-  "fixed": [["@electric-ax/agents-server", "@electric-ax/agents-server-ui"]],
+  "fixed": [],
   "linked": [],
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["@electric-examples/*"],
+  "ignore": [],
   "privatePackages": { "tag": true, "version": true }
 }

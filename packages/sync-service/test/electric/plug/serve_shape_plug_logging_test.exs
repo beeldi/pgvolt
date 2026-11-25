@@ -69,4 +69,52 @@ defmodule Electric.Plug.ServeShapePlugLoggingTest do
     refute log =~ "legacy"
     refute log =~ "abc123"
   end
+
+  @tag :request_value_redaction
+  test "logs the query string size and omits invalid JSON details", ctx do
+    Application.put_env(:electric, :telemetry_redact_request_values?, true)
+    previous_level = Logger.level()
+
+    on_exit(fn ->
+      Application.delete_env(:electric, :telemetry_redact_request_values?)
+      Logger.configure(level: previous_level)
+    end)
+
+    Logger.configure(level: :debug)
+    query = "offset=-1&table=.invalid_shape&where=query-marker"
+
+    log =
+      capture_log([level: :debug], fn ->
+        request = conn(ctx, :get, nil, "?" <> query)
+        assert call_serve_shape_plug(request, ctx).status == 400
+
+        invalid =
+          Plug.Test.conn(:post, "/v1/shape", ~s({"where":"json-marker"} "json-marker"))
+          |> Plug.Conn.put_req_header("content-type", "application/json")
+
+        assert call_serve_shape_plug(invalid, ctx).status == 400
+      end)
+
+    assert log =~ "Query String: #{byte_size(query)} bytes"
+    assert log =~ "Invalid JSON in request body"
+    refute log =~ "query-marker"
+    refute log =~ "json-marker"
+    refute log =~ "unexpected byte"
+  end
+
+  @tag :request_value_redaction
+  test "labels the request process with query string size" do
+    Application.put_env(:electric, :telemetry_redact_request_values?, true)
+    on_exit(fn -> Application.delete_env(:electric, :telemetry_redact_request_values?) end)
+    query = "where=label-marker&secret=query-credential"
+
+    request =
+      Plug.Test.conn(:get, "/v1/shape?" <> query)
+      |> Plug.Conn.assign(:plug_request_id, "request-id")
+
+    assert Electric.Plug.LabelProcessPlug.call(request, []) == request
+
+    assert Process.get_label(self()) ==
+             "Request request-id - GET /v1/shape?[#{byte_size(query)} bytes]"
+  end
 end

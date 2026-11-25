@@ -6,8 +6,18 @@ defmodule Electric.Plug.DeleteShapePlug do
   plug :fetch_query_params
   plug :put_resp_content_type, "application/json"
 
+  plug :reject_ambiguous_shape_params
   plug :validate_request
   plug :truncate_or_delete_shape
+
+  # A delete given only a `handle` is aimed by it alone, so it must be single-valued too.
+  defp reject_ambiguous_shape_params(%Plug.Conn{assigns: %{config: config}} = conn, _) do
+    Electric.Plug.Utils.reject_ambiguous_shape_params(
+      conn,
+      Access.fetch!(config, :api),
+      ~w(handle)
+    )
+  end
 
   defp validate_request(%Plug.Conn{assigns: %{config: config}} = conn, _) do
     api = Access.fetch!(config, :api)

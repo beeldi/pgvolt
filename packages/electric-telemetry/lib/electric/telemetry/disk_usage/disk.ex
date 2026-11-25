@@ -7,6 +7,8 @@ defmodule ElectricTelemetry.DiskUsage.Disk do
     do_recursive_usage(path, MapSet.new(exclude), 0)
   end
 
+  # An entry that cannot be read adds nothing and keeps the total counted so far: the storage
+  # directory loses files while it is walked, and answering 0 dropped everything walked before it.
   def do_recursive_usage(path, exclude, acc) do
     case stat(path) do
       {:ok, file_info(size: size, type: :regular)} ->
@@ -22,14 +24,14 @@ defmodule ElectricTelemetry.DiskUsage.Disk do
             Enum.reduce(files, acc, &do_recursive_usage(Path.join(path, &1), exclude, &2))
 
           {:error, _} ->
-            0
+            acc
         end
 
       {:ok, _} ->
-        0
+        acc
 
       {:error, _} ->
-        0
+        acc
     end
   end
 

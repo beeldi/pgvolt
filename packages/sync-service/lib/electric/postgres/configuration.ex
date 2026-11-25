@@ -11,6 +11,7 @@ defmodule Electric.Postgres.Configuration do
   @type relation_filters :: PublicationManager.RelationTracker.relation_filters()
 
   @type publication_status :: %{
+          oid: Electric.relation_id(),
           can_alter_publication?: boolean(),
           publishes_all_operations?: boolean(),
           publishes_generated_columns?: boolean()
@@ -21,7 +22,8 @@ defmodule Electric.Postgres.Configuration do
           to_add: relation_filters(),
           to_drop: relation_filters(),
           to_configure_replica_identity: relation_filters(),
-          to_invalidate: relation_filters()
+          to_invalidate: relation_filters(),
+          memberships: %{Electric.oid_relation() => Electric.relation_id()}
         }
 
   @typep changed_relation ::
@@ -35,6 +37,31 @@ defmodule Electric.Postgres.Configuration do
   @typep relation_with_replica :: {Electric.relation_id(), Electric.relation(), <<_::8>>}
 
   @default_action_timeout 5_000
+  # Each catalog query of a pass had Postgrex's default to itself before the pass read them in one
+  # snapshot, and has it there too: the read's deadline gives that time to each of its round trips,
+  # the five around its queries included (`BEGIN`, its isolation level, the read of the
+  # connection's own `statement_timeout`, the budget set from it, `COMMIT`).
+  @catalog_query_timeout 15_000
+  @catalog_read_round_trips 5
+  # The time the membership read after a drain's `LOCK` has, on the server.
+  @drain_read_timeout 1_000
+  # A drain's checkout, which can queue behind another action on the pool, and the eight round
+  # trips of its transaction: `BEGIN`, its isolation level, the read of the connection's own
+  # `statement_timeout`, the budget set before the `LOCK`, the `LOCK`, the budget set before the
+  # read, the read, `COMMIT`.
+  @drain_round_trips 9
+  # An update of a table Electric publishes had the action timeout for its checkout, `BEGIN`, its
+  # statements and `COMMIT`. The isolation level set before it and the membership read after it are
+  # two round trips more, with the second a drain's read has for each: an update that committed in
+  # time on a slow link still does with them. The client's deadline is also what cancels a statement
+  # still waiting for a lock, so the update gives up such a wait two seconds later than it did.
+  @owned_update_timeout @default_action_timeout + 2 * @drain_read_timeout
+  @publishes_generated_columns """
+  CASE WHEN current_setting('server_version_num')::int >= 180000
+      THEN (to_jsonb(p) ->> 'pubgencols') = 's'
+      ELSE FALSE
+  END
+  """
 
   @doc """
   Check whether the publication with the given name exists, and return its status.
@@ -50,27 +77,63 @@ defmodule Electric.Postgres.Configuration do
     query =
       """
       SELECT
+        p.oid,
         pg_get_userbyid(p.pubowner) = current_role as can_alter_publication,
         pubinsert AND pubupdate AND pubdelete AND pubtruncate as publishes_all_operations,
-        CASE WHEN current_setting('server_version_num')::int >= 180000
-            THEN (to_jsonb(p) ->> 'pubgencols') = 's'
-            ELSE FALSE
-        END AS publishes_generated_columns
+        #{@publishes_generated_columns} AS publishes_generated_columns
       FROM pg_publication as p WHERE pubname = $1;
       """
 
     Postgrex.query!(conn, query, [publication_name])
     |> case do
       %Postgrex.Result{
-        rows: [[can_alter_publication, publishes_all_operations, publishes_generated_columns]]
+        rows: [
+          [oid, can_alter_publication, publishes_all_operations, publishes_generated_columns]
+        ]
       } ->
         %{
+          oid: oid,
           can_alter_publication?: can_alter_publication,
           publishes_all_operations?: publishes_all_operations,
           publishes_generated_columns?: publishes_generated_columns
         }
 
       %Postgrex.Result{num_rows: 0} ->
+        :not_found
+    end
+  end
+
+  @doc """
+  The publication's status as `check_publication_status!/2` reads it, for a read of the catalog
+  that is not the check: in a transaction, from its snapshot.
+  """
+  @spec read_publication_status!(Postgrex.conn(), String.t()) ::
+          publication_status() | :not_found
+  def read_publication_status!(conn, publication_name) do
+    %Postgrex.Result{rows: rows} =
+      Postgrex.query!(
+        conn,
+        """
+        SELECT
+          p.oid,
+          pg_get_userbyid(p.pubowner) = current_role,
+          pubinsert AND pubupdate AND pubdelete AND pubtruncate,
+          #{@publishes_generated_columns}
+        FROM pg_publication AS p WHERE pubname = $1
+        """,
+        [publication_name]
+      )
+
+    case rows do
+      [[oid, can_alter, all_operations, generated_columns]] ->
+        %{
+          oid: oid,
+          can_alter_publication?: can_alter,
+          publishes_all_operations?: all_operations,
+          publishes_generated_columns?: generated_columns
+        }
+
+      [] ->
         :not_found
     end
   end
@@ -93,7 +156,7 @@ defmodule Electric.Postgres.Configuration do
       fn conn ->
         case exec_alter_publication_for_table(conn, publication_name, :add, table) do
           :ok -> wait_for_in_flight_writers(conn, table)
-          :noop -> :ok
+          :noop -> wait_for_in_flight_writers_after_another_addition(conn, table)
           {:error, _} = error -> error
         end
       end,
@@ -122,16 +185,22 @@ defmodule Electric.Postgres.Configuration do
   # EXCLUSIVE lock. The wait is bounded by the transaction timeout, on expiry of which the whole
   # transaction, addition included, is rolled back and the configuration reported as failed.
   #
-  # Only called when this transaction is the one adding the table, i.e. when it holds the SHARE
-  # UPDATE EXCLUSIVE lock from the `ALTER PUBLICATION`. That lock serialises concurrent
+  # The automatic path calls this inside the transaction that added the table, while it holds the
+  # SHARE UPDATE EXCLUSIVE lock from the `ALTER PUBLICATION`. That lock serialises concurrent
   # configurators on the same table, so no two of them can hold SHARE at the same time and then
-  # deadlock on upgrading it to ACCESS EXCLUSIVE for the replica identity change. If the table was
-  # already in the publication there is no gap to close, and taking the lock would open that
-  # deadlock up.
-  defp wait_for_in_flight_writers(conn, table) do
+  # deadlock on upgrading it to ACCESS EXCLUSIVE for the replica identity change.
+  #
+  # The path for a publication Electric may not alter, in manual publishing mode or owned by another
+  # role, calls it through `wait_for_in_flight_writers_on_published_table/4`, in its own transaction,
+  # for a table that role already added. No replica identity upgrade follows there - that role owns
+  # it too - so the ACCESS EXCLUSIVE deadlock cannot arise.
+  defp wait_for_in_flight_writers(conn, table, denied \\ & &1) do
     case Postgrex.query(conn, "LOCK TABLE #{table} IN SHARE MODE", []) do
       {:ok, _} ->
         :ok
+
+      {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}} = error} ->
+        Postgrex.rollback(conn, denied.(error))
 
       # `query_canceled` is what the transaction timeout produces, `lock_not_available` what a
       # `lock_timeout` configured on the database side does.
@@ -143,6 +212,188 @@ defmodule Electric.Postgres.Configuration do
 
       {:error, reason} ->
         Postgrex.rollback(conn, reason)
+    end
+  end
+
+  # The table was added by someone else after the publication was checked, with nothing waiting
+  # for the writers then in flight, so the barrier is still owed to the shapes waiting on this
+  # addition. The lock the failed addition took went with its savepoint, and is taken again first
+  # to keep the lock order of an addition.
+  defp wait_for_in_flight_writers_after_another_addition(conn, table) do
+    case Postgrex.query(conn, "LOCK TABLE #{table} IN SHARE UPDATE EXCLUSIVE MODE", []) do
+      {:ok, _} ->
+        wait_for_in_flight_writers(conn, table)
+
+      {:error, %Postgrex.Error{postgres: %{code: code}}}
+      when code in [:query_canceled, :lock_not_available] ->
+        Postgrex.rollback(conn, DbConfigurationError.table_lock_timeout(table))
+
+      {:error, reason} ->
+        Postgrex.rollback(conn, reason)
+    end
+  end
+
+  @doc """
+  Drain in-flight writers on a table whose publication membership Electric did not establish itself,
+  before Electric starts snapshotting it.
+
+  Used when another session adds a table, including in manual publishing mode or when another role
+  owns the publication. That session runs `ALTER PUBLICATION ... ADD TABLE`, so the barrier that
+  `add_table_to_publication/4` takes never runs, and a writer open across that addition has its
+  pre-addition rows in neither the initial snapshot nor the replication stream. Taking the same
+  SHARE lock here, in its own transaction, waits for those writers to finish before the snapshot.
+
+  This barrier needs a privilege the minimal manual-publishing role (SELECT + REPLICATION) does not
+  have, so a caller must tolerate a `{:lock_denied, error}` failure, which only a denial of the
+  `LOCK` itself returns, and rely on the operator taking the barrier in the same transaction as the
+  addition instead - see the manual publishing guide.
+
+  The `LOCK` waits up to `lock_timeout` milliseconds, the action timeout unless given, so that a
+  writer still open fails the drain within it, with the connection kept. A stricter
+  `statement_timeout` of the connection bounds it instead. The bound covers the whole statement, not
+  each lock it takes: on a partitioned table the `LOCK` takes one per partition, each of which can
+  wait. The membership read after it has a second of its own on the server, so a lock granted at the
+  end of its wait still admits the table. The transaction's deadline adds the action timeout for
+  each round trip, the checkout included, so the connection stays checked out past the `LOCK`'s
+  wait through the read and the commit.
+  """
+  @spec wait_for_in_flight_writers_on_published_table(
+          Postgrex.conn(),
+          String.t(),
+          Electric.oid_relation(),
+          {Electric.relation_id(), publication_status()},
+          pos_integer() | :infinity
+        ) ::
+          {:ok, Electric.relation_id()}
+          | {:error, {:lock_denied, Postgrex.Error.t()}}
+          | {:error, term()}
+  def wait_for_in_flight_writers_on_published_table(
+        conn,
+        publication,
+        oid_relation,
+        expected,
+        lock_timeout \\ @default_action_timeout
+      ) do
+    {_oid, relation} = oid_relation
+    table = Utils.relation_to_sql(relation)
+    Logger.debug("Waiting for in-flight writers on #{table} before serving it")
+
+    run_in_transaction(
+      conn,
+      fn conn ->
+        :ok = read_committed(conn)
+        own = own_statement_timeout(conn, lock_timeout)
+
+        # Only a denial of the `LOCK` itself says that this role cannot drain the table. One met
+        # before it, while the timeout is set up, fails the drain as any other error does.
+        :ok =
+          with_statement_timeout(conn, own, lock_timeout, fn ->
+            wait_for_in_flight_writers(conn, table, &{:lock_denied, &1})
+          end)
+
+        with_statement_timeout(conn, own, @drain_read_timeout, fn ->
+          published_table_membership!(conn, publication, oid_relation, expected)
+        end)
+      end,
+      drain_transaction_timeout(lock_timeout)
+    )
+  end
+
+  # The server bounds the `LOCK` and the read. The client's deadline, which closes the connection
+  # when it passes, gives each round trip the time an action has. A deadline any slow link can
+  # outlast fails a drain as a lost connection does, and the next try, with the same deadline,
+  # the same way: the table stays held with no writer left to wait for.
+  defp drain_transaction_timeout(:infinity), do: :infinity
+
+  defp drain_transaction_timeout(lock_timeout),
+    do: lock_timeout + @drain_read_timeout + @drain_round_trips * @default_action_timeout
+
+  # A `statement_timeout`, not a `lock_timeout`, which bounds each lock the statement waits for. Its
+  # expiry is a `query_canceled` the server raises, which `wait_for_in_flight_writers/3` reports as
+  # a lock timeout. The connection's own, read in milliseconds from `pg_settings`, stays when it is
+  # stricter, whether it came from the server's configuration, the role or a `SET` on the session.
+  defp own_statement_timeout(_conn, :infinity), do: nil
+
+  defp own_statement_timeout(conn, _lock_timeout) do
+    %{rows: [[setting]]} =
+      Postgrex.query!(
+        conn,
+        "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'",
+        []
+      )
+
+    String.to_integer(setting)
+  end
+
+  # Each statement sets its own budget: a `SET LOCAL` lasts the transaction, so the one the `LOCK`
+  # set would bound the read too.
+  defp with_statement_timeout(_conn, nil, _timeout, fun), do: fun.()
+  defp with_statement_timeout(_conn, _own, :infinity, fun), do: fun.()
+
+  defp with_statement_timeout(conn, own, timeout, fun) when is_integer(timeout) and timeout > 0 do
+    budget = if own > 0, do: min(own, timeout), else: timeout
+    :ok = set_local_statement_timeout(conn, Integer.to_string(budget))
+    fun.()
+  end
+
+  defp set_local_statement_timeout(conn, setting) do
+    Postgrex.query!(conn, "SELECT set_config('statement_timeout', $1, true)", [setting])
+    :ok
+  end
+
+  # A role or a database can make `REPEATABLE READ` its transactions' default, under which the
+  # first statement takes the snapshot every later one reads. The membership read that follows a
+  # lock's wait would then see the catalog as it was before the wait, and admit a table taken out
+  # of the publication meanwhile. Under `READ COMMITTED` each statement reads what has committed
+  # when it starts. The level is set before any other statement, which is when it can be.
+  defp read_committed(conn) do
+    Postgrex.query!(conn, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", [])
+    :ok
+  end
+
+  @doc false
+  def update_and_verify_table_membership(conn, publication, oid_relation, expected, update_table) do
+    run_in_transaction(
+      conn,
+      fn conn ->
+        :ok = read_committed(conn)
+
+        with :ok <- update_table.(conn),
+             {:ok, _membership} = verified <-
+               published_table_membership!(conn, publication, oid_relation, expected) do
+          verified
+        else
+          {:error, reason} -> Postgrex.rollback(conn, reason)
+        end
+      end,
+      @owned_update_timeout
+    )
+  end
+
+  def published_table_membership!(
+        conn,
+        publication,
+        {oid, {schema, name}},
+        {membership, %{oid: publication_oid, publishes_generated_columns?: publishes_generated}}
+      ) do
+    case Postgrex.query!(
+           conn,
+           """
+           SELECT pr.oid
+           FROM pg_publication_rel pr
+           JOIN pg_publication p ON p.oid = pr.prpubid
+           JOIN pg_class c ON c.oid = pr.prrelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE p.pubname = $1 AND c.oid = $2 AND n.nspname = $3 AND c.relname = $4
+             AND c.relreplident = 'f'
+             AND ($5::oid IS NULL OR pr.oid = $5) AND p.oid = $6
+             AND p.pubinsert AND p.pubupdate AND p.pubdelete AND p.pubtruncate
+             AND (#{@publishes_generated_columns}) = $7
+           """,
+           [publication, oid, schema, name, membership, publication_oid, publishes_generated]
+         ) do
+      %{rows: [[membership]]} -> {:ok, membership}
+      %{rows: []} -> {:error, :publication_changed}
     end
   end
 
@@ -215,6 +466,13 @@ defmodule Electric.Postgres.Configuration do
     )
   end
 
+  defp publication_exists?(conn, publication_name) do
+    %Postgrex.Result{num_rows: num_rows} =
+      Postgrex.query!(conn, "SELECT 1 FROM pg_publication WHERE pubname = $1", [publication_name])
+
+    num_rows > 0
+  end
+
   # Returns `:noop` when the table was already in the requested state, i.e. the publication was
   # not altered. Note that in that case the savepoint rollback also releases the lock that
   # `ALTER PUBLICATION` took on the table.
@@ -242,9 +500,11 @@ defmodule Electric.Postgres.Configuration do
         Postgrex.query!(conn, "RELEASE SAVEPOINT before_publication", [])
 
         case reason do
-          # undefined object can happen when removing a table that was already removed
-          %{postgres: %{code: :undefined_object, message: "relation" <> _}} when op_atom == :drop ->
-            :noop
+          # undefined object can happen when removing a table that was already removed, and also
+          # when the publication itself is missing. The message would tell them apart, but Postgres
+          # translates it into the server's `lc_messages` language, so the catalog is asked instead.
+          %{postgres: %{code: :undefined_object}} when op_atom == :drop ->
+            if publication_exists?(conn, publication_name), do: :noop, else: {:error, reason}
 
           # duplicate object can happen when adding a table that was already added
           %{postgres: %{code: :duplicate_object}} when op_atom == :add ->
@@ -285,13 +545,17 @@ defmodule Electric.Postgres.Configuration do
 
     # Compare with current relations in the publication to determine what needs dropping/adding,
     # as well as reconfiguring because of misconfigured replica identity
-    pub_tables = get_publication_tables!(conn, publication_name)
-    publication_rels = MapSet.new(pub_tables, &trim_relation_with_replica/1)
+    pub_tables = get_publication_memberships!(conn, publication_name)
+
+    memberships =
+      Map.new(pub_tables, fn {oid, rel, _, membership} -> {{oid, rel}, membership} end)
+
+    publication_rels = MapSet.new(Map.keys(memberships))
 
     misconfigured_publication_rels =
       pub_tables
-      |> Enum.filter(fn {_oid, _rel, replident} -> replident != "f" end)
-      |> MapSet.new(&trim_relation_with_replica/1)
+      |> Enum.reject(fn {_oid, _rel, replident, _membership} -> replident == "f" end)
+      |> MapSet.new(fn {oid, rel, _, _} -> {oid, rel} end)
 
     correctly_configured_publication_rels =
       MapSet.difference(publication_rels, misconfigured_publication_rels)
@@ -320,12 +584,18 @@ defmodule Electric.Postgres.Configuration do
       to_add: to_add,
       to_drop: to_drop,
       to_configure_replica_identity: to_configure_replica_identity,
-      to_invalidate: to_invalidate
+      to_invalidate: to_invalidate,
+      memberships: memberships
     }
   end
 
   @spec get_publication_tables!(Postgrex.conn(), String.t()) :: list(relation_with_replica())
   def get_publication_tables!(conn, publication) do
+    for {oid, relation, replica, _membership} <- get_publication_memberships!(conn, publication),
+        do: {oid, relation, replica}
+  end
+
+  defp get_publication_memberships!(conn, publication) do
     # `pg_publication_tables` is too clever for us -- if you add a partitioned
     # table to the publication `pg_publication_tables` lists all the partitions
     # as members, not the actual partitioned table. `pg_publication_rel`
@@ -337,7 +607,7 @@ defmodule Electric.Postgres.Configuration do
         conn,
         """
         SELECT
-          pc.oid, (pn.nspname, pc.relname), pc.relreplident
+          pc.oid, (pn.nspname, pc.relname), pc.relreplident, ppr.oid
         FROM
           pg_publication_rel ppr
         JOIN
@@ -355,6 +625,17 @@ defmodule Electric.Postgres.Configuration do
       )
 
     Enum.map(rows, &List.to_tuple/1)
+  end
+
+  @spec existing_relation_oids!(Postgrex.conn(), [Electric.relation_id()]) ::
+          MapSet.t(Electric.relation_id())
+  def existing_relation_oids!(_conn, []), do: MapSet.new()
+
+  def existing_relation_oids!(conn, oids) do
+    %{rows: rows} =
+      Postgrex.query!(conn, "SELECT oid FROM pg_class WHERE oid = ANY($1::oid[])", [oids])
+
+    MapSet.new(rows, fn [oid] -> oid end)
   end
 
   @spec get_replica_identities!(Postgrex.conn(), list(Electric.oid_relation())) ::
@@ -417,6 +698,61 @@ defmodule Electric.Postgres.Configuration do
       )
 
     Enum.map(rows, &List.to_tuple/1)
+  end
+
+  @doc """
+  Runs `fun` on a connection in a read-only transaction, so that every query it makes reads one
+  snapshot of the catalog. `fun` makes `queries` queries, and the transaction has `query_timeout`
+  for each of its round trips. The server also ends each statement at `query_timeout`, or at the
+  connection's own `statement_timeout` where that is stricter: one query that stalls fails the read
+  there, as it did when it ran alone, and frees the connection, which on an admin pool of one the
+  inspector shares, instead of holding it to the read's deadline. Returns what `fun` returns, or
+  `{:error, error}` when a query fails.
+  """
+  @spec read_in_one_snapshot(
+          Postgrex.conn(),
+          pos_integer(),
+          (Postgrex.conn() -> result),
+          pos_integer()
+        ) :: result | {:error, term()}
+        when result: term()
+  def read_in_one_snapshot(db_pool, queries, fun, query_timeout \\ @catalog_query_timeout) do
+    run_in_transaction(
+      db_pool,
+      fn conn ->
+        Postgrex.query!(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY", [])
+        :ok = set_catalog_query_budget(conn, query_timeout)
+        fun.(conn)
+      end,
+      (queries + @catalog_read_round_trips) * query_timeout
+    )
+  end
+
+  # The budget is read and set with `SHOW` and `SET`, not with the `SELECT`s a drain's are: neither
+  # takes a snapshot, so the read's is still taken at `fun`'s first query and sees what committed
+  # until then. The connection's own setting, from the server's configuration, the role or a `SET`
+  # on the session, stays when it is stricter.
+  defp set_catalog_query_budget(conn, query_timeout) do
+    %{rows: [[setting]]} = Postgrex.query!(conn, "SHOW statement_timeout", [])
+    own = shown_milliseconds(setting)
+    budget = if own > 0, do: min(own, query_timeout), else: query_timeout
+    Postgrex.query!(conn, "SET LOCAL statement_timeout = #{budget}", [])
+    :ok
+  end
+
+  @shown_time_units %{
+    "" => 1,
+    "ms" => 1,
+    "s" => 1_000,
+    "min" => 60_000,
+    "h" => 3_600_000,
+    "d" => 86_400_000
+  }
+
+  # `SHOW` gives a time in the largest unit that divides it, and `0` with none.
+  defp shown_milliseconds(setting) do
+    {value, unit} = Integer.parse(setting)
+    value * Map.fetch!(@shown_time_units, unit)
   end
 
   defp run_in_transaction(db_pool, fun, timeout) do

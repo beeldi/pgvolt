@@ -78,6 +78,55 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTrackerTest do
   end
 
   describe "handle_flush_notification/4" do
+    test "a derived operation flushed beyond the source offset completes the same transaction", %{
+      tracker: tracker
+    } do
+      tracker = handle_txn(tracker, batch(lsn: 10), ["shape1"])
+      tracker = FlushTracker.handle_flush_notification(tracker, "shape1", LogOffset.new(10, 1), 1)
+
+      refute FlushTracker.tracked?(tracker, "shape1")
+      assert FlushTracker.empty?(tracker)
+      assert FlushTracker.stalled_shapes(tracker, 100_000, 1_000) == []
+      assert_receive {:flush_confirmed, 10}
+    end
+
+    test "an early derived-operation flush completes when its source commit is registered", %{
+      tracker: tracker
+    } do
+      tracker = handle_txn(tracker, batch(lsn: 10), ["shape1"])
+      tracker = FlushTracker.handle_flush_notification(tracker, "shape1", LogOffset.new(20, 1), 1)
+
+      assert FlushTracker.tracked?(tracker, "shape1")
+
+      tracker = handle_txn(tracker, batch(lsn: 20), ["shape1"], 2)
+
+      refute FlushTracker.tracked?(tracker, "shape1")
+      assert FlushTracker.empty?(tracker)
+      assert FlushTracker.stalled_shapes(tracker, 100_000, 1_000) == []
+      assert_receive {:flush_confirmed, 20}
+    end
+
+    # Scatter-ahead publishes to consumers before the commit registers here, so a shape
+    # can report a commit flushed before that commit is tracked. Re-arming the entry at
+    # an offset the consumer already reported would pin it forever: the consumer pops the
+    # offset mapping it used and never sends that offset again.
+    test "completes an entry whose flush notification arrived before the commit",
+         %{tracker: tracker} do
+      # Arrange
+      tracker = handle_txn(tracker, batch(lsn: 10), ["shape1"])
+
+      # Act
+      tracker =
+        tracker
+        |> FlushTracker.handle_flush_notification("shape1", LogOffset.new(20, 0), 1)
+        |> handle_txn(batch(lsn: 20), ["shape1"], 2)
+
+      # Assert
+      refute FlushTracker.tracked?(tracker, "shape1")
+      assert FlushTracker.empty?(tracker)
+      assert FlushTracker.stalled_shapes(tracker, 100_000, 1_000) == []
+    end
+
     test "should notify immediately when last shape catches up", %{tracker: tracker} do
       tracker = handle_txn(tracker, batch(lsn: 1, last_offset: 10), ["shape1"])
 
@@ -368,6 +417,19 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTrackerTest do
         |> handle_txn(batch(lsn: 6, last_offset: 10), ["shape2"], 400)
 
       assert FlushTracker.stalled_shapes(tracker, 480, 100) == ["shape1"]
+    end
+
+    test "entry exposes a tracked shape's offsets and progress timestamp", %{tracker: tracker} do
+      tracker =
+        tracker
+        |> handle_txn(batch(lsn: 5, last_offset: 10), ["shape1"], 100)
+        |> FlushTracker.handle_flush_notification("shape1", LogOffset.new(5, 5), 300)
+
+      assert {last_sent, last_flushed, 300} = FlushTracker.entry(tracker, "shape1")
+      assert last_sent == LogOffset.new(5, 10)
+      assert last_flushed == LogOffset.new(5, 5)
+
+      assert FlushTracker.entry(tracker, "shape2") == nil
     end
   end
 

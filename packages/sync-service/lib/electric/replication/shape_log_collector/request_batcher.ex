@@ -43,6 +43,8 @@ defmodule Electric.Replication.ShapeLogCollector.RequestBatcher do
     Electric.ProcessRegistry.name(stack_id, __MODULE__)
   end
 
+  @add_shape_timeout 45_000
+
   @doc """
   Registers a shape with the SLC, returns after the shape has actually
   been added and is receiving operations from the log.
@@ -51,17 +53,27 @@ defmodule Electric.Replication.ShapeLogCollector.RequestBatcher do
           Electric.stack_id(),
           Electric.shape_handle(),
           Electric.Shapes.Shape.t(),
-          :create | :restore
+          :create | :restore,
+          timeout()
         ) :: :ok | {:error, any()}
+  def add_shape(stack_id, shape_handle, shape, action, timeout \\ @add_shape_timeout)
+
   # shapes that are being restored are already in the filters
   # because they were restored from the ets at startup
-  def add_shape(_stack_id, _shape_handle, _shape, :restore) do
+  def add_shape(_stack_id, _shape_handle, _shape, :restore, _timeout) do
     :ok
   end
 
   # new shapes -- created after boot -- do need to be added
-  def add_shape(stack_id, shape_handle, shape, :create) do
-    GenServer.call(name(stack_id), {:add_shape, shape_handle, shape}, 45_000)
+  def add_shape(stack_id, shape_handle, shape, :create, timeout) do
+    GenServer.call(name(stack_id), {:add_shape, shape_handle, shape}, timeout)
+  catch
+    # Exiting is not one of the two results declared above, and the caller has an invalidation path
+    # for `{:error, _}` that never ran. Registration queues behind the processor's `:infinity` event
+    # handling, so one slow event kills every consumer waiting to register; `handle_writer_termination`
+    # then reads that exit as a crash and answers with a crash report plus a second async removal --
+    # load added to a stack already too slow to register.
+    :exit, {:timeout, _} -> {:error, :timeout}
   end
 
   @doc """

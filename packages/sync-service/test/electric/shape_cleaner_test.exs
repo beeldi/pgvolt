@@ -53,7 +53,22 @@ defmodule Electric.ShapeCleanerTest do
         %{stack_id: stack_id} = ctx
         existing_shapes = Map.get(ctx, :restore_shapes, [])
 
-        patch_shape_status(list_shapes: fn ^stack_id -> existing_shapes end)
+        # The boot restore folds reduce_encoded_shapes/3; list_shapes/1 stays stubbed for paths
+        # that read it.
+        patch_shape_status(
+          list_shapes: fn ^stack_id -> existing_shapes end,
+          reduce_encoded_shapes: fn
+            ^stack_id, acc, fun ->
+              existing_shapes
+              |> Enum.map(fn {handle, shape} -> {handle, shape.root_table_id, shape} end)
+              |> Enum.reduce(acc, fun)
+
+            other_stack_id, acc, fun ->
+              Repatch.real(
+                Electric.ShapeCache.ShapeStatus.reduce_encoded_shapes(other_stack_id, acc, fun)
+              )
+          end
+        )
 
         Support.TestUtils.activate_mocks_for_descendant_procs(
           Electric.Replication.ShapeLogCollector
@@ -96,7 +111,7 @@ defmodule Electric.ShapeCleanerTest do
       setup(ctx) do
         Electric.Replication.ShapeLogCollector.mark_as_ready(ctx.stack_id)
 
-        assert_receive :shape_log_collector_ready, 1000
+        assert_receive :shape_log_collector_ready
 
         # don't suspend consumers in this test -- we don want them terminating
         # themselves before we clean them up
@@ -289,11 +304,108 @@ defmodule Electric.ShapeCleanerTest do
       assert_shape_cleanup(shape_handle)
 
       # Allow asynchronous queued removal to complete
-      assert_receive {:DOWN, ^consumer_ref, :process, _pid, {:shutdown, :cleanup}}, 1_000
+      assert_receive {:DOWN, ^consumer_ref, :process, _pid, {:shutdown, :cleanup}}
 
       {shape_handle2, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
       assert :started = ShapeCache.await_snapshot_start(shape_handle2, ctx.stack_id)
       assert shape_handle != shape_handle2
+    end
+
+    test "lists the shapes again when the shape db connection stays busy past its deadline",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+      assert :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      consumer_ref =
+        Electric.Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
+        |> Process.monitor()
+
+      calls = :atomics.new(1, [])
+      Support.TestUtils.activate_mocks_for_descendant_procs(ShapeCleaner)
+
+      patch_shape_status(
+        list_shape_handles_for_relations: fn stack_id, relations ->
+          if :atomics.add_get(calls, 1, 1) == 1 do
+            exit({:timeout, {NimblePool, :checkout, [:shape_db]}})
+          end
+
+          Repatch.real(
+            Electric.ShapeCache.ShapeStatus.list_shape_handles_for_relations(stack_id, relations)
+          )
+        end
+      )
+
+      :ok =
+        ShapeCleaner.remove_shapes_for_relations(
+          ctx.stack_id,
+          [{@shape.root_table_id, {"public", "items"}}]
+        )
+
+      assert_shape_cleanup(shape_handle)
+      assert_receive {:DOWN, ^consumer_ref, :process, _pid, {:shutdown, :cleanup}}
+      assert 2 = :atomics.get(calls, 1)
+    end
+
+    test "removes the shape again when the shape db connection stays busy past its deadline",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+      assert :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      consumer_ref =
+        Electric.Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
+        |> Process.monitor()
+
+      calls = :atomics.new(1, [])
+      Support.TestUtils.activate_mocks_for_descendant_procs(ShapeCleaner)
+
+      patch_shape_status(
+        remove_shape: fn stack_id, handle ->
+          if :atomics.add_get(calls, 1, 1) == 1 do
+            exit({:timeout, {NimblePool, :checkout, [:shape_db]}})
+          end
+
+          Repatch.real(Electric.ShapeCache.ShapeStatus.remove_shape(stack_id, handle))
+        end
+      )
+
+      :ok =
+        ShapeCleaner.remove_shapes_for_relations(
+          ctx.stack_id,
+          [{@shape.root_table_id, {"public", "items"}}]
+        )
+
+      assert_shape_cleanup(shape_handle)
+      assert_receive {:DOWN, ^consumer_ref, :process, _pid, {:shutdown, :cleanup}}
+
+      assert :error =
+               Electric.ShapeCache.ShapeStatus.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+    end
+
+    # The log collector holds replication while it waits, so its wait ends.
+    test "a waiting removal gives up once the shape db connection stays busy past its wait",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+      assert :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      calls = :atomics.new(1, [])
+
+      patch_shape_status(
+        remove_shape: fn _stack_id, _handle ->
+          :atomics.add_get(calls, 1, 1)
+          exit({:timeout, {NimblePool, :checkout, [:shape_db]}})
+        end
+      )
+
+      removal =
+        Task.async(fn ->
+          catch_exit(ShapeCleaner.remove_shapes_waiting(ctx.stack_id, [shape_handle], 200))
+        end)
+
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, {:timeout, {NimblePool, :checkout, _}}} = Task.yield(removal, 5_000)
+      end)
+
+      assert :atomics.get(calls, 1) > 1
     end
   end
 
@@ -317,7 +429,7 @@ defmodule Electric.ShapeCleanerTest do
       ShapeCleaner.remove_shape_storage_async(ctx.stack_id, handles)
 
       for handle <- handles do
-        assert_receive {:cleanup, ^handle}, 500
+        assert_receive {:cleanup, ^handle}
       end
 
       remaining_handles = Agent.get(agent, & &1)
@@ -369,7 +481,11 @@ defmodule Electric.ShapeCleanerTest do
     end
   end
 
-  defp assert_shape_log_collector_active_shapes(ctx, shape_handles_active, timeout \\ 500) do
+  defp assert_shape_log_collector_active_shapes(
+         ctx,
+         shape_handles_active,
+         timeout \\ ExUnit.configuration()[:assert_receive_timeout]
+       ) do
     assert shape_handles_active ==
              Electric.Replication.ShapeLogCollector.active_shapes(ctx.stack_id)
   rescue

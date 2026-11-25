@@ -1,7 +1,10 @@
 defmodule Electric.Client.PollTest do
   use ExUnit.Case, async: true
 
+  alias Electric.Client.Mock
+  alias Electric.Client.Poll
   alias Electric.Client.ShapeState
+  alias Electric.Client.Message.ChangeMessage
   alias Electric.Client.Message.ResumeMessage
   alias Electric.Client.Offset
 
@@ -133,6 +136,34 @@ defmodule Electric.Client.PollTest do
       unique_busters = Enum.uniq(busters)
 
       assert length(unique_busters) == 100
+    end
+  end
+
+  describe "request/3 on a resumed stream" do
+    test "derives the value mapper from the resumed schema before mapping live rows" do
+      {:ok, client} = Mock.new()
+
+      resume = %ResumeMessage{
+        shape_handle: "resume-handle",
+        offset: Offset.new(0, 1),
+        schema: %{"id" => %{type: "int8"}, "name" => %{type: "text"}}
+      }
+
+      state = ShapeState.from_resume(resume)
+
+      ref =
+        Mock.async_response(client,
+          status: 200,
+          shape_handle: "resume-handle",
+          last_offset: Offset.new(0, 2),
+          body: Mock.transaction([%{id: "42", name: "Ada"}], operation: :insert, lsn: 2)
+        )
+
+      {:ok, messages, new_state} = Poll.request(client, state)
+      _request = Mock.async_await(ref)
+
+      assert [%ChangeMessage{value: %{"id" => 42, "name" => "Ada"}} | _] = messages
+      assert is_function(new_state.value_mapper_fun, 1)
     end
   end
 end

@@ -36,8 +36,11 @@ defmodule Electric.Shapes.Consumer do
   require TransactionFragment
 
   @default_snapshot_timeout 45_000
+  @publication_retry_interval 1_000
   @stop_and_clean_timeout 30_000
   @stop_and_clean_reason ShapeCleaner.consumer_cleanup_reason()
+  @stop_and_suspend_reason ShapeCleaner.consumer_suspend_reason()
+  @catalog_confirm_timeout 1_000
   @word_size :erlang.system_info(:wordsize)
 
   # Minimum wall-clock interval (ms) between consumer-forced full GC sweeps. Caps how much CPU
@@ -89,6 +92,25 @@ defmodule Electric.Shapes.Consumer do
   @spec whereis(Electric.stack_id(), Electric.shape_handle()) :: pid() | nil
   def whereis(stack_id, shape_handle) do
     consumer_pid(stack_id, shape_handle)
+  end
+
+  @doc """
+  Whether the shape's log holds every transaction its consumer has been handed.
+
+  False while the consumer buffers transactions behind its snapshot or a move-in, once it is
+  stopping on one (a truncate, a relation change), or when it does not answer within `timeout`.
+  A shape without a consumer process wrote everything it was handed before that process exited:
+  a consumer that crashed or is being removed stays registered until its shape is gone.
+  """
+  @spec holds_handled_transactions?(Electric.stack_id(), Electric.shape_handle(), timeout()) ::
+          boolean()
+  def holds_handled_transactions?(stack_id, shape_handle, timeout) do
+    case consumer_pid(stack_id, shape_handle) do
+      nil -> true
+      pid -> GenServer.call(pid, :holds_handled_transactions?, timeout)
+    end
+  catch
+    :exit, _reason -> false
   end
 
   def stop(nil, _reason) do
@@ -195,6 +217,11 @@ defmodule Electric.Shapes.Consumer do
     {:reply, ref, %{state | monitors: [{pid, ref} | monitors]}, state.hibernate_after}
   end
 
+  def handle_call(:holds_handled_transactions?, _from, state) do
+    holds? = not (state.terminating? or deferring_flush_notifications?(state))
+    {:reply, holds?, state, state.hibernate_after}
+  end
+
   def handle_call(:await_snapshot_start, _from, state) when is_snapshot_started(state) do
     {:reply, :started, state, state.hibernate_after}
   end
@@ -263,6 +290,26 @@ defmodule Electric.Shapes.Consumer do
   end
 
   def handle_cast(
+        {:publication_admission_failed, shape_handle, %SnapshotError{} = error},
+        %{shape_handle: shape_handle} = state
+      ) do
+    retry? =
+      error.type == :publication_admission_pending or
+        (SnapshotError.retryable?(error) and not is_nil(state.initial_snapshot_state.pg_snapshot) and
+           ShapeCache.Storage.snapshot_started?(state.storage))
+
+    if retry? do
+      # A held admission precedes snapshot streaming. Keep the consumer available for the next
+      # request and for any flushes the collector is already waiting for.
+      state = State.reply_to_snapshot_waiters(state, {:error, error})
+      schedule_publication_retry()
+      {:noreply, state, state.hibernate_after}
+    else
+      handle_cast({:snapshot_failed, shape_handle, error}, state)
+    end
+  end
+
+  def handle_cast(
         {:snapshot_failed, shape_handle, %SnapshotError{} = error},
         %{shape_handle: shape_handle} = state
       ) do
@@ -273,9 +320,34 @@ defmodule Electric.Shapes.Consumer do
       clean_table(root_table_id, state)
     end
 
-    state
-    |> State.reply_to_snapshot_waiters({:error, error})
-    |> stop_and_clean()
+    state = State.reply_to_snapshot_waiters(state, {:error, error})
+
+    if SnapshotError.retryable?(error) and not is_snapshot_started(state) do
+      # Transient failure before any row was streamed (connection-subsystem restart,
+      # pool queue timeout): keep the shape's data and status and suspend the consumer so
+      # the next request restarts it and retries the snapshot, instead of deleting the
+      # shape and forcing a full re-snapshot fan-out just as the connection recovers.
+      #
+      # This reads the consumer's own state, not the storage marker. The marker stays set
+      # for the life of the shape, so on a restored shape with a complete snapshot it is
+      # already true when the snapshotter fails to register the shape with the publication.
+      # The consumer hears of a snapshot starting to stream only from the snapshotter, so
+      # the flag is false until then.
+      #
+      # A new shape's storage has no snapshot started, and it is removed instead, as upstream
+      # removes it. A request at offset `now` answers without waiting for the snapshot, so a
+      # client may hold an offset of the shape, and a snapshot taken at the restart under the
+      # same handle would hold the changes made since, which the log after it leaves out.
+      if ShapeCache.Storage.snapshot_started?(state.storage),
+        do: stop_and_suspend(state),
+        else: stop_and_clean(state)
+    else
+      # A failure after the snapshot began streaming leaves a started-but-incomplete
+      # snapshot on disk. Suspending would let the lazy restart read snapshot_started? as
+      # done, skip re-running the snapshot, and serve a snapshot that never completes -
+      # wedging the read path. Clean so the shape re-snapshots from scratch.
+      stop_and_clean(state)
+    end
   end
 
   def handle_cast({:snapshot_exists, shape_handle}, %{shape_handle: shape_handle} = state) do
@@ -306,6 +378,25 @@ defmodule Electric.Shapes.Consumer do
     handle_info(msg, cancel_suspend_timer(state))
   end
 
+  # The retried snapshotter writes the snapshot, so it is watched as the first one is, and it
+  # starts only once the consumer has handled the exit of the one before it.
+  def handle_info(:retry_publication_admission, %{snapshotter: nil} = state) do
+    case start_snapshotter(state, nil) do
+      {:ok, pid} ->
+        {:noreply, %{state | snapshotter: Process.monitor(pid, tag: :snapshotter_down)},
+         state.hibernate_after}
+
+      {:error, {:already_started, _pid}} ->
+        schedule_publication_retry()
+        {:noreply, state, state.hibernate_after}
+    end
+  end
+
+  def handle_info(:retry_publication_admission, state) do
+    schedule_publication_retry()
+    {:noreply, state, state.hibernate_after}
+  end
+
   def handle_info({:initialize_shape, shape, opts}, state) do
     %{stack_id: stack_id, shape_handle: shape_handle} = state
 
@@ -320,11 +411,17 @@ defmodule Electric.Shapes.Consumer do
       :ignore -> :ok
     end
 
-    writer = ShapeCache.Storage.init_writer!(storage, shape)
+    case restore_checks(state, storage, opts.action) do
+      :removed ->
+        stop_and_clean(state)
 
-    state = State.initialize(state, storage, writer)
+      :ok ->
+        writer = init_writer!(storage, shape, opts.action)
 
-    finish_initialization(state, opts.action, Map.get(opts, :otel_ctx, nil))
+        state = State.initialize(state, storage, writer)
+
+        finish_initialization(state, opts.action, Map.get(opts, :otel_ctx, nil))
+    end
   end
 
   def handle_info({ShapeCache.Storage, :flushed, flushed_offset}, state) do
@@ -380,7 +477,7 @@ defmodule Electric.Shapes.Consumer do
   end
 
   def handle_info(
-        {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn},
+        {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn, patterns},
         state
       ) do
     Logger.debug(fn ->
@@ -391,7 +488,7 @@ defmodule Electric.Shapes.Consumer do
       state,
       apply_event(
         state,
-        {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn}
+        {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn, patterns}
       )
     )
   end
@@ -405,6 +502,10 @@ defmodule Electric.Shapes.Consumer do
 
     # No-op as the raise will crash the process
     stop_and_clean(state)
+  end
+
+  def handle_info({:snapshotter_down, ref, :process, _pid, _reason}, %{snapshotter: ref} = state) do
+    {:noreply, %{state | snapshotter: nil}, state.hibernate_after}
   end
 
   def handle_info({:materializer_shape_invalidated, shape_handle}, state) do
@@ -476,11 +577,17 @@ defmodule Electric.Shapes.Consumer do
   # A suspending consumer must have flushed and notified everything it has written:
   # an empty txn_offset_mapping and no deferred flush notification guarantee that the
   # ShapeLogCollector holds no pending flush entry for this shape.
+  #
+  # The snapshot is written by its own process, which outlives a suspension of its consumer, and
+  # its end has no record on disk until its syncs are done: a change that restored the consumer
+  # meanwhile would reopen the writer on a snapshot it cannot tell from an incomplete one. So the
+  # consumer suspends only once it has handled that process's exit, which reaches it after the
+  # failure the process reports, if any, and that exit wakes it to suspend.
   defp consumer_can_suspend?(state) do
     is_snapshot_started(state) and not Shape.has_dependencies(state.shape) and
       not state.materializer_subscribed? and is_nil(state.deferred_materializer_subscription) and
       is_nil(state.pending_txn) and state.txn_offset_mapping == [] and
-      is_nil(state.pending_flush_offset)
+      is_nil(state.pending_flush_offset) and is_nil(state.snapshotter)
   end
 
   defp schedule_suspend_timer(%{suspend_after: nil} = state), do: state
@@ -622,26 +729,39 @@ defmodule Electric.Shapes.Consumer do
   #
   # When snapshot info arrives, `process_buffered_txn_fragments/1` will be called to process
   # buffered fragments in order.
+  # The buffer is bounded too, so a slow snapshot during a bulk transaction cannot grow it
+  # without limit.
   defp handle_txn_fragment(
          %TransactionFragment{} = txn_fragment,
          %State{buffering?: true} = state
        ) do
-    State.add_to_buffer(state, txn_fragment)
+    state
+    |> State.add_to_buffer(txn_fragment)
+    |> check_snapshot_wait_buffer_size()
   end
 
   # Skip transactions already applied and persisted (e.g. replayed from the persistent
-  # replication slot on restart) - ones at or below `latest_offset`.
+  # replication slot or the transaction journal on restart) - ones at or below `latest_offset`.
   #
-  # This skips whole transactions, relying on a replayed transaction being entirely
-  # at-or-below or entirely above `latest_offset`, never straddling it. In-memory
-  # `latest_offset` advances per written fragment (see `write_txn_fragment_to_storage/2`),
-  # not only at commit — but on the replay path the guarantee holds: after a restart
-  # `latest_offset` is restored from storage at a commit boundary
-  # (`Storage.fetch_latest_offset/1`, from `last_{seen,persisted}_txn_offset`), and the
-  # replication slot replays whole transactions from a commit boundary
-  # (`confirmed_flush_lsn`).
+  # After a restart `latest_offset` is restored from storage at a commit boundary
+  # (`Storage.fetch_latest_offset/1`, from `last_{seen,persisted}_txn_offset`), and the replay
+  # starts at a commit boundary too. In-memory `latest_offset` advances per written fragment (see
+  # `write_txn_fragment_to_storage/2`), not only at commit.
   defp handle_txn_fragment(%TransactionFragment{last_log_offset: offset} = txn_fragment, state)
        when LogOffset.is_log_offset_lte(offset, state.latest_offset) do
+    skip_txn_fragment(state, txn_fragment)
+  end
+
+  # A replayed transaction can still straddle `latest_offset`. The offset a shape keeps after a
+  # transaction is its own last change in it, not the transaction's last offset, and a large
+  # transaction arrives in fragments: those up to that change are skipped above, the later ones
+  # end above it. Between transactions (no `pending_txn`), storage holds the whole of the
+  # transaction `latest_offset` belongs to, so any fragment of it is a replay.
+  defp handle_txn_fragment(
+         %TransactionFragment{last_log_offset: %LogOffset{tx_offset: tx_offset}} = txn_fragment,
+         %State{pending_txn: nil, latest_offset: %LogOffset{tx_offset: latest_tx_offset}} = state
+       )
+       when tx_offset <= latest_tx_offset do
     skip_txn_fragment(state, txn_fragment)
   end
 
@@ -649,7 +769,7 @@ defmodule Electric.Shapes.Consumer do
   defp handle_txn_fragment(%TransactionFragment{} = txn_fragment, state)
        when TransactionFragment.complete_transaction?(txn_fragment) and
               needs_initial_filtering(state) do
-    case InitialSnapshot.filter(state.initial_snapshot_state, state.storage, txn_fragment.xid) do
+    case InitialSnapshot.filter(state.initial_snapshot_state, state.storage, txn_fragment) do
       {:consider_flushed, initial_snapshot_state} ->
         # This transaction is already included in the snapshot, flush it immediately and skip
         # writing it to the shape log.
@@ -685,12 +805,12 @@ defmodule Electric.Shapes.Consumer do
   # Initial filtering is giving us the advantage of not accumulating fragments for a
   # transaction that is going to be skipped anyway. This works for any value of state.write_unit.
   defp handle_txn_fragment(
-         %TransactionFragment{has_begin?: true, xid: xid} = txn_fragment,
+         %TransactionFragment{has_begin?: true} = txn_fragment,
          %State{} = state
        )
        when needs_initial_filtering(state) do
     state =
-      case InitialSnapshot.filter(state.initial_snapshot_state, state.storage, xid) do
+      case InitialSnapshot.filter(state.initial_snapshot_state, state.storage, txn_fragment) do
         {:consider_flushed, initial_snapshot_state} ->
           # This transaction is already included in the snapshot, so mark it as flushed to
           # ignore any of its follow-up fragments.
@@ -712,11 +832,10 @@ defmodule Electric.Shapes.Consumer do
 
   # Defensive: this is only ever reached with a `pending_txn` set — a transaction's
   # BEGIN fragment creates it (see the `has_begin?` clauses above) before any fragment
-  # gets here. The only way to arrive with `pending_txn: nil` is a transaction that
-  # straddled `latest_offset`: its BEGIN fragment skipped by the already-applied clause
-  # while a later fragment was not. The commit-aligned restore + whole-transaction replay
-  # invariant (documented on that clause) rules this out; fail loudly with a clear message
-  # rather than crash on `nil.consider_flushed?` if it is ever violated.
+  # gets here. The only way to arrive with `pending_txn: nil` is a transaction whose
+  # BEGIN fragment was skipped as already applied while a later fragment was not, and the
+  # straddle clause above skips those. Fail loudly with a clear message rather than crash
+  # on `nil.consider_flushed?` if it ever happens anyway.
   defp process_txn_fragment(%TransactionFragment{last_log_offset: offset}, %State{
          pending_txn: nil
        }) do
@@ -747,7 +866,7 @@ defmodule Electric.Shapes.Consumer do
 
         case txns do
           [] ->
-            state
+            check_txn_buffer_size(state)
 
           [txn] ->
             Logger.debug(fn -> "Txn assembled in Shapes.Consumer: #{inspect(txn)}" end)
@@ -762,6 +881,39 @@ defmodule Electric.Shapes.Consumer do
         |> maybe_complete_pending_txn(txn_fragment)
     end
   end
+
+  # With write_unit=txn every change of the transaction in progress stays in memory until its
+  # commit, so one bulk transaction on the shape's table grows this process without bound.
+  # Past the limit, remove the shape instead: its clients refetch, as after a truncate, and
+  # the other shapes keep going.
+  defp check_txn_buffer_size(%State{txn_buffer_max_changes: max} = state) when is_integer(max) do
+    buffered = TransactionBuilder.num_changes(state.transaction_builder)
+
+    if buffered > max do
+      Logger.warning(
+        "Transaction #{state.pending_txn.xid} holds #{buffered} changes for shape " <>
+          "#{state.shape_handle}, over the limit of #{max} - terminating shape"
+      )
+
+      mark_for_removal(state)
+    else
+      state
+    end
+  end
+
+  defp check_txn_buffer_size(state), do: state
+
+  defp check_snapshot_wait_buffer_size(%State{txn_buffer_max_changes: max} = state)
+       when is_integer(max) and state.buffered_changes > max do
+    Logger.warning(
+      "Shape #{state.shape_handle} buffered #{state.buffered_changes} changes while waiting " <>
+        "for its snapshot, over the limit of #{max} - terminating shape"
+    )
+
+    mark_for_removal(state)
+  end
+
+  defp check_snapshot_wait_buffer_size(state), do: state
 
   defp skip_txn_fragment(state, %TransactionFragment{commit: nil}), do: state
 
@@ -796,7 +948,7 @@ defmodule Electric.Shapes.Consumer do
 
       {[], 0} ->
         Logger.debug(fn ->
-          "No relevant changes found for #{inspect(shape)} in txn fragment of txn #{xid}"
+          "No relevant changes found for #{Shape.log_description(shape)} in txn fragment of txn #{xid}"
         end)
 
         state
@@ -809,14 +961,10 @@ defmodule Electric.Shapes.Consumer do
 
         timestamp = System.monotonic_time()
 
-        {lines, total_size} = prepare_log_entries(converted_changes, xid, shape)
-        writer = ShapeCache.Storage.append_fragment_to_log!(lines, writer)
+        {lines, total_size} =
+          LogItems.encode_changes(converted_changes, xid, fragment.full_xid, shape)
 
-        # The Materializer must see all txn changes for correct tracking of move-ins and
-        # move-outs for the outer shape. The commit=false flag ensure it doesn't yet notify
-        # outer consumers about those changes.
-        :ok =
-          notify_materializer_of_new_changes(state, converted_changes, commit: false, xid: xid)
+        writer = ShapeCache.Storage.append_fragment_to_log!(lines, writer)
 
         txn =
           PendingTxn.update_with_changes(
@@ -834,6 +982,14 @@ defmodule Electric.Shapes.Consumer do
     Enum.reduce_while(changes, {[], 0}, fn
       %Changes.TruncatedRelation{}, _acc ->
         {:halt, :includes_truncate}
+
+      # Already converted by the router on behalf of every shape in this change's fan-out class,
+      # all of which would have produced the same result. Nothing left to decide here.
+      %Changes.PreparedChange{} = prepared, {changes, count} ->
+        {:cont, {[prepared | changes], count + 1}}
+
+      %Changes.FramedBlock{} = block, {changes, count} ->
+        {:cont, {[block | changes], count + block.count}}
 
       change, {changes, count} = acc ->
         # Apply Shape.convert_change to each change to:
@@ -853,12 +1009,22 @@ defmodule Electric.Shapes.Consumer do
     end)
     |> case do
       {[change | _] = changes, num_changes} ->
-        {changes, num_changes, LogItems.expected_offset_after_split(change)}
+        {changes, num_changes, LogItems.expected_offset_after_split(converted(change))}
 
       acc ->
         acc
     end
   end
+
+  defp converted(%Changes.PreparedChange{change: change}), do: change
+
+  defp converted(%Changes.FramedBlock{}) do
+    raise "a framed block reached last? marking as a fragment's trailing change — the " <>
+            "assembler must always emit a run's trailing change individually so marking " <>
+            "never splits a block"
+  end
+
+  defp converted(change), do: change
 
   # Mark the last change in the list as last? when this is a commit fragment
   # This is needed for clients to know when a transaction is complete
@@ -868,7 +1034,9 @@ defmodule Electric.Shapes.Consumer do
 
   defp maybe_mark_last_change(changes, _commit) do
     [head | tail] = changes
-    [%{head | last?: true} | tail]
+    # Only this shape's copy of the change is last, so the encoding prepared for the whole class
+    # no longer describes it. Unwrapping drops it and this one change is re-encoded below.
+    [%{converted(head) | last?: true} | tail]
   end
 
   defp maybe_complete_pending_txn(%State{} = state, %TransactionFragment{commit: nil}),
@@ -887,7 +1055,11 @@ defmodule Electric.Shapes.Consumer do
       # Signal commit to storage to allow it to advance its internal txn offset
       writer = ShapeCache.Storage.signal_txn_commit!(txn.xid, writer)
 
-      :ok = notify_new_changes_with_offset(state, [], state.latest_offset, xid: txn.xid)
+      :ok =
+        notify_new_changes_with_offset(state, [], state.latest_offset,
+          xid: txn.xid,
+          full_xid: txn_fragment.full_xid
+        )
 
       lag = calculate_replication_lag(txn_fragment.commit.commit_timestamp)
 
@@ -972,7 +1144,7 @@ defmodule Electric.Shapes.Consumer do
 
       {state, notification, num_changes, total_size} ->
         if notification do
-          :ok = notify_new_changes(state, notification, xid: txn.xid)
+          :ok = notify_new_changes(state, notification, xid: txn.xid, full_xid: txn.full_xid)
 
           OpenTelemetry.add_span_attributes(%{
             num_bytes: total_size,
@@ -1044,6 +1216,11 @@ defmodule Electric.Shapes.Consumer do
     mark_for_removal(state)
   end
 
+  defp handle_event_error(state, reason)
+       when reason in [:ambiguous_text_pair_exclusion, :overlapping_dependency_replacement] do
+    mark_for_removal(state)
+  end
+
   defp handle_txn_with_truncate(xid, state) do
     # TODO: This is a very naive way to handle truncations: if ANY relevant truncates are
     #       present in the transaction, we're considering the whole transaction empty, and
@@ -1069,8 +1246,15 @@ defmodule Electric.Shapes.Consumer do
           opts :: keyword()
         ) :: :ok
   defp notify_new_changes_with_offset(state, changes_or_bounds, latest_log_offset, opts) do
-    :ok = notify_materializer_of_new_changes(state, changes_or_bounds, opts)
-    :ok = notify_clients_of_new_changes(state, latest_log_offset)
+    case notify_materializer_of_new_changes(state, changes_or_bounds, opts) do
+      :ok ->
+        :ok = notify_clients_of_new_changes(state, latest_log_offset)
+
+      # The changes give a key the view already holds, which a client reading them would apply
+      # as Postgres did not: the materializer's exit cleans this shape up, and its clients refetch.
+      {:error, :duplicate_key} ->
+        :ok
+    end
   end
 
   @spec notify_clients_of_new_changes(
@@ -1096,7 +1280,7 @@ defmodule Electric.Shapes.Consumer do
           state :: map(),
           changes_or_bounds :: list(Changes.change()) | {LogOffset.t(), LogOffset.t()},
           opts :: keyword()
-        ) :: :ok
+        ) :: :ok | {:error, :duplicate_key}
   defp notify_materializer_of_new_changes(
          %{materializer_subscribed?: true} = state,
          changes_or_bounds,
@@ -1115,6 +1299,8 @@ defmodule Electric.Shapes.Consumer do
     :exit, :noproc -> :ok
     :exit, {:normal, _} -> :ok
     :exit, {:shutdown, _} -> :ok
+    # The materializer stopped on a key it already holds before it took these changes.
+    :exit, {{:shutdown, :duplicate_key}, _} -> {:error, :duplicate_key}
   end
 
   defp notify_materializer_of_new_changes(_state, _changes_or_bounds, _opts), do: :ok
@@ -1151,18 +1337,119 @@ defmodule Electric.Shapes.Consumer do
     {:stop, @stop_and_clean_reason, mark_for_removal(state)}
   end
 
-  defp prepare_log_entries(changes, xid, shape) do
-    changes
-    |> Stream.flat_map(
-      &LogItems.from_change(&1, xid, Shape.pk(shape, &1.relation), shape.replica)
-    )
-    |> Enum.map_reduce(0, fn {offset, %{key: key, headers: %{operation: operation}} = log_item},
-                             total_size ->
-      json_line = Jason.encode!(log_item)
-      line_tuple = {offset, key, operation, json_line}
-      {line_tuple, total_size + byte_size(json_line)}
-    end)
+  # Stop without marking the shape for removal: its ShapeStatus entry and on-disk
+  # data survive, and the consumer is deregistered so the next request restarts
+  # it lazily and re-runs the snapshotter.
+  defp stop_and_suspend(state) do
+    {:stop, @stop_and_suspend_reason, state}
   end
+
+  # The catalog has the snapshot as started, complete if read at boot, so clients may hold
+  # offsets into it, while the storage holds none: its files were lost, to a crash before they
+  # were synced or to a removal whose catalog write did not land. A writer would create the
+  # storage as new and take a second snapshot under the same handle, so the shape is removed.
+  defp refuse_restore_without_snapshot!(%State{} = state, storage, :restore) do
+    if ShapeCache.ShapeStatus.snapshot_started?(state.stack_id, state.shape_handle) and
+         not ShapeCache.Storage.snapshot_started?(storage) do
+      raise ShapeCache.Storage.Error,
+        kind: :data_loss,
+        message:
+          "Shape #{state.shape_handle} has a started snapshot in the catalog and none in " <>
+            "storage; it is removed, not rebuilt under its handle"
+    end
+  end
+
+  defp refuse_restore_without_snapshot!(_state, _storage, :create), do: :ok
+
+  # The stack's table of shapes goes with its owner, which the stack restarts, and every consumer
+  # with it. A look at it then says nothing of the shape, and a raise would remove the shape, row
+  # and files, by a cleanup that outlives the restart. A stop would drop the change the restore
+  # runs for: the collector takes a consumer's shutdown for a teardown and, with nothing else
+  # pending, lets the change be acknowledged though the shape never wrote it. So the restore goes
+  # on as it did before these looks, with the one the catalog answers alone: a shape it no longer
+  # holds was removed. The restart stops the consumer with the rest, and the restore that follows
+  # it makes both looks.
+  defp restore_checks(%State{} = state, storage, action) do
+    if removed_since_restore_read?(state, action) do
+      :removed
+    else
+      refuse_restore_without_snapshot!(state, storage, action)
+      :ok
+    end
+  rescue
+    error in ArgumentError ->
+      cond do
+        ShapeCache.ShapeStatus.available?(state.stack_id) -> reraise(error, __STACKTRACE__)
+        action == :restore and not catalog_holds_handle?(state) -> :removed
+        true -> :ok
+      end
+  end
+
+  # A restore reads the shape from the catalog before its consumer registers. A removal that took
+  # the row in between found no consumer to stop and removes the files, and a writer opened now
+  # would create the storage anew and take a second snapshot under the retired handle. The
+  # consumer is registered by now: a removal that takes the row after this read finds it, and its
+  # stop waits behind this initialization, so the files it removes are not opened after it.
+  #
+  # The stack's table can miss a shape the catalog holds: a refresh rebuilds it from SQLite, which
+  # the write buffer lags, and sweeps the rows the rebuild did not write, so a shape added in
+  # between loses its row. A miss is confirmed against the catalog, buffer first, before the shape
+  # is taken for removed: a removal takes the shape out of the catalog before the table, so one
+  # the catalog still holds was not removed.
+  defp removed_since_restore_read?(%State{} = state, :restore) do
+    not ShapeCache.ShapeStatus.has_shape_handle?(state.stack_id, state.shape_handle) and
+      not catalog_holds_handle?(state)
+  end
+
+  defp removed_since_restore_read?(_state, :create), do: false
+
+  # A walk of every shape can hold an exclusive-mode store's one connection past the read's
+  # checkout deadline, a read can meet another connection's lock, which the query does not answer
+  # either way, a read can fail, on an I/O error say, that SQLite recovers from, and the catalog
+  # can be restarting, its pool gone. Such a read says nothing of the shape, and its exit or raise
+  # removed a shape the catalog holds, files and all: the restore goes on as it did before this
+  # check, and the writer opens the storage or refuses storage that is gone
+  # (`init_restored_writer!/2`).
+  #
+  # The read waits for a connection at most `@catalog_confirm_timeout`, and for a lock another
+  # connection holds at most SQLite's busy timeout. The restore of a change's shape holds that
+  # change's routing, which the collector gives a bounded time before it restarts replication,
+  # and the catalog read that found the shape for the restore already took its own.
+  defp catalog_holds_handle?(%State{} = state) do
+    ShapeCache.ShapeStatus.ShapeDb.handle_exists?(
+      state.stack_id,
+      state.shape_handle,
+      @catalog_confirm_timeout
+    )
+  rescue
+    error in ShapeCache.ShapeStatus.ShapeDb.Error ->
+      restore_unconfirmed(state, Exception.message(error))
+
+    # The tables of the catalog's write buffer and of its pool registry go while the stack
+    # restarts the catalog.
+    error in ArgumentError ->
+      restore_unconfirmed(state, Exception.message(error))
+  catch
+    # The read waited past its deadline, or the pool is gone: not registered while the catalog
+    # restarts, or stopped during the read.
+    :exit, {_reason, {NimblePool, :checkout, _}} = reason ->
+      restore_unconfirmed(state, inspect(reason))
+  end
+
+  defp restore_unconfirmed(%State{} = state, reason) do
+    Logger.warning(
+      "Restoring shape #{state.shape_handle} without confirming it in the catalog, which " <>
+        "did not answer: #{reason}"
+    )
+
+    true
+  end
+
+  # A restored shape's storage was created with it; the restore never creates it anew.
+  defp init_writer!(storage, shape, :restore),
+    do: ShapeCache.Storage.init_restored_writer!(storage, shape)
+
+  defp init_writer!(storage, shape, :create), do: ShapeCache.Storage.init_writer!(storage, shape)
 
   defp calculate_replication_lag(nil), do: 0
 
@@ -1279,19 +1566,9 @@ defmodule Electric.Shapes.Consumer do
           # to wait for the snapshot asynchronously and if we called publication manager here it would
           # block and prevent await_snapshot_start calls from adding snapshot subscribers.
 
-          {:ok, _pid} =
-            Shapes.DynamicConsumerSupervisor.start_snapshotter(
-              state.stack_id,
-              %{
-                stack_id: state.stack_id,
-                shape: state.shape,
-                shape_handle: state.shape_handle,
-                storage: state.storage,
-                otel_ctx: otel_ctx
-              }
-            )
+          {:ok, pid} = start_snapshotter(state, otel_ctx)
 
-          {:noreply, state}
+          {:noreply, %{state | snapshotter: Process.monitor(pid, tag: :snapshotter_down)}}
 
         {:error, state} ->
           stop_and_clean(state)
@@ -1299,6 +1576,20 @@ defmodule Electric.Shapes.Consumer do
     else
       stop_and_clean(state)
     end
+  end
+
+  defp start_snapshotter(state, otel_ctx) do
+    Shapes.DynamicConsumerSupervisor.start_snapshotter(state.stack_id, %{
+      stack_id: state.stack_id,
+      shape: state.shape,
+      shape_handle: state.shape_handle,
+      storage: state.storage,
+      otel_ctx: otel_ctx
+    })
+  end
+
+  defp schedule_publication_retry do
+    Process.send_after(self(), :retry_publication_admission, @publication_retry_interval)
   end
 
   defp all_materializers_alive?(state) do
@@ -1317,7 +1608,7 @@ defmodule Electric.Shapes.Consumer do
       else
         _ ->
           Logger.warning(
-            "Materializer for shape is not alive, invalidating shape",
+            "Materializer for shape is not alive, invalidating shape #{state.shape_handle}",
             shape_handle: shape_handle,
             state_shape_handle: state.shape_handle
           )

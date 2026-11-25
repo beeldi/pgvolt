@@ -5,6 +5,8 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
   alias Electric.Shapes.Consumer.Materializer
   alias Electric.Shapes.Consumer.SetupEffects
   alias Electric.Shapes.Consumer.State
+  alias Electric.Shapes.Consumer.Subqueries.MoveBroadcast
+  alias Electric.Shapes.Consumer.Subqueries.Views
   alias Electric.Shapes.DnfPlan
   alias Electric.Shapes.Shape
 
@@ -13,6 +15,7 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
   def build(%State{shape: %Shape{shape_dependencies_handles: dep_handles}} = state, action)
       when dep_handles != [] do
     {:ok, dnf_plan} = DnfPlan.compile(state.shape)
+    dnf_plan = MoveBroadcast.allow_direct_text_pairs(dnf_plan, state.shape, state.stack_id)
 
     {views, dep_handle_to_ref, dep_index_to_ref} =
       dep_handles
@@ -21,8 +24,9 @@ defmodule Electric.Shapes.Consumer.EventHandlerBuilder do
                                          {views, handle_mapping, index_mapping} ->
         materializer_opts = %{stack_id: state.stack_id, shape_handle: handle}
         :ok = Materializer.wait_until_ready(materializer_opts)
-        view = Materializer.get_link_values(materializer_opts)
         ref = ["$sublink", Integer.to_string(index)]
+        keys = Materializer.get_link_view(materializer_opts)
+        view = Views.new(keys, state.shape.where.used_refs[ref])
 
         {Map.put(views, ref, view), Map.put(handle_mapping, handle, {index, ref}),
          Map.put(index_mapping, index, ref)}

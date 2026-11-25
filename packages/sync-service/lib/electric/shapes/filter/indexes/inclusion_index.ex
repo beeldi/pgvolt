@@ -4,31 +4,58 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
 
   The index is a tree stored in ETS. Each node in the tree represents a value in the array.
 
-  When adding a shape to the tree, the shape's array is sorted and deduplicated, then first value is used to find the child node of the root node.
+  When adding a shape to the tree, the shape's array is flattened, sorted and deduplicated, then first value is used to find the child node of the root node.
   The child to that node is then found using the next value and so on. When there are no values left, the shape is then added to the last node.
   Adding the shape to the last node is done by adding the shape the node's `WhereCondition` which represents the rest of the where
   clause of the shape (the `@>` comparison may be only part of the where clause) and can also contain many shapes.
 
-  To find the shapes affected by a change, the values of the array in the change are sorted and deduplicated. The tree is then traversed using the values
+  To find the shapes affected by a change, the values of the array in the change are flattened, sorted and deduplicated. The tree is then traversed using the values
   and any nodes that contain shapes on the way are added to the result set, because if the node has been reached the shape's array must be a subset of the change's array.
+
+  A node is an array *element*, never a sub-array. Postgres's `@>`, `<@`, `&&` and `= ANY` compare
+  element membership regardless of dimension, so `{{1,2},{3,4}} @> {1}` holds; the array parser
+  returns a multidimensional value as nested lists, and leaving those nested would key the tree on
+  `[1, 2]` where a shape is registered under `1`, routing no shapes to a record that matches. The
+  same `List.flatten/1` the interpreter applies in `Env.KnownFunctions` is applied here so the
+  index and the interpreter agree on membership.
 
   ## ETS Storage
 
   Tree nodes are stored in the incl_index_table with keys of the form:
-  `{condition_id, field, path}` -> `%{keys: [...], condition_id: condition_id | nil}`
+  `{condition_id, field, path}` -> `%{child_count: non_neg_integer(), condition_id: condition_id | nil}`
 
   Where `path` is the list of array values traversed to reach this node (e.g., `[]` for root, `[1]`, `[1, 2]`, etc.).
+
+  A node holds a count of its children rather than a list of their values. A child already IS the row
+  `{condition_id, field, path ++ [value]}`, so the list duplicated what the table knows, and it was
+  the largest thing in the row: maintaining it cost O(children) per insert - a full copy of the list
+  in and out of ETS - and routing merged the change's array against it, O(children) per change, where
+  the child count grows with the shape population. The count is enough for the two questions actually
+  asked of it: is this node prunable, and is there any point descending.
 
   Additionally, the field type is cached at:
   `{:type, condition_id, field}` -> type
   This enables O(1) type lookup for parsing record values.
+
+  A separate ordered set stores only paths with a where condition, keyed by
+  `{condition_id, field, node_condition_id}`, each with the hash of every element. The bound key
+  prefix lets a fallback scan just the paths for one field of one condition, while the trie keeps
+  constant-time probes.
+
+  What that scan costs is kept at:
+  `{:scan_cost, condition_id, field}` -> the number of paths plus their elements
+  so that routing can tell whether the trie walk or the scan is cheaper.
   """
 
   alias Electric.Replication.Eval.Env
   alias Electric.Shapes.Filter
+  alias Electric.Shapes.Filter.Indexes.IndexValue
   alias Electric.Shapes.Filter.WhereCondition
 
   @env Env.new()
+  @extra_record_probes 4_096
+  @path_batch_size 128
+  @element_hash_range 4_294_967_296
 
   def add_shape(
         %Filter{incl_index_table: table} = filter,
@@ -40,7 +67,7 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
     %{field: field, type: type, value: array_value, and_where: and_where} = optimisation
     :ets.insert(table, {{:type, condition_id, field}, type})
 
-    values = array_value |> Enum.sort() |> Enum.dedup()
+    values = canonical_elements(List.flatten(array_value), type)
 
     ctx = %{
       filter: filter,
@@ -67,14 +94,10 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
 
     case :ets.lookup(ctx.table, child_key) do
       [] ->
-        :ets.insert(ctx.table, {child_key, %{keys: [], condition_id: nil}})
-
-        # Update parent's keys list (maintain sorted order)
-        updated_keys = insert_sorted(node.keys, value)
-        :ets.insert(ctx.table, {node_key, %{node | keys: updated_keys}})
+        :ets.insert(ctx.table, {child_key, %{child_count: 0, condition_id: nil}})
+        :ets.insert(ctx.table, {node_key, %{node | child_count: node.child_count + 1}})
 
       _ ->
-        # Child exists, no need to update parent's keys
         :ok
     end
 
@@ -93,6 +116,13 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
           new_id = Filter.next_condition_id(ctx.filter)
           WhereCondition.init(ctx.filter, new_id)
           :ets.insert(ctx.table, {node_key, %{node | condition_id: new_id}})
+
+          :ets.insert(
+            ctx.filter.incl_index_paths_table,
+            {{ctx.condition_id, ctx.field, new_id}, Enum.map(path, &element_hash/1), path}
+          )
+
+          add_scan_cost(ctx, path, 1)
           new_id
 
         existing_id ->
@@ -111,27 +141,13 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
   defp get_or_create_node(table, node_key) do
     case :ets.lookup(table, node_key) do
       [] ->
-        node = %{keys: [], condition_id: nil}
+        node = %{child_count: 0, condition_id: nil}
         :ets.insert(table, {node_key, node})
         node
 
       [{_, node}] ->
         node
     end
-  end
-
-  defp insert_sorted([], value), do: [value]
-
-  defp insert_sorted([head | tail], value) when value < head do
-    [value, head | tail]
-  end
-
-  defp insert_sorted([head | tail], value) when value == head do
-    [head | tail]
-  end
-
-  defp insert_sorted([head | tail], value) do
-    [head | insert_sorted(tail, value)]
   end
 
   def remove_shape(
@@ -141,8 +157,8 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
         optimisation,
         branch_key
       ) do
-    %{field: field, value: array_value, and_where: and_where} = optimisation
-    ordered = array_value |> Enum.sort() |> Enum.dedup()
+    %{field: field, type: type, value: array_value, and_where: and_where} = optimisation
+    ordered = canonical_elements(List.flatten(array_value), type)
 
     ctx = %{
       filter: filter,
@@ -159,9 +175,10 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
     root_key = {condition_id, field, []}
 
     case :ets.lookup(table, root_key) do
-      [{_, root_node}] when root_node.keys == [] and root_node.condition_id == nil ->
+      [{_, root_node}] when root_node.child_count == 0 and root_node.condition_id == nil ->
         :ets.delete(table, root_key)
         :ets.delete(table, {:type, condition_id, field})
+        :ets.delete(table, {:scan_cost, condition_id, field})
         :deleted
 
       _ ->
@@ -187,8 +204,7 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
 
           case :ets.lookup(ctx.table, node_key) do
             [{_, node}] ->
-              updated_keys = List.delete(node.keys, value)
-              :ets.insert(ctx.table, {node_key, %{node | keys: updated_keys}})
+              :ets.insert(ctx.table, {node_key, %{node | child_count: node.child_count - 1}})
 
             [] ->
               :ok
@@ -219,6 +235,13 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
           :deleted ->
             :ets.insert(ctx.table, {node_key, %{node | condition_id: nil}})
 
+            :ets.delete(
+              ctx.filter.incl_index_paths_table,
+              {ctx.condition_id, ctx.field, node_condition_id}
+            )
+
+            add_scan_cost(ctx, path, -1)
+
           :ok ->
             :ok
         end
@@ -228,8 +251,14 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
     end
   end
 
-  defp node_empty?(%{keys: [], condition_id: nil}), do: true
+  defp node_empty?(%{child_count: 0, condition_id: nil}), do: true
   defp node_empty?(_), do: false
+
+  # A scanned path costs one row read plus one membership test per element.
+  defp add_scan_cost(ctx, path, sign) do
+    key = {:scan_cost, ctx.condition_id, ctx.field}
+    :ets.update_counter(ctx.table, key, sign * (length(path) + 1), {key, 0})
+  end
 
   def affected_shapes(%Filter{incl_index_table: table} = filter, condition_id, field, record) do
     case :ets.lookup(table, {:type, condition_id, field}) do
@@ -241,8 +270,15 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
           {:ok, nil} ->
             MapSet.new()
 
-          {:ok, values} when is_list(values) ->
-            sorted_values = values |> Enum.sort() |> Enum.dedup()
+          {:ok, values} when is_list(values) or is_struct(values, PgInterop.Array.Bounded) ->
+            # Postgres never matches a NULL array element, even to another NULL, and its `@>`
+            # reads no lower bound.
+            sorted_values =
+              values
+              |> PgInterop.Array.elements()
+              |> List.flatten()
+              |> Enum.reject(&is_nil/1)
+              |> canonical_elements(type)
 
             ctx = %{
               filter: filter,
@@ -252,85 +288,130 @@ defmodule Electric.Shapes.Filter.Indexes.InclusionIndex do
               record: record
             }
 
-            shapes_affected_by_tree(ctx, [], sorted_values) || MapSet.new()
+            shapes_affected_by_record_array(ctx, sorted_values)
 
+          # Postgres emits values this evaluator cannot read on types it accepts, so this is a
+          # data condition. Raising reaches WhereCondition.affected_shapes's rescue, which formats
+          # a stacktrace per change and widens to every shape under the condition, discarding the
+          # exact answers of the other indexes on it.
           :error ->
-            raise RuntimeError,
-              message:
-                "Could not parse value for field #{inspect(field)} of type #{inspect(type)}"
+            Filter.mark_routing_inexact()
+            all_shape_ids(filter, condition_id, field)
         end
     end
   end
 
-  defp shapes_affected_by_tree(ctx, path, values) do
+  defp shapes_affected_by_record_array(ctx, values) do
+    # Allow the root, one probe per element and one full suffix walk, plus a fixed allowance,
+    # or what a scan of the field's paths costs if that is more. A walk that ends within this is
+    # the unbounded walk. One that does not has spent more than the scan it falls back to, so
+    # the route takes at most twice the steps of the unbounded walk.
+    # Discover conditions before evaluating them: a fallback can discard partial discovery
+    # without repeating nested routing or changing its inexactness flag.
+    scan_cost = :ets.lookup_element(ctx.table, {:scan_cost, ctx.condition_id, ctx.field}, 2, 0)
+    budget = max(1 + 2 * length(values) + @extra_record_probes, scan_cost)
+
+    case collect_tree_conditions(ctx, [], values, budget, []) do
+      {_, conditions} ->
+        Enum.reduce(Enum.reverse(conditions), MapSet.new(), &route_condition(ctx, &1, &2))
+
+      :spent ->
+        pattern = {{ctx.condition_id, ctx.field, :"$1"}, :"$2", :_}
+        batch = :ets.match(ctx.filter.incl_index_paths_table, pattern, @path_batch_size)
+        route_path_batches(ctx, batch, row_elements(values), MapSet.new())
+    end
+  end
+
+  defp collect_tree_conditions(_ctx, _path, _values, 0, _conditions), do: :spent
+
+  defp collect_tree_conditions(ctx, path, values, budget, conditions) do
     node_key = {ctx.condition_id, ctx.field, path}
 
     case :ets.lookup(ctx.table, node_key) do
       [] ->
-        nil
+        {budget - 1, conditions}
 
       [{_, node}] ->
-        union(
-          shapes_affected_by_node(ctx, node),
-          shapes_affected_by_children(ctx, path, node.keys, values)
-        )
+        conditions = if node.condition_id, do: [node.condition_id | conditions], else: conditions
+        collect_child_conditions(ctx, node.child_count, path, values, budget - 1, conditions)
     end
   end
 
-  defp shapes_affected_by_node(_ctx, %{condition_id: nil}), do: nil
+  # Probe by row values so a short array does not scan a node's potentially many children.
+  defp collect_child_conditions(_ctx, 0, _path, _values, budget, conditions),
+    do: {budget, conditions}
 
-  defp shapes_affected_by_node(ctx, %{condition_id: condition_id}) do
-    WhereCondition.affected_shapes(ctx.filter, condition_id, ctx.record)
+  defp collect_child_conditions(_ctx, _child_count, _path, [], budget, conditions),
+    do: {budget, conditions}
+
+  defp collect_child_conditions(ctx, child_count, path, [value | values], budget, conditions) do
+    with {budget, conditions} <-
+           collect_tree_conditions(ctx, path ++ [value], values, budget, conditions) do
+      collect_child_conditions(ctx, child_count, path, values, budget, conditions)
+    end
   end
 
-  # key matches value, so check the child then continue with the rest
-  defp shapes_affected_by_children(ctx, path, [value | keys], [value | values]) do
-    child_path = path ++ [value]
+  defp route_path_batches(_ctx, :"$end_of_table", _values, shapes), do: shapes
 
-    union(
-      shapes_affected_by_tree(ctx, child_path, values),
-      shapes_affected_by_children(ctx, path, keys, values)
-    )
+  defp route_path_batches(ctx, {paths, continuation}, row, shapes) do
+    # Canonicalisation sorts and deduplicates both arrays, so testing path membership reaches
+    # the same conditions as looking for the path as a subsequence in the trie.
+    shapes =
+      Enum.reduce(paths, shapes, fn [id, hashes], shapes ->
+        if row_path?(ctx, id, hashes, row),
+          do: route_condition(ctx, id, shapes),
+          else: shapes
+      end)
+
+    route_path_batches(ctx, :ets.match(continuation), row, shapes)
   end
 
-  # key can be discarded as it's not in the list of values
-  defp shapes_affected_by_children(ctx, path, [key | keys], [value | _] = values)
-       when key < value do
-    shapes_affected_by_children(ctx, path, keys, values)
+  # A membership test hashes the value, which costs its size, and a shape's element can be far
+  # longer than any of the row's. The scan tests the hashes stored with each path against the
+  # row's, which costs no more than hashing the row's own values, as the walk does, and reads a
+  # path itself only when every hash is the row's.
+  defp row_elements(values) do
+    {MapSet.new(values), Map.new(values, &{element_hash(&1), true})}
   end
 
-  # value can be discarded as it's not in the list of keys
-  defp shapes_affected_by_children(ctx, path, keys, [_value | values]) do
-    shapes_affected_by_children(ctx, path, keys, values)
+  defp row_path?(ctx, id, hashes, {values, row_hashes}) do
+    Enum.all?(hashes, &is_map_key(row_hashes, &1)) and
+      ctx.filter.incl_index_paths_table
+      |> :ets.lookup_element({ctx.condition_id, ctx.field, id}, 3)
+      |> Enum.all?(&MapSet.member?(values, &1))
   end
 
-  # No more keys to process
-  defp shapes_affected_by_children(_ctx, _path, [], _values), do: nil
+  defp element_hash(value), do: :erlang.phash2(value, @element_hash_range)
 
-  # No more values to process
-  defp shapes_affected_by_children(_ctx, _path, _keys, []), do: nil
+  defp route_condition(ctx, condition_id, shapes) do
+    MapSet.union(shapes, WhereCondition.affected_shapes(ctx.filter, condition_id, ctx.record))
+  end
 
   defp value_from_record(record, field, type) do
     Env.parse_const(@env, record[field], type)
   end
 
-  def all_shape_ids(%Filter{incl_index_table: table} = filter, condition_id, field) do
-    table
-    |> :ets.match({{condition_id, field, :_}, :"$1"})
-    |> Enum.reduce(MapSet.new(), fn
-      [%{condition_id: nil}], ids ->
-        ids
-
-      [%{condition_id: condition_id}], ids ->
-        MapSet.union(ids, WhereCondition.all_shape_ids(filter, condition_id))
-    end)
+  # The tree keys each node on an array element by term equality, so a where-clause element and the
+  # record element Postgres calls equal must reduce to one term or the shape's node is never reached.
+  # `IndexValue.index_value/2` is the same per-type canonicalisation the equality index routes on,
+  # applied here per flattened element so both the stored path and the change's probe agree on
+  # membership.
+  defp canonical_elements(values, {:array, subtype}) do
+    values
+    |> Enum.map(&IndexValue.index_value(subtype, &1))
+    |> Enum.sort()
+    |> Enum.dedup()
   end
 
-  # Union two sets, treating `nil` as an empty set.
-  # This allows us to use `nil` rather than `MapSet.new()`
-  # and avoid many calls to `MapSet.union/2` which
-  # makes `affected_shapes/3` ~20% faster.
-  defp union(nil, set), do: set
-  defp union(set, nil), do: set
-  defp union(set1, set2), do: MapSet.union(set1, set2)
+  defp canonical_elements(values, _type) do
+    values |> Enum.sort() |> Enum.dedup()
+  end
+
+  def all_shape_ids(%Filter{incl_index_paths_table: table} = filter, condition_id, field) do
+    table
+    |> :ets.select([{{{condition_id, field, :"$1"}, :_, :_}, [], [:"$1"]}])
+    |> Enum.reduce(MapSet.new(), fn node_condition_id, ids ->
+      MapSet.union(ids, WhereCondition.all_shape_ids(filter, node_condition_id))
+    end)
+  end
 end

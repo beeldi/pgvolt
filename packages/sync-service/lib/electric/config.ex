@@ -36,7 +36,7 @@ defmodule Electric.Config do
 
   @type instance_id :: String.t()
 
-  @known_feature_flags ~w[]
+  @known_feature_flags ~w[full_xid_source_positions]
   @default_storage_dir "./persistent"
 
   @defaults [
@@ -53,10 +53,15 @@ defmodule Electric.Config do
     replication_stream_id: "default",
     replication_slot_temporary?: false,
     replication_slot_temporary_random_name?: false,
-    max_txn_size: 250 * 1024 * 1024,
+    # No cap: transactions reach the shapes in fragments of `max_batch_size` changes, and
+    # going over a cap drops the slot and purges every shape. Shapes that hold changes in
+    # memory have their own limit, `txn_buffer_max_changes`.
+    max_txn_size: nil,
     max_batch_size: 100,
     # Scaling down on idle is disabled by default
     replication_idle_timeout: 0,
+    # Replication heartbeats are disabled by default
+    replication_heartbeat_interval: 0,
     manual_table_publishing?: false,
     ## HTTP API
     # set enable_http_api: false to turn off the HTTP server totally
@@ -74,6 +79,7 @@ defmodule Electric.Config do
     cache_max_age: 60,
     cache_stale_age: 60 * 5,
     chunk_bytes_threshold: Electric.ShapeCache.LogChunker.default_chunk_size_threshold(),
+    compaction_period: :timer.minutes(10),
     allow_shape_deletion?: false,
     service_port: 3000,
     listen_on_ipv6?: false,
@@ -92,7 +98,9 @@ defmodule Electric.Config do
     instance_id: nil,
     prometheus_port: nil,
     telemetry_statsd_host: nil,
+    telemetry_redact_request_values?: false,
     otel_sampling_ratio: 0.01,
+    otel_trusted_sample_rates: nil,
     metrics_sampling_ratio: 1,
     # When true, the OTel spans of empty/up-to-date shape-GET responses are tail-dropped
     # at export time to cut trace volume. See Electric.Telemetry.EmptyResponseSampler.
@@ -111,11 +119,32 @@ defmodule Electric.Config do
     # shape is invalidated to unpin the stack-wide flush boundary. The storage
     # contract already says writes slower than this should raise.
     flush_stall_grace_period: :timer.minutes(1),
+    flush_stall_boot_grace: :timer.minutes(10),
+    # How many consecutive stall challenges a deliberately deferring writer may
+    # answer before its word stops being taken. A shape buffering ahead of a
+    # snapshot that never completes would otherwise pin the stack-wide flush
+    # boundary — and the replication slot ack — indefinitely while reporting
+    # itself healthy on every challenge.
+    flush_deferral_round_limit: 10,
+    # How long a scatter-gather may wait on router-worker acks before the collector
+    # crashes to re-stream from the slot instead of wedging silently. Generous on
+    # purpose: the gather spans consumer publishes, and the first fragment after a
+    # restart cold-starts every affected consumer serially, so with a large
+    # shape count a healthy post-boot gather can take minutes.
+    gather_stall_timeout: :timer.minutes(10),
+    # How long a broadcast waits for a consumer's reply before killing it as
+    # unresponsive; the DOWN classifies it as crashed and the shape is invalidated
+    # rather than pinning the pipeline. Must stay well below gather_stall_timeout.
+    broadcast_reply_grace: :timer.minutes(1),
     # Sets max_requests for Bandit HTTP/1 handler processes:
     # https://hexdocs.pm/bandit/Bandit.html#t:http_1_options/0
     # "The maximum number of requests to serve in a single HTTP/1
     # connection before closing the connection"
     conn_max_requests: 50,
+    # Longest HTTP/1 request line Bandit accepts, in bytes; nil keeps Bandit's 10,000. A shape
+    # whose `where` or `params` make the URL longer gets a 414.
+    # https://hexdocs.pm/bandit/Bandit.html#t:http_1_options/0
+    max_request_line_length: nil,
     # Sets fullsweep_after for Bandit handler processes.
     # Bandit reuses handler processes across requests (capped by conn_max_requests).
     # These processes can accumulate garbage on the old heap since BEAM's generational
@@ -123,6 +152,14 @@ defmodule Electric.Config do
     # forces a fullsweep after N minor collections to reclaim that memory.
     # See https://www.erlang.org/doc/apps/erts/erlang.html#spawn_opt/4
     handler_fullsweep_after: nil,
+    # Sets max_reset_stream_rate for Bandit HTTP/2 connections: the number of client
+    # RST_STREAM frames tolerated per connection within a time window before Bandit
+    # tears down the whole connection with ENHANCE_YOUR_CALM. Bandit defaults to
+    # {500, 10_000}. Higher here: tearing down a connection kills every in-flight
+    # stream on it, and behind a proxy that multiplexes many end clients onto a few
+    # upstream connections, ordinary client-side cancellations of long-polls count
+    # against the limit.
+    http2_max_reset_stream_rate: {10_000, 10_000},
     ## Performance tweaks
     publication_alter_debounce_ms: 0,
     # allow for configuring per-process `Process.spawn_opt()`. In the form
@@ -134,6 +171,11 @@ defmodule Electric.Config do
     # Heap-size threshold (in BYTES) above which a consumer runs :erlang.garbage_collect()
     # after processing a transaction fragment.
     consumer_gc_heap_threshold: nil,
+    # Terminate a shape response serve when a single socket write makes no
+    # progress for this long (ms). Catches serves to clients that stop
+    # accepting data, which otherwise pin memory and a file descriptor
+    # indefinitely. 0 disables reaping.
+    stalled_serve_timeout: :timer.seconds(60),
     ## Misc
     process_registry_partitions: &Electric.Config.Defaults.process_registry_partitions/0,
     feature_flags: [],
@@ -146,9 +188,29 @@ defmodule Electric.Config do
     shape_db_synchronous:
       Electric.ShapeCache.ShapeStatus.ShapeDb.Connection.default!(:synchronous),
     shape_db_cache_size: Electric.ShapeCache.ShapeStatus.ShapeDb.Connection.default!(:cache_size),
+    shape_db_boot_read_timeout: 300_000,
     exclude_spans: MapSet.new(),
     live_dashboard_port: nil,
-    subquery_buffer_max_transactions: 1000
+    subquery_buffer_max_transactions: 1000,
+    subset_max_rows: nil,
+    # Changes a shape may hold in memory: those of one transaction before its commit, for a
+    # shape writing whole transactions (a subquery shape or one of its inner shapes), and
+    # those it buffers while waiting for its snapshot, for any shape. Past it the shape is
+    # removed, as on a truncate. nil means no limit.
+    txn_buffer_max_changes: 250_000,
+    router_shards: 1,
+    replication_pipeline_window: 1,
+    shared_conversion: false,
+    shared_payload_arena: false,
+    # A boot reclaims the payload arena only once earlier generations hold this much: the reclaim
+    # scans the log directory of every stored shape before the stack can go active.
+    payload_arena_reclaim_min_bytes: 1024 * 1024 * 1024,
+    worker_prepare: false,
+    shared_fragment_blocks: false,
+    ack_after_journal: false,
+    keep_shapes_on_promotion: false,
+    ingest_priority_high: false,
+    filter_routing_memo: false
   ]
 
   @installation_id_key "electric_installation_id"
@@ -193,6 +255,14 @@ defmodule Electric.Config do
       {:error, :not_found} ->
         :ok = Electric.PersistentKV.set(persistent_kv, @installation_id_key, instance_id)
         instance_id
+
+      {:error, reason} ->
+        Logger.warning(
+          "Could not read the stored installation id (#{inspect(reason)}), generating a new one."
+        )
+
+        :ok = Electric.PersistentKV.set(persistent_kv, @installation_id_key, instance_id)
+        instance_id
     end
   end
 
@@ -201,6 +271,7 @@ defmodule Electric.Config do
     case Electric.PersistentKV.get(kv, @installation_id_key) do
       {:ok, id} when is_binary(id) -> id
       {:error, :not_found} -> raise "Electric's installation_id not set"
+      {:error, reason} -> raise "Electric's installation_id is unreadable: #{inspect(reason)}"
     end
   end
 
@@ -229,6 +300,16 @@ defmodule Electric.Config do
       value -> value
     end
   end
+
+  @doc """
+  `get_env/1` with a caller-supplied override, for settings a stack can be started with.
+
+  `nil` means "not overridden" and falls through; an explicit `false` wins, which a
+  `||` chain cannot express.
+  """
+  @spec get_env(Application.key(), Application.value()) :: Application.value()
+  def get_env(key, nil), do: get_env(key)
+  def get_env(_key, override), do: override
 
   def get_env_lazy(key, fun) when is_function(fun, 0) do
     case Application.fetch_env(:electric, key) do
@@ -435,7 +516,24 @@ defmodule Electric.Config do
     params = URI.decode_query(query_str)
 
     with :ok <- validate_no_replication_param(params) do
+      warn_ignored_query_options(params)
       parse_sslmode(params)
+    end
+  end
+
+  # Only `sslmode` is read from the query. Another key is accepted and dropped, which hides a
+  # misspelt option, so each is named. Values stay out of the log: a query can carry a secret.
+  defp warn_ignored_query_options(params) do
+    case params |> Map.keys() |> List.delete("sslmode") |> Enum.sort() do
+      [] ->
+        :ok
+
+      ignored ->
+        Logger.warning(
+          "Ignoring unsupported options in the database URL query: " <>
+            Enum.map_join(ignored, ", ", &inspect/1) <>
+            ". Only \"sslmode\" is read from it."
+        )
     end
   end
 
@@ -451,11 +549,9 @@ defmodule Electric.Config do
     {:ok, sslmode: String.to_existing_atom(sslmode)}
   end
 
-  defp parse_sslmode(%{"sslmode" => sslmode})
-       when sslmode in ~w[verify-ca verify-full] do
-    {:error,
-     "unsupported \"sslmode\" value #{inspect(sslmode)}. Use sslmode=require and set the ELECTRIC_DATABASE_CA_CERTIFICATE_FILE config to ensure Electric verifies database server identity"}
-  end
+  defp parse_sslmode(%{"sslmode" => "verify-ca"}), do: {:ok, sslmode: :"verify-ca"}
+
+  defp parse_sslmode(%{"sslmode" => "verify-full"}), do: {:ok, sslmode: :"verify-full"}
 
   defp parse_sslmode(%{"sslmode" => sslmode}) do
     {:error, "invalid \"sslmode\" value: #{inspect(sslmode)}"}
@@ -483,6 +579,50 @@ defmodule Electric.Config do
 
   def parse_log_level!(_str) do
     raise Dotenvy.Error, message: "Must be one of #{inspect(@public_log_levels)}"
+  end
+
+  @doc """
+  Resolve the IP address the (unauthenticated) LiveDashboard endpoint binds to.
+
+  The dashboard exposes VM internals with no authentication, so it binds to loopback unless an
+  operator explicitly opts into another address via `ELECTRIC_LIVE_DASHBOARD_ADDRESS`. `ipv6?`
+  selects the loopback family used when no address is given.
+
+  ## Examples
+
+      iex> parse_dashboard_listen_address(nil, false)
+      {:ok, {127, 0, 0, 1}}
+
+      iex> parse_dashboard_listen_address("", true)
+      {:ok, {0, 0, 0, 0, 0, 0, 0, 1}}
+
+      iex> parse_dashboard_listen_address("10.1.2.3", false)
+      {:ok, {10, 1, 2, 3}}
+
+      iex> parse_dashboard_listen_address("not-an-ip", false)
+      {:error, ~S|invalid IP address: "not-an-ip"|}
+  """
+  @spec parse_dashboard_listen_address(String.t() | nil, boolean()) ::
+          {:ok, :inet.ip_address()} | {:error, binary()}
+  def parse_dashboard_listen_address(address, ipv6?) when address in [nil, ""],
+    do: {:ok, dashboard_loopback(ipv6?)}
+
+  def parse_dashboard_listen_address(address, _ipv6?) when is_binary(address) do
+    case :inet.parse_address(String.to_charlist(address)) do
+      {:ok, ip} -> {:ok, ip}
+      {:error, _reason} -> {:error, "invalid IP address: #{inspect(address)}"}
+    end
+  end
+
+  defp dashboard_loopback(false), do: {127, 0, 0, 1}
+  defp dashboard_loopback(true), do: {0, 0, 0, 0, 0, 0, 0, 1}
+
+  @spec parse_dashboard_listen_address!(String.t() | nil, boolean()) :: :inet.ip_address()
+  def parse_dashboard_listen_address!(address, ipv6?) do
+    case parse_dashboard_listen_address(address, ipv6?) do
+      {:ok, ip} -> ip
+      {:error, message} -> raise Dotenvy.Error, message: message
+    end
   end
 
   @time_units ~w[ms msec s sec m min]
@@ -618,6 +758,47 @@ defmodule Electric.Config do
   end
 
   @doc """
+  Parse an HTTP/2 reset-stream rate limit of the form `<count>/<duration>` into the
+  `{count, period_ms}` tuple Bandit expects, or `disabled` into `:disabled`.
+
+  ## Examples
+
+    iex> parse_http2_max_reset_stream_rate("500/10s")
+    {:ok, {500, 10000}}
+
+    iex> parse_http2_max_reset_stream_rate("disabled")
+    {:ok, :disabled}
+
+    iex> parse_http2_max_reset_stream_rate("500")
+    {:error, ~S'invalid HTTP/2 reset stream rate: "500". Expected format: <count>/<duration> (e.g. 500/10s) or disabled'}
+  """
+  @spec parse_http2_max_reset_stream_rate(binary) ::
+          {:ok, {pos_integer, pos_integer} | :disabled} | {:error, binary}
+  def parse_http2_max_reset_stream_rate(str) do
+    with false <- String.downcase(str) == "disabled",
+         [count_str, period_str] <- String.split(str, "/"),
+         {count, ""} when count > 0 <- Integer.parse(count_str),
+         {:ok, period_ms} <- parse_human_readable_time(period_str) do
+      {:ok, {count, period_ms}}
+    else
+      true ->
+        {:ok, :disabled}
+
+      _ ->
+        {:error,
+         "invalid HTTP/2 reset stream rate: #{inspect(str)}. " <>
+           "Expected format: <count>/<duration> (e.g. 500/10s) or disabled"}
+    end
+  end
+
+  def parse_http2_max_reset_stream_rate!(str) do
+    case parse_http2_max_reset_stream_rate(str) do
+      {:ok, result} -> result
+      {:error, message} -> raise Dotenvy.Error, message: message
+    end
+  end
+
+  @doc """
   Parse the deprecated ELECTRIC_TELEMETRY_TOP_PROCESS_COUNT value (a plain integer)
   into a `{:count, N}` tuple.
 
@@ -662,6 +843,13 @@ defmodule Electric.Config do
       !insecure && secret == nil ->
         raise "You must set ELECTRIC_SECRET unless ELECTRIC_INSECURE=true. Setting ELECTRIC_INSECURE=true risks exposing your database, only use insecure mode in development or you've otherwise secured the Electric API"
 
+      # An unset variable expanding to an empty string is the ordinary way this happens in a shell or
+      # a manifest. Blank is not nil, so it used to pass as a configured secret: the service came
+      # up reporting itself secured, logged nothing unusual, and `?secret=` then matched it exactly.
+      # Refuse to boot rather than advertise protection that is not there.
+      !insecure && is_binary(secret) && String.trim(secret) == "" ->
+        raise "ELECTRIC_SECRET is set but blank. A blank secret is not a secret - it leaves the API open to anyone who sends `?secret=`. Set a real value, or set ELECTRIC_INSECURE=true if you genuinely intend to run without authentication."
+
       true ->
         if insecure do
           Logger.warning(
@@ -672,6 +860,60 @@ defmodule Electric.Config do
         :ok
     end
   end
+
+  @insecure_true_values ~w[true 1 yes on]
+
+  @doc """
+  Decode the `ELECTRIC_INSECURE` flag with fail-closed semantics.
+
+  Only an explicit, recognised true spelling turns authentication off. Anything else - unset,
+  blank, a recognised false spelling, or an unrecognised value - resolves to secure, so a typo
+  or a shell-expanded empty string can never leave the API unauthenticated.
+
+  ## Examples
+
+      iex> parse_insecure!("true")
+      true
+
+      iex> parse_insecure!("YES")
+      true
+
+      iex> parse_insecure!("no")
+      false
+
+      iex> parse_insecure!("off")
+      false
+
+      iex> parse_insecure!("")
+      false
+
+      iex> parse_insecure!("disabled")
+      false
+  """
+  @spec parse_insecure!(binary) :: boolean
+  def parse_insecure!(value) when is_binary(value) do
+    String.downcase(String.trim(value)) in @insecure_true_values
+  end
+
+  # Leave room for the extra row used to detect overflow within PostgreSQL's bigint LIMIT.
+  @max_subset_rows 2 ** 63 - 2
+  @subset_max_rows_error "must be an integer between 1 and #{@max_subset_rows}"
+
+  def parse_subset_max_rows!(value) do
+    with {rows, ""} <- Integer.parse(value),
+         {:ok, rows} <- validate_subset_max_rows(rows) do
+      rows
+    else
+      _ -> raise Dotenvy.Error, message: "ELECTRIC_SUBSET_MAX_ROWS #{@subset_max_rows_error}"
+    end
+  end
+
+  def validate_subset_max_rows(nil), do: {:ok, nil}
+
+  def validate_subset_max_rows(rows) when is_integer(rows) and rows in 1..@max_subset_rows,
+    do: {:ok, rows}
+
+  def validate_subset_max_rows(_), do: {:error, @subset_max_rows_error}
 
   @valid_spawn_opts ~w[min_bin_vheap_size min_heap_size priority fullsweep_after message_queue_data]
 
@@ -765,6 +1007,29 @@ defmodule Electric.Config do
   """
   def parse_comma_separated_set!(str) do
     str |> String.split(",", trim: true) |> Enum.map(&String.trim/1) |> MapSet.new()
+  end
+
+  def parse_otel_sample_rate(str) do
+    case Integer.parse(str) do
+      {rate, ""} when rate >= 1 and rate <= 0x7FFF_FFFF_FFFF_FFFF -> rate
+      _ -> nil
+    end
+  end
+
+  def parse_otel_trusted_sample_rates!(str) do
+    case String.trim(str) do
+      "" ->
+        MapSet.new()
+
+      rates ->
+        rates
+        |> String.split(",")
+        |> MapSet.new(fn entry ->
+          parse_otel_sample_rate(String.trim(entry)) ||
+            raise Dotenvy.Error,
+                  "expected a comma-separated list of positive signed 64-bit sample rates"
+        end)
+    end
   end
 
   def parse_feature_flags(str) do

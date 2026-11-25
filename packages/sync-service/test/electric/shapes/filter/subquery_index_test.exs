@@ -1,11 +1,17 @@
 defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
   use ExUnit.Case
 
+  alias Electric.Replication.Eval.Parser
   alias Electric.Replication.Eval.Parser.{Func, Ref}
+  alias Electric.Replication.Eval.Runner
+  alias Electric.Replication.Eval.SublinkKey
   alias Electric.Shapes.DnfPlan
   alias Electric.Shapes.Filter
   alias Electric.Shapes.Filter.Indexes.SubqueryIndex
   alias Electric.Shapes.Filter.WhereCondition
+  alias Electric.Shapes.WhereClause
+
+  import Support.DbSetup, only: [with_shared_db: 1, scalar: 3]
 
   @subquery_ref ["$sublink", "0"]
   @field "par_id"
@@ -44,6 +50,129 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
 
       refute SubqueryIndex.member?(table, "s1", @subquery_ref, 5)
       refute SubqueryIndex.fallback?(table, "s1")
+    end
+  end
+
+  describe "three-valued membership (NULL in dependency view)" do
+    test "composite NOT IN agrees with Postgres when either key contains NULL", ctx do
+      {:ok, %{db_conn: conn}} = with_shared_db(ctx)
+      %{table: table} = ctx
+      sql = "(parent_id, value) NOT IN (SELECT parent_id, value FROM parent)"
+
+      where =
+        Parser.parse_and_validate_expression!(sql,
+          refs: %{
+            ["parent_id"] => :int4,
+            ["value"] => :int4,
+            @subquery_ref => {:array, {:row, [:int4, :int4]}}
+          },
+          sublink_queries: %{0 => "SELECT parent_id, value FROM parent"}
+        )
+
+      view = MapSet.new([{2, 1}, {nil, 3}])
+      seed(table, "s1", view)
+      callback = WhereClause.subquery_member_from_index(table, "s1")
+
+      results =
+        for {a, b} <- [{nil, 1}, {nil, 2}, {nil, 3}, {2, 1}, {2, 3}, {2, nil}, {3, 1}] do
+          expected =
+            scalar(
+              conn,
+              """
+              WITH parent(parent_id, value) AS (VALUES (2, 1), (NULL, 3))
+              SELECT #{sql} FROM (VALUES ($1::int, $2::int)) AS child(parent_id, value)
+              """,
+              [a, b]
+            )
+
+          refs = %{@subquery_ref => view, ["parent_id"] => a, ["value"] => b}
+
+          indexed =
+            Runner.execute(where, Map.delete(refs, @subquery_ref), subquery_member?: callback)
+
+          {expected, indexed, Runner.execute(where, refs)}
+        end
+
+      assert Enum.all?(results, fn {expected, indexed, live} ->
+               indexed == {:ok, expected} and live == {:ok, expected}
+             end),
+             inspect(results)
+    end
+
+    test "member? answers true / nil / false the way Sublink.member? does", %{table: table} do
+      seed(table, "s1", [2, 3, nil])
+      seed(table, "s2", [2, 3])
+
+      # A present value is a definite member over either view.
+      assert SubqueryIndex.member?(table, "s1", @subquery_ref, 2) == true
+      assert SubqueryIndex.member?(table, "s2", @subquery_ref, 2) == true
+
+      # A non-member is unknown when the view holds a NULL, but a proven non-member without one.
+      assert SubqueryIndex.member?(table, "s1", @subquery_ref, 5) == nil
+      assert SubqueryIndex.member?(table, "s2", @subquery_ref, 5) == false
+
+      # A NULL value is never a member of a non-empty view: unknown, never false.
+      assert SubqueryIndex.member?(table, "s1", @subquery_ref, nil) == nil
+      assert SubqueryIndex.member?(table, "s2", @subquery_ref, nil) == nil
+    end
+
+    test "member? over an empty seeded view is false, even for NULL", %{table: table} do
+      SubqueryIndex.register_shape(table, "s1", make_plan())
+      SubqueryIndex.mark_ready(table, "s1")
+
+      assert SubqueryIndex.member?(table, "s1", @subquery_ref, 5) == false
+      assert SubqueryIndex.member?(table, "s1", @subquery_ref, nil) == false
+    end
+
+    test "membership_or_fallback? carries the unknown through for a ready shape", %{table: table} do
+      seed(table, "s1", [2, 3, nil])
+
+      assert SubqueryIndex.membership_or_fallback?(table, "s1", @subquery_ref, 5) == nil
+      assert SubqueryIndex.membership_or_fallback?(table, "s1", @subquery_ref, 2) == true
+    end
+
+    test "NOT IN routed through the index excludes a non-member when the view holds a NULL", %{
+      filter: filter,
+      table: table,
+      condition_id: condition_id
+    } do
+      where =
+        Parser.parse_and_validate_expression!("test NOT IN (SELECT val FROM tester)",
+          refs: %{["test"] => :int4, @subquery_ref => {:array, :int4}},
+          sublink_queries: %{0 => "SELECT val FROM tester"}
+        )
+
+      register_node_shape(filter, table, condition_id, "s1", polarity: :negated)
+      seed(table, "s1", [2, 3, nil])
+      callback = WhereClause.subquery_member_from_index(table, "s1")
+
+      # Postgres makes `5 NOT IN (2, 3, NULL)` unknown, so the row is excluded. The two-valued index
+      # answered false here, and `NOT false` streamed every root-table row to the shape.
+      assert {:ok, false} =
+               WhereClause.includes_record_result(where, %{"test" => "5"}, callback)
+
+      # A genuine match is still a definite exclusion under NOT IN.
+      assert {:ok, false} =
+               WhereClause.includes_record_result(where, %{"test" => "2"}, callback)
+    end
+
+    test "NOT IN through the index still admits a real non-member when no NULL is present", %{
+      filter: filter,
+      table: table,
+      condition_id: condition_id
+    } do
+      where =
+        Parser.parse_and_validate_expression!("test NOT IN (SELECT val FROM tester)",
+          refs: %{["test"] => :int4, @subquery_ref => {:array, :int4}},
+          sublink_queries: %{0 => "SELECT val FROM tester"}
+        )
+
+      register_node_shape(filter, table, condition_id, "s1", polarity: :negated)
+      seed(table, "s1", [2, 3])
+      callback = WhereClause.subquery_member_from_index(table, "s1")
+
+      assert {:ok, true} =
+               WhereClause.includes_record_result(where, %{"test" => "5"}, callback)
     end
   end
 
@@ -154,6 +283,31 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
              )
     end
 
+    test "a numeric key routes by its exact value and leaves no row once removed", %{
+      filter: filter,
+      table: table,
+      condition_id: condition_id
+    } do
+      register_node_shape(filter, table, condition_id, "s1", type: :numeric)
+      seed(table, "s1", [numeric_key("9007199254740993"), numeric_key("NaN")])
+      route = &SubqueryIndex.affected_shapes(filter, condition_id, @field, %{@field => &1})
+
+      assert route.("9007199254740993.00") == MapSet.new(["s1"])
+      assert route.("NaN") == MapSet.new(["s1"])
+      assert route.("9007199254740992") == MapSet.new()
+
+      SubqueryIndex.remove_value(table, "s1", @subquery_ref, 0, numeric_key("NaN"))
+      assert route.("NaN") == MapSet.new()
+
+      opts = subquery_optimisation(type: :numeric)
+      SubqueryIndex.remove_shape(filter, condition_id, "s1", opts, [])
+      SubqueryIndex.unregister_shape(table, "s1")
+
+      assert :ets.select_count(table, [
+               {{{:node_positive_member, :_, :_, :_, :_}, :_}, [], [true]}
+             ]) == 0
+    end
+
     test "remove_shape clears node registrations", %{
       filter: filter,
       table: table,
@@ -195,7 +349,7 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
     %{
       operation: "subquery",
       field: field,
-      testexpr: %Ref{path: [field], type: :int8},
+      testexpr: %Ref{path: [field], type: Keyword.get(opts, :type, :int8)},
       subquery_ref: Keyword.get(opts, :subquery_ref, @subquery_ref),
       dep_index: Keyword.get(opts, :dep_index, 0),
       polarity: Keyword.get(opts, :polarity, :positive),
@@ -208,9 +362,10 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
     dep_index = Keyword.get(opts, :dep_index, 0)
     subquery_ref = Keyword.get(opts, :subquery_ref, @subquery_ref)
     field = Keyword.get(opts, :field, @field)
+    type = Keyword.get(opts, :type, :int8)
 
-    testexpr = %Ref{path: [field], type: :int8}
-    ref = %Ref{path: subquery_ref, type: {:array, :int8}}
+    testexpr = %Ref{path: [field], type: type}
+    ref = %Ref{path: subquery_ref, type: {:array, type}}
 
     ast = %Func{
       name: "sublink_membership_check",
@@ -247,6 +402,8 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
   @perf_timeout 120_000
 
   defp reductions(fun) do
+    # A collection that lands inside `fun` is charged to it as reductions; start from a clean heap.
+    :erlang.garbage_collect()
     {:reductions, before} = :erlang.process_info(self(), :reductions)
     fun.()
     {:reductions, after_} = :erlang.process_info(self(), :reductions)
@@ -264,6 +421,11 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
   defp seed(table, shape_id, values) do
     SubqueryIndex.seed_membership(table, shape_id, @subquery_ref, 0, MapSet.new(values))
     SubqueryIndex.mark_ready(table, shape_id)
+  end
+
+  defp numeric_key(text) do
+    {:ok, key} = SublinkKey.parse(text, :numeric)
+    key
   end
 
   describe "performance" do
@@ -376,6 +538,93 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndexTest do
 
       assert big > small * 5,
              "expected removal to scale with view size, got #{small} -> #{big}"
+    end
+
+    @tag :performance
+    @tag timeout: @perf_timeout
+    test "routing a numeric key is O(log n) in the number of member rows" do
+      # A numeric key is a Decimal, a map, and a map in a match-spec key is a pattern: the
+      # node-member lookup would scan every row of the index instead of one key range.
+      measure = fn n ->
+        filter = Filter.new()
+        table = Filter.subquery_index(filter)
+        condition_id = make_ref()
+        WhereCondition.init(filter, condition_id)
+
+        for i <- 1..n do
+          register_node_shape(filter, table, condition_id, i, type: :numeric)
+          seed(table, i, [numeric_key("#{i}.5")])
+        end
+
+        record = %{@field => "#{div(n, 2)}.50"}
+        route = fn -> SubqueryIndex.affected_shapes(filter, condition_id, @field, record) end
+        assert route.() == MapSet.new([div(n, 2)])
+        reductions(route)
+      end
+
+      small = measure.(@perf_small)
+      large = measure.(@perf_large)
+
+      assert abs(large - small) < @flatness_tolerance,
+             "routing grew with member rows: #{small} -> #{large} reductions"
+    end
+
+    @tag :performance
+    @tag timeout: @perf_timeout
+    test "routing an array key with lower bounds is O(log n) in the number of member rows" do
+      # An array whose lower bounds are not 1 is a struct, so a map too, as a numeric key is.
+      measure = fn n ->
+        filter = Filter.new()
+        table = Filter.subquery_index(filter)
+        condition_id = make_ref()
+        WhereCondition.init(filter, condition_id)
+
+        for i <- 1..n do
+          register_node_shape(filter, table, condition_id, i, type: {:array, :int4})
+          {:ok, key} = SublinkKey.parse("[0:0]={#{i}}", {:array, :int4})
+          seed(table, i, [key])
+        end
+
+        record = %{@field => "[0:0]={#{div(n, 2)}}"}
+        route = fn -> SubqueryIndex.affected_shapes(filter, condition_id, @field, record) end
+        assert route.() == MapSet.new([div(n, 2)])
+        reductions(route)
+      end
+
+      small = measure.(@perf_small)
+      large = measure.(@perf_large)
+
+      assert abs(large - small) < @flatness_tolerance,
+             "routing grew with member rows: #{small} -> #{large} reductions"
+    end
+
+    @tag :performance
+    @tag timeout: @perf_timeout
+    test "routing a numeric[] key is O(log n) in the number of member rows" do
+      # A numeric[] key holds a Decimal per element, a struct inside a list.
+      measure = fn n ->
+        filter = Filter.new()
+        table = Filter.subquery_index(filter)
+        condition_id = make_ref()
+        WhereCondition.init(filter, condition_id)
+
+        for i <- 1..n do
+          register_node_shape(filter, table, condition_id, i, type: {:array, :numeric})
+          {:ok, key} = SublinkKey.parse("{#{i}.5}", {:array, :numeric})
+          seed(table, i, [key])
+        end
+
+        record = %{@field => "{#{div(n, 2)}.50}"}
+        route = fn -> SubqueryIndex.affected_shapes(filter, condition_id, @field, record) end
+        assert route.() == MapSet.new([div(n, 2)])
+        reductions(route)
+      end
+
+      small = measure.(@perf_small)
+      large = measure.(@perf_large)
+
+      assert abs(large - small) < @flatness_tolerance,
+             "routing grew with member rows: #{small} -> #{large} reductions"
     end
   end
 end

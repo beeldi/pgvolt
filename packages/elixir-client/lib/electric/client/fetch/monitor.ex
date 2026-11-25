@@ -70,6 +70,7 @@ defmodule Electric.Client.Fetch.Monitor do
 
     state = %{
       request_id: request_id,
+      loggable: Fetch.Request.loggable(request),
       request: request,
       client: client,
       subscribers: [],
@@ -108,7 +109,7 @@ defmodule Electric.Client.Fetch.Monitor do
           fn ->
             "Returning response #{status}"
           end,
-          request_id: state.request_id
+          request_id: state.loggable
         )
 
       {:error, %{status: _} = response} ->
@@ -116,7 +117,7 @@ defmodule Electric.Client.Fetch.Monitor do
           fn ->
             "Request failed: #{inspect(response)}"
           end,
-          request_id: state.request_id
+          request_id: state.loggable
         )
 
       {:error, reason} ->
@@ -124,7 +125,7 @@ defmodule Electric.Client.Fetch.Monitor do
           fn ->
             "Request failed: #{inspect(reason)}"
           end,
-          request_id: state.request_id
+          request_id: state.loggable
         )
     end
 
@@ -141,7 +142,7 @@ defmodule Electric.Client.Fetch.Monitor do
       [
         message:
           "Listener #{inspect(pid)} exited with reason #{inspect(reason)}. Removing from subscribers",
-        request_id: state.request_id
+        request_id: state.loggable
       ]
     end)
 
@@ -170,7 +171,7 @@ defmodule Electric.Client.Fetch.Monitor do
 
     Logger.debug(
       fn -> "Registering listener pid #{inspect(listener_pid)}" end,
-      request_id: state.request_id
+      request_id: state.loggable
     )
 
     state = Map.update!(state, :subscribers, &[{listener_pid, ref} | &1])

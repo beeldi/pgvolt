@@ -24,6 +24,8 @@ defmodule Electric.Shapes.Consumer.State do
     event_handler: nil,
     transaction_builder: TransactionBuilder.new(),
     buffer: [],
+    # Sum of the buffered fragments' `change_count`.
+    buffered_changes: 0,
     txn_offset_mapping: [],
     materializer_subscribed?: false,
     # `{pid, from}` of a materializer whose `subscribe_materializer` call arrived while a
@@ -52,12 +54,17 @@ defmodule Electric.Shapes.Consumer.State do
     suspend_timer: nil,
     # How long after hibernation to suspend (in ms)
     suspend_after: nil,
+    # Monitor of the process that writes the snapshot, until the consumer handles its exit.
+    # What that process tells the consumer reaches it before its exit does.
+    snapshotter: nil,
     # Monotonic millisecond timestamp of the last consumer-forced GC (nil if never).
     # Used by hysteresis logic in maybe_garbage_collect/1 to cap forced-GC frequency.
     last_forced_gc_at: nil,
     # Adaptive-GC heap threshold (bytes) cached at consumer startup, or nil when
     # disabled.
-    gc_heap_threshold: nil
+    gc_heap_threshold: nil,
+    # See `txn_buffer_max_changes` in Electric.Config; nil means no limit.
+    txn_buffer_max_changes: nil
   ]
 
   @type pg_snapshot() :: SnapshotQuery.pg_snapshot()
@@ -118,6 +125,12 @@ defmodule Electric.Shapes.Consumer.State do
           Electric.Config.default(:shape_suspend_after)
         ),
       gc_heap_threshold: Electric.StackConfig.lookup(stack_id, :consumer_gc_heap_threshold, nil),
+      txn_buffer_max_changes:
+        Electric.StackConfig.lookup(
+          stack_id,
+          :txn_buffer_max_changes,
+          Electric.Config.default(:txn_buffer_max_changes)
+        ),
       buffering?: true
     }
   end
@@ -171,7 +184,12 @@ defmodule Electric.Shapes.Consumer.State do
     {:ok, latest_offset} = Storage.fetch_latest_offset(storage)
     {:ok, pg_snapshot} = Storage.fetch_pg_snapshot(storage)
 
-    initial_snapshot_state = InitialSnapshot.new(pg_snapshot)
+    # The consumer is registered, and reachable by `await_snapshot_start`, before it receives
+    # its shape: keep the waiters that got in first.
+    initial_snapshot_state = %{
+      InitialSnapshot.new(pg_snapshot)
+      | awaiting_snapshot_start: state.initial_snapshot_state.awaiting_snapshot_start
+    }
 
     %__MODULE__{
       state
@@ -224,12 +242,12 @@ defmodule Electric.Shapes.Consumer.State do
 
   @spec add_to_buffer(t(), TransactionFragment.t()) :: t()
   def add_to_buffer(%__MODULE__{buffer: buffer} = state, txn) do
-    %{state | buffer: [txn | buffer]}
+    %{state | buffer: [txn | buffer], buffered_changes: state.buffered_changes + txn.change_count}
   end
 
   @spec pop_buffered(t()) :: {[TransactionFragment.t()], t()}
   def pop_buffered(%__MODULE__{buffer: buffer} = state) do
-    {Enum.reverse(buffer), %{state | buffer: [], buffering?: false}}
+    {Enum.reverse(buffer), %{state | buffer: [], buffered_changes: 0, buffering?: false}}
   end
 
   @spec add_waiter(t(), GenServer.from()) :: t()
@@ -279,12 +297,7 @@ defmodule Electric.Shapes.Consumer.State do
   def initial_snapshot_xmin(%__MODULE__{}), do: nil
 
   def telemetry_attrs(%__MODULE__{stack_id: stack_id, shape_handle: shape_handle, shape: shape}) do
-    [
-      "shape.handle": shape_handle,
-      "shape.root_table": shape.root_table,
-      "shape.where": if(not is_nil(shape.where), do: shape.where.query, else: nil),
-      stack_id: stack_id
-    ]
+    Shape.otel_attrs(shape_handle, shape) ++ [stack_id: stack_id]
   end
 
   defguard is_write_unit_txn(write_unit) when write_unit == @write_unit_txn

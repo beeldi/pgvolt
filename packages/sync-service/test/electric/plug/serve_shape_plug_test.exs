@@ -225,7 +225,7 @@ defmodule Electric.Plug.ServeShapePlugTest do
     end
 
     @tag long_poll_timeout: 100
-    test "returns 400 when offset is out of bounds after a timeout", ctx do
+    test "tells the client to refetch when offset is out of bounds after a timeout", ctx do
       out_of_bounds_offset = LogOffset.increment(@test_offset)
 
       patch_shape_cache(
@@ -243,14 +243,9 @@ defmodule Electric.Plug.ServeShapePlugTest do
         )
         |> call_serve_shape_plug(ctx)
 
-      assert conn.status == 400
+      assert conn.status == 409
 
-      assert Jason.decode!(conn.resp_body) == %{
-               "message" => "Invalid request",
-               "errors" => %{
-                 "offset" => ["out of bounds for this shape"]
-               }
-             }
+      assert Jason.decode!(conn.resp_body) == [%{"headers" => %{"control" => "must-refetch"}}]
     end
 
     test "returns 400 for live request when offset == -1", ctx do
@@ -812,7 +807,7 @@ defmodule Electric.Plug.ServeShapePlugTest do
 
       # The default long_poll_timeout is 20s here, so completing well within
       # a second proves the poll was aborted by the reset, not the timeout.
-      conn = Task.await(task, 1000)
+      conn = Task.await(task)
 
       assert conn.status == 499
       assert conn.resp_body == ""
@@ -1149,6 +1144,60 @@ defmodule Electric.Plug.ServeShapePlugTest do
       end
     end
 
+    test "[:electric, :shape, :response_size] labels a predefined shape by its own table, not the `table` parameter",
+         ctx do
+      patch_shape_cache(
+        get_or_create_shape_handle: fn %Shape{root_table: {"public", "users"}},
+                                       _stack_id,
+                                       _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        has_shape?: fn @test_shape_handle, _opts -> true end
+      )
+
+      next_offset = LogOffset.increment(@first_offset)
+
+      patch_storage(
+        get_chunk_end_log_offset: fn @before_all_offset, _ -> @first_offset end,
+        get_log_stream: fn @before_all_offset, @first_offset, @test_opts ->
+          [Jason.encode!(%{key: "log", value: "foo", headers: %{}, offset: next_offset})]
+        end
+      )
+
+      plug_opts = build_plug_opts(ctx)
+      {:ok, api} = Api.predefined_shape(plug_opts[:api], table: "users")
+      plug_opts = Keyword.put(plug_opts, :api, api)
+
+      test_pid = self()
+      stack_id = ctx.stack_id
+      handler_id = "test-response-size-predefined-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:electric, :shape, :response_size],
+        fn _event, _measurements, metadata, _config ->
+          if metadata.stack_id == stack_id,
+            do: send(test_pid, {:telemetry_response_size, metadata})
+        end,
+        nil
+      )
+
+      try do
+        conn =
+          ctx
+          |> conn(:get, %{"table" => "caller_chosen_label"}, "?offset=-1")
+          |> ServeShapePlug.call(plug_opts)
+
+        assert conn.status == 200
+
+        assert_receive {:telemetry_response_size, %{root_table: root_table}}
+        assert root_table == "public.users"
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+
     test "[:electric, :plug, :serve_shape] tags a successful response with known_error: false",
          ctx do
       expect_shape_cache(
@@ -1304,6 +1353,97 @@ defmodule Electric.Plug.ServeShapePlugTest do
       assert conn.state == :chunked
     end
 
+    test "ends an SSE stream at once when its connection is shut down", ctx do
+      test_pid = self()
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      expect_storage(
+        get_chunk_end_log_offset: fn @test_offset, _ -> nil end,
+        get_log_stream: fn @test_offset, @test_offset, @test_opts ->
+          send(test_pid, :got_log_stream)
+          []
+        end
+      )
+
+      # Far longer than the Task.await below, so only the shutdown can end the stream in time.
+      ctx = Map.put(ctx, :sse_timeout, 60_000)
+
+      # The request runs as in a ThousandIsland connection: a process that traps exits, which
+      # its supervisor stops with an exit signal of reason :shutdown.
+      task =
+        Task.async(fn ->
+          Process.flag(:trap_exit, true)
+
+          conn =
+            ctx
+            |> conn(
+              :get,
+              %{"table" => "public.users"},
+              "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true&live_sse=true"
+            )
+            |> call_serve_shape_plug(ctx)
+
+          signal_kept? =
+            receive do
+              {:EXIT, ^test_pid, :shutdown} -> true
+            after
+              0 -> false
+            end
+
+          {conn, signal_kept?}
+        end)
+
+      assert_receive :got_log_stream, @receive_timeout
+      Process.exit(task.pid, :shutdown)
+
+      assert {conn, signal_kept?} = Task.await(task, @receive_timeout)
+
+      assert conn.status == 200
+      assert conn.state == :chunked
+
+      assert signal_kept?,
+             "the shutdown signal must stay in the mailbox for the connection's own loop"
+    end
+
+    test "omits the connection header from an SSE response on HTTP/2", ctx do
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      expect_storage(
+        get_chunk_end_log_offset: fn @test_offset, _ -> nil end,
+        get_log_stream: fn @test_offset, @test_offset, @test_opts -> [] end
+      )
+
+      ctx = Map.put(ctx, :sse_timeout, 100)
+
+      conn =
+        ctx
+        |> conn(
+          :get,
+          %{"table" => "public.users"},
+          "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true&live_sse=true"
+        )
+        |> Plug.Test.put_http_protocol(:"HTTP/2")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 200
+      assert conn.state == :chunked
+      assert {"content-type", "text/event-stream"} in conn.resp_headers
+      refute List.keymember?(conn.resp_headers, "connection", 0)
+    end
+
     test "returns 400 when live_sse=true but live=false", ctx do
       conn =
         ctx
@@ -1356,6 +1496,138 @@ defmodule Electric.Plug.ServeShapePlugTest do
       assert body =~ "data:"
       assert body =~ "test-key"
       assert body =~ "test-value"
+    end
+
+    test "streams changes past a chunk boundary in one SSE response, then up-to-date", ctx do
+      test_pid = self()
+      chunk_boundary = LogOffset.new(Lsn.from_integer(200), 0)
+      latest_offset = LogOffset.new(Lsn.from_integer(300), 0)
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      expect_storage(
+        # The request is at the log end, so the response opens as a live stream.
+        get_chunk_end_log_offset: fn @test_offset, _ -> nil end,
+        get_log_stream: fn @test_offset, @test_offset, @test_opts ->
+          send(test_pid, :sse_open)
+          []
+        end,
+        # The first change carries the log past a chunk boundary.
+        get_chunk_end_log_offset: fn @test_offset, _ -> chunk_boundary end,
+        get_log_stream: fn @test_offset, ^chunk_boundary, @test_opts ->
+          [Jason.encode!(%{key: "before-boundary"})]
+        end,
+        # The rest of the log, read from the boundary.
+        get_chunk_end_log_offset: fn ^chunk_boundary, _ -> nil end,
+        get_log_stream: fn ^chunk_boundary, ^latest_offset, @test_opts ->
+          [Jason.encode!(%{key: "after-boundary"})]
+        end
+      )
+
+      ctx = Map.put(ctx, :sse_timeout, 500)
+
+      task =
+        Task.async(fn ->
+          ctx
+          |> conn(
+            :get,
+            %{"table" => "public.users"},
+            "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true&live_sse=true"
+          )
+          |> call_serve_shape_plug(ctx)
+        end)
+
+      assert_receive :sse_open, @receive_timeout
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, latest_offset})
+      end)
+
+      %{resp_body: body} = Task.await(task)
+
+      assert body =~ "before-boundary"
+      assert body =~ "after-boundary"
+      assert body =~ ~s("control":"up-to-date")
+    end
+
+    test "ends an SSE catch-up at a chunk boundary when the timeout came during it", ctx do
+      body = sse_catch_up_body(ctx, fn _pid, ref -> {:sse_timeout, ref} end)
+
+      assert body =~ "before-boundary"
+      refute body =~ "after-boundary"
+    end
+
+    test "ends an SSE catch-up at a chunk boundary when the server is stopping", ctx do
+      body = sse_catch_up_body(ctx, fn pid, _ref -> {:EXIT, pid, :shutdown} end)
+
+      assert body =~ "before-boundary"
+      refute body =~ "after-boundary"
+    end
+
+    test "sends each change once when a notification is behind the SSE response", ctx do
+      test_pid = self()
+      latest_offset = LogOffset.new(Lsn.from_integer(300), 0)
+
+      log =
+        for lsn <- [200, 250, 300] do
+          {LogOffset.new(Lsn.from_integer(lsn), 0), Jason.encode!(%{key: "change-#{lsn}"})}
+        end
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      patch_storage(
+        get_chunk_end_log_offset: fn _offset, _ -> nil end,
+        get_log_stream: fn since, up_to, @test_opts ->
+          if since == @test_offset and up_to == @test_offset, do: send(test_pid, :sse_open)
+
+          for {offset, entry} <- log,
+              LogOffset.compare(offset, since) == :gt,
+              LogOffset.compare(offset, up_to) != :gt,
+              do: entry
+        end
+      )
+
+      ctx = Map.put(ctx, :sse_timeout, 500)
+
+      task =
+        Task.async(fn ->
+          ctx
+          |> conn(
+            :get,
+            %{"table" => "public.users"},
+            "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true&live_sse=true"
+          )
+          |> call_serve_shape_plug(ctx)
+        end)
+
+      assert_receive :sse_open, @receive_timeout
+
+      # The first notification already covers the whole log. The ones for
+      # earlier changes land after it, as when the request's own recheck of
+      # the log end beats the consumer's notifications to the mailbox.
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, latest_offset})
+        for {offset, _entry} <- log, do: send(pid, {ref, :new_changes, offset})
+      end)
+
+      %{resp_body: body} = Task.await(task)
+
+      assert Regex.scan(~r/"key":"([^"]+)"/, body, capture: :all_but_first) ==
+               [["change-200"], ["change-250"], ["change-300"]]
+
+      assert length(Regex.scan(~r/"control":"up-to-date"/, body)) == 1
     end
 
     test "works with deprecated experimental_live_sse=true", ctx do
@@ -1463,6 +1735,396 @@ defmodule Electric.Plug.ServeShapePlugTest do
     end
   end
 
+  describe "POST body cannot redefine the shape pinned in the URL" do
+    setup :with_lsn_tracker
+
+    setup ctx do
+      {:via, _, {registry_name, registry_key}} =
+        Electric.Shapes.Supervisor.name(ctx.stack_id)
+
+      {:ok, _} = Registry.register(registry_name, registry_key, nil)
+      set_status_to_active(ctx)
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      :ok
+    end
+
+    # An authorizing proxy pins the shape definition in the query string. Each case
+    # pins a definition that cannot validate and offers a valid replacement in the
+    # body: the request must still be rejected on the pinned value, proving the body
+    # never displaced it.
+
+    test "a body `where` does not replace the where pinned in the URL", ctx do
+      conn =
+        Plug.Test.conn(
+          :post,
+          "/?table=public.users&offset=-1&where=" <> URI.encode_www_form("no_such_column = 1"),
+          Jason.encode!(%{"subset" => %{}, "where" => "id = 1"})
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 400
+      assert %{"errors" => %{"where" => [message]}} = Jason.decode!(conn.resp_body)
+      assert message =~ "no_such_column"
+    end
+
+    test "a body `table` does not replace the table pinned in the URL", ctx do
+      conn =
+        Plug.Test.conn(
+          :post,
+          "/?table=public.no_such_table&offset=-1",
+          Jason.encode!(%{"where" => "id = 1", "table" => "public.users"})
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 400
+      assert %{"errors" => %{"table" => [_ | _]}} = Jason.decode!(conn.resp_body)
+    end
+
+    test "a body `columns` does not replace the columns pinned in the URL", ctx do
+      conn =
+        Plug.Test.conn(
+          :post,
+          "/?table=public.users&offset=-1&columns=" <> URI.encode_www_form("id,no_such_column"),
+          Jason.encode!(%{"where" => "id = 1", "columns" => "id,value"})
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 400
+      assert %{"errors" => %{"columns" => [_ | _]}} = Jason.decode!(conn.resp_body)
+    end
+
+    # The body must still be read for the subset parameters it is meant to carry:
+    # a subset `where` naming an unknown column is rejected on that column, which it
+    # can only be if the body reached subset validation.
+    test "a documented subset body still reaches the subset params", ctx do
+      conn =
+        Plug.Test.conn(
+          :post,
+          "/?table=public.users&offset=-1&subset__order_by=id&where=" <>
+            URI.encode_www_form("id = 1"),
+          Jason.encode!(%{"where" => "no_such_column = 1", "subset" => %{"limit" => 10}})
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "no_such_column"
+    end
+
+    # The schema ignores a key the subset does not read, so naming it twice is no conflict: the
+    # body reaches subset validation and is rejected on its unknown column.
+    test "a key the subset does not read may be in both the URL and the body", ctx do
+      conn =
+        Plug.Test.conn(
+          :post,
+          "/?table=public.users&offset=-1&subset__order_by=id&subset__note=a",
+          Jason.encode!(%{"subset" => %{"where" => "no_such_column = 1", "note" => "b"}})
+        )
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "no_such_column"
+      refute conn.resp_body =~ "more than one place"
+    end
+
+    # A params object given as a JSON string is decoded after the body, where a repeated key
+    # would keep its last value while a proxy that checked the params read the first.
+    for {request, method, query, body} <- [
+          {"a GET query", :get,
+           "&subset__where=" <>
+             URI.encode_www_form("id = $1") <>
+             "&subset__params=" <> URI.encode_www_form(~s({"1":"1","1":"2"})), nil},
+          {"a POST body", :post, "",
+           Jason.encode!(%{
+             "subset" => %{"where" => "id = $1", "params" => ~s({"1":"1","1":"2"})}
+           })}
+        ] do
+      test "refuses a key repeated in JSON-encoded subset params in #{request}", ctx do
+        conn =
+          Plug.Test.conn(
+            unquote(method),
+            "/?table=public.users&offset=-1" <> unquote(query),
+            unquote(body)
+          )
+          |> put_req_header("content-type", "application/json")
+          |> call_serve_shape_plug(ctx)
+
+        assert {400,
+                %{"errors" => %{"subset" => %{"params" => ["params must not repeat a key"]}}}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+      end
+    end
+  end
+
+  describe "POST subset parameter sources" do
+    setup :with_lsn_tracker
+
+    setup ctx do
+      set_status_to_active(ctx)
+      :ok
+    end
+
+    for {sources, query, body, field} <- [
+          {"the URL and flat body", "&subset__limit=1", ~s({"limit":1}), "limit"},
+          {"the URL and nested body", "&subset__where=id+%3D+1",
+           ~s({"subset":{"where":"id = 2"}}), "where"},
+          {"the flat and nested body", "", ~s({"order_by":"id","subset":{"order_by":"id"}}),
+           "order_by"},
+          {"the URL and nested body for a map field", "&subset__params[1]=1",
+           ~s({"subset":{"params":{"2":"2"}}}), "params"}
+        ] do
+      test "refuses a subset field in #{sources}", ctx do
+        conn =
+          Plug.Test.conn(:post, "/?offset=-1" <> unquote(query), unquote(body))
+          |> call_serve_shape_plug(ctx)
+
+        errors = %{unquote(field) => ["can't be specified in more than one place"]}
+
+        assert {400, %{"errors" => %{"subset" => ^errors}}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+      end
+    end
+
+    # Plug reads `subset=a` as a string and `subset[]=a` as a list, neither of which a body
+    # subset can be merged into.
+    for query <- ["&subset=a", "&subset[]=a"] do
+      test "refuses a URL subset that is not an object next to a body subset: #{query}", ctx do
+        conn =
+          Plug.Test.conn(:post, "/?offset=-1" <> unquote(query), ~s({"limit":1}))
+          |> call_serve_shape_plug(ctx)
+
+        assert {400, %{"errors" => %{"subset" => ["is invalid"]}}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+      end
+    end
+
+    for {location, body} <- [
+          {"top-level object", ~s({"limit":1,"limit":1})},
+          {"subset object", ~S({"subset":{"where":"id = 1","wher\u0065":"id = 2"}})},
+          {"object in an array", ~s({"ignored":[{"value":1,"value":2}]})}
+        ] do
+      test "refuses duplicate JSON members in the #{location}", ctx do
+        conn =
+          Plug.Test.conn(:post, "/?offset=-1", unquote(body))
+          |> call_serve_shape_plug(ctx)
+
+        assert {400, %{"error" => "Duplicate JSON member in request body"}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+      end
+    end
+  end
+
+  describe "a shape parameter given more than once or spelled another way" do
+    setup :with_lsn_tracker
+
+    setup ctx do
+      {:via, _, {registry_name, registry_key}} =
+        Electric.Shapes.Supervisor.name(ctx.stack_id)
+
+      {:ok, _} = Registry.register(registry_name, registry_key, nil)
+      set_status_to_active(ctx)
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      :ok
+    end
+
+    # Plug keeps the last value of a repeated parameter and matches names exactly. A proxy
+    # in front may read the first value, match undecoded names regardless of case (nginx) or
+    # read names as PHP does. The request is refused rather than read either way.
+    for {param, query} <- [
+          {"table", "table=public.users&table=public.no_such_table"},
+          {"where", "table=public.users&where=id+%3D+1&where=true"},
+          {"columns", "table=public.users&columns=id&columns=id%2Cvalue"},
+          {"params", "table=public.users&where=id+%3D+%241&params[1]=1&params[1]=2"},
+          {"table", "table=public.users&t%61ble=public.no_such_table"},
+          {"table", "TABLE=public.no_such_table&table=public.users"},
+          {"where", "table=public.users&WHERE=id+%3D+1"},
+          {"queryable_columns", "table=public.users&queryable.columns=id"},
+          {"subset", "table=public.users&subset__where=id+%3D+1&subset__where=true"},
+          {"subset", "table=public.users&subset__where=id+%3D+1&subset[where]=true"},
+          {"subset", "table=public.users&subset__where=id+%3D+1&subset[order_by]=id"},
+          {"params",
+           "table=public.users&where=id+%3D+%241&params=%7B%221%22%3A%221%22%7D&params[1]=2"},
+          {"where", "table=public.users&w%68ere=id+%3D+1"},
+          {"where", "table=public.users&where=true&%20where=id+%3D+1"},
+          {"where", "table=public.users&where=true&where%00=id+%3D+1"},
+          {"queryable_columns", "table=public.users&queryable[columns=id"},
+          {"params", "table=public.users&where=id+%3D+%241&params[1]=1&params[1]x=2"}
+        ] do
+      test "is refused: #{query}", ctx do
+        conn =
+          conn(ctx, :get, nil, "?offset=-1&" <> unquote(query))
+          |> call_serve_shape_plug(ctx)
+
+        expected = %{unquote(param) => ["can't be repeated or spelled another way"]}
+        assert {400, %{"errors" => ^expected}} = {conn.status, Jason.decode!(conn.resp_body)}
+      end
+    end
+
+    # The request below reaches where-clause validation, which it can only do if neither
+    # the distinct `params[n]` and `subset__*` keys, the escaped brackets clients send, nor
+    # the repeated `offset` were refused.
+    test "distinct keys and a repeated non-shape parameter are not refused", ctx do
+      where = URI.encode_www_form("no_such_column = $1 AND value = $2")
+      subset = "subset__where=id+%3D+1&subset__order_by=id&subset__limit=1&subset__params=%7B%7D"
+
+      conn =
+        conn(
+          ctx,
+          :get,
+          nil,
+          "?table=public.users&offset=-1&offset=-1&where=#{where}&params%5B1%5D=1&params[2]=2&" <>
+            subset
+        )
+        |> call_serve_shape_plug(ctx)
+
+      assert %{"errors" => %{"where" => [message]} = errors} = Jason.decode!(conn.resp_body)
+      assert message =~ "no_such_column"
+      refute Enum.any?(Map.values(errors), &("can't be repeated or spelled another way" in &1))
+    end
+  end
+
+  describe "admission of a request carrying a known handle" do
+    setup :with_lsn_tracker
+
+    setup ctx do
+      {:via, _, {registry_name, registry_key}} =
+        Electric.Shapes.Supervisor.name(ctx.stack_id)
+
+      {:ok, _} = Registry.register(registry_name, registry_key, nil)
+      set_status_to_active(ctx)
+
+      Repatch.patch(Electric.ShapeCache.ShapeStatus, :has_shape_handle?, fn _stack_id, _handle ->
+        true
+      end)
+
+      :ok
+    end
+
+    defp assert_refused_as_initial(conn) do
+      assert conn.status == 503
+
+      assert %{
+               "code" => "concurrent_request_limit_exceeded",
+               "message" => "Concurrent initial request limit exceeded" <> _
+             } = Jason.decode!(conn.resp_body)
+    end
+
+    defp refute_shape_loaded do
+      Repatch.patch(Electric.Shapes.Api, :load_shape_info, fn _request ->
+        flunk("the shape must not be loaded for a refused request")
+      end)
+    end
+
+    for offset <- ["-1", "now"] do
+      @tag max_concurrent_requests: %{initial: 0, existing: 10}
+      test "counts against the initial limit at offset #{offset}", ctx do
+        refute_shape_loaded()
+
+        conn =
+          ctx
+          |> conn(
+            :get,
+            %{"table" => "public.users"},
+            "?offset=#{unquote(offset)}&handle=#{@test_shape_handle}"
+          )
+          |> call_serve_shape_plug(ctx)
+
+        assert_refused_as_initial(conn)
+        assert %{initial: 0, existing: 0} == Electric.AdmissionControl.get_current(ctx.stack_id)
+      end
+    end
+
+    @tag max_concurrent_requests: %{initial: 0, existing: 10}
+    test "counts against the initial limit before its body is read", ctx do
+      conn =
+        Plug.Test.conn(:post, "/?offset=-1&handle=#{@test_shape_handle}", "not valid json")
+        |> put_req_header("content-type", "application/json")
+        |> call_serve_shape_plug(ctx)
+
+      assert_refused_as_initial(conn)
+    end
+
+    @tag max_concurrent_requests: %{initial: 0, existing: 10}
+    test "counts against the initial limit when the handle is of another definition", ctx do
+      Repatch.patch(Electric.ShapeCache.ShapeStatus, :validate_shape_handle, fn _, _, _ ->
+        :error
+      end)
+
+      refute_shape_loaded()
+
+      conn =
+        ctx
+        |> conn(
+          :get,
+          %{"table" => "public.users"},
+          "?offset=#{@test_offset}&handle=#{@test_shape_handle}"
+        )
+        |> call_serve_shape_plug(ctx)
+
+      assert_refused_as_initial(conn)
+      assert %{initial: 0, existing: 0} == Electric.AdmissionControl.get_current(ctx.stack_id)
+    end
+
+    @tag max_concurrent_requests: %{initial: 0, existing: 10}
+    test "keeps its existing permit when the handle is of the requested definition", ctx do
+      Repatch.patch(Electric.ShapeCache.ShapeStatus, :validate_shape_handle, fn
+        _stack_id, @test_shape_handle, @test_shape -> :ok
+      end)
+
+      assert %{initial: 0, existing: 1} ==
+               permits_held_at_shape_load(
+                 ctx,
+                 "?offset=#{@test_offset}&handle=#{@test_shape_handle}"
+               )
+
+      assert %{initial: 0, existing: 0} == Electric.AdmissionControl.get_current(ctx.stack_id)
+    end
+
+    @tag max_concurrent_requests: %{initial: 1, existing: 10}
+    test "moves to an initial permit, released at the end, when the handle is of another definition",
+         ctx do
+      Repatch.patch(Electric.ShapeCache.ShapeStatus, :validate_shape_handle, fn _, _, _ ->
+        :error
+      end)
+
+      assert %{initial: 1, existing: 0} ==
+               permits_held_at_shape_load(
+                 ctx,
+                 "?offset=#{@test_offset}&handle=#{@test_shape_handle}"
+               )
+
+      assert %{initial: 0, existing: 0} == Electric.AdmissionControl.get_current(ctx.stack_id)
+    end
+
+    defp permits_held_at_shape_load(ctx, query_string) do
+      test_pid = self()
+
+      Repatch.patch(Electric.Shapes.Api, :load_shape_info, fn _request ->
+        send(test_pid, {:permits, Electric.AdmissionControl.get_current(ctx.stack_id)})
+        raise RuntimeError, "simulated crash"
+      end)
+
+      try do
+        ctx
+        |> conn(:get, %{"table" => "public.users"}, query_string)
+        |> call_serve_shape_plug(ctx)
+      catch
+        _kind, _reason -> :ok
+      end
+
+      assert_received {:permits, permits}
+      permits
+    end
+  end
+
   describe "admission control release on error" do
     setup :with_lsn_tracker
 
@@ -1521,6 +2183,8 @@ defmodule Electric.Plug.ServeShapePlugTest do
         true
       end)
 
+      Repatch.patch(Electric.ShapeCache.ShapeStatus, :validate_shape_handle, fn _, _, _ -> :ok end)
+
       Repatch.patch(Electric.Shapes.Api, :load_shape_info, fn _request ->
         raise RuntimeError, "simulated crash"
       end)
@@ -1546,6 +2210,69 @@ defmodule Electric.Plug.ServeShapePlugTest do
       call_plug_expecting_crash(ctx)
 
       assert %{initial: 0, existing: 0} == Electric.AdmissionControl.get_current(ctx.stack_id)
+    end
+
+    test "releases the permit of a live request whose process is killed while it waits", ctx do
+      # As when an HTTP/2 connection closes: its stream processes are killed
+      # with it and never reach the `after` clause in call/2.
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      test_pid = self()
+
+      patch_storage(
+        get_chunk_end_log_offset: fn _offset, _ -> nil end,
+        get_log_stream: fn _since, _up_to, @test_opts ->
+          send(test_pid, :waiting_for_changes)
+          []
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          ctx
+          |> conn(
+            :get,
+            %{"table" => "public.users"},
+            "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true"
+          )
+          |> ServeShapePlug.call(ctx.plug_opts)
+        end)
+
+      Process.unlink(task.pid)
+      assert_receive :waiting_for_changes, @receive_timeout
+      assert permits_held(ctx.stack_id) == 1
+
+      Process.exit(task.pid, :kill)
+      assert {:exit, :killed} = Task.yield(task, @receive_timeout)
+
+      assert_eventually_no_permits(ctx.stack_id)
+    end
+
+    defp permits_held(stack_id) do
+      %{initial: initial, existing: existing} = Electric.AdmissionControl.get_current(stack_id)
+      initial + existing
+    end
+
+    defp assert_eventually_no_permits(stack_id, attempts \\ 100) do
+      cond do
+        permits_held(stack_id) == 0 ->
+          :ok
+
+        attempts > 0 ->
+          Process.sleep(10)
+          assert_eventually_no_permits(stack_id, attempts - 1)
+
+        true ->
+          flunk("permits still held: #{inspect(Electric.AdmissionControl.get_current(stack_id))}")
+      end
     end
 
     test "500 response body redacts internal exception details", ctx do
@@ -1766,6 +2493,65 @@ defmodule Electric.Plug.ServeShapePlugTest do
       assert conn.status == 400
       assert get_resp_header(conn, "cache-control") == ["no-store"]
     end
+  end
+
+  # An SSE response whose first change carries the log past a chunk boundary. `stop` builds a
+  # message that reaches the request right behind the change notice, so while it sends the
+  # segment up to the boundary.
+  defp sse_catch_up_body(ctx, stop) do
+    test_pid = self()
+    chunk_boundary = LogOffset.new(Lsn.from_integer(200), 0)
+    latest_offset = LogOffset.new(Lsn.from_integer(300), 0)
+
+    patch_shape_cache(
+      resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+        {@test_shape_handle, @test_offset}
+      end,
+      has_shape?: fn @test_shape_handle, _opts -> true end,
+      await_snapshot_start: fn @test_shape_handle, _ -> :started end
+    )
+
+    patch_storage(
+      get_chunk_end_log_offset: fn
+        # At the log end when the response opens, past a boundary once the change is in.
+        @test_offset, _ -> if Process.put(:sse_open?, true), do: chunk_boundary
+        ^chunk_boundary, _ -> nil
+      end,
+      get_log_stream: fn
+        @test_offset, @test_offset, @test_opts ->
+          send(test_pid, :sse_open)
+          []
+
+        @test_offset, ^chunk_boundary, @test_opts ->
+          [Jason.encode!(%{key: "before-boundary"})]
+
+        ^chunk_boundary, ^latest_offset, @test_opts ->
+          [Jason.encode!(%{key: "after-boundary"})]
+      end
+    )
+
+    ctx = Map.put(ctx, :sse_timeout, 5_000)
+
+    task =
+      Task.async(fn ->
+        ctx
+        |> conn(
+          :get,
+          %{"table" => "public.users"},
+          "?offset=#{@test_offset}&handle=#{@test_shape_handle}&live=true&live_sse=true"
+        )
+        |> call_serve_shape_plug(ctx)
+      end)
+
+    assert_receive :sse_open, @receive_timeout
+
+    Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+      send(pid, {ref, :new_changes, latest_offset})
+      send(pid, stop.(pid, ref))
+    end)
+
+    %{resp_body: body} = Task.await(task)
+    body
   end
 
   defp get_shape_with_etag(ctx, offset, extra_query_params \\ []) do

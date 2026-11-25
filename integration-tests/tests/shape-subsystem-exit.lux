@@ -1,0 +1,76 @@
+[doc Verify that an exit of the shape log collector stops Electric, and that the next start on the same storage and slot serves the changes committed meanwhile]
+
+[include _macros.luxinc]
+
+[global pg_container_name=shape-subsystem-exit__pg]
+[global handle=""]
+
+###
+
+## Start a new Postgres cluster
+[invoke setup_pg]
+
+## Add some data
+[invoke start_psql]
+[shell psql]
+  """!
+  CREATE TABLE items (
+    id UUID PRIMARY KEY,
+    val TEXT
+  );
+  """
+  ??CREATE TABLE
+
+  !INSERT INTO items (id, val) VALUES (gen_random_uuid(), 'before the exit');
+  ??INSERT 0 1
+
+## Start the sync service.
+[invoke setup_electric]
+
+[shell electric]
+  ??[notice] Starting replication from postgres
+
+# Initialize a shape, wait for it to persist and collect the offset
+[shell client]
+  [invoke shape_get_snapshot items]
+  ?electric-handle: ([\d-]+)
+  [global handle=$1]
+  ?electric-offset: ([\w\d_]+)
+  [global offset=$1]
+  ??"val":"before the exit"
+
+[shell electric]
+  ??[debug] ShapeDb: committed {:snapshot_complete, "$handle"}
+
+## Kill the shape log collector. The shape subsystem is not started again in place, so the
+## application stops.
+[shell electric]
+  # The exit logs the collector's crash and the shutdown that follows.
+  -
+
+  !Process.exit(GenServer.whereis(Electric.Replication.ShapeLogCollector.name("single_stack")), :kill)
+  ??[notice] Application electric exited: shutdown
+
+## Commit a change while the service is down
+[shell psql]
+  !INSERT INTO items (id, val) VALUES (gen_random_uuid(), 'while stopped');
+  ??INSERT 0 1
+
+[invoke stop_electric]
+
+## Start the sync service again, on the same storage and replication slot
+[invoke setup_electric]
+
+[shell electric]
+  ??[notice] Loaded shape metadata for 1 completed shapes
+  ??[notice] Starting replication from postgres
+
+# The client resumes the shape where it left it and gets the change
+[shell client]
+  [invoke shape_get_live items $handle $offset]
+  ??HTTP/1.1 200 OK
+  ??electric-handle: $handle
+  ??"val":"while stopped"
+
+[cleanup]
+  [invoke teardown]

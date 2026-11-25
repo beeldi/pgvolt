@@ -152,7 +152,7 @@ defmodule Electric.Replication.Eval.KnownDefinition do
       <=: [:lt, :eq],
       >=: [:eq, :gt],
       >: [:gt],
-      !=: [:lt, :gt]
+      <>: [:lt, :gt]
     }
 
     {module, compare_fn, _} = ampersand_to_mfa(func_ast)

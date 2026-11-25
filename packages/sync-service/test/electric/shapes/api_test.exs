@@ -15,7 +15,8 @@ defmodule Electric.Shapes.ApiTest do
       expect_storage: 1,
       patch_storage: 1,
       expect_shape_cache: 1,
-      patch_shape_cache: 1
+      patch_shape_cache: 1,
+      patch_calls: 2
     ]
 
   @inspector Support.StubInspector.new(
@@ -42,7 +43,7 @@ defmodule Electric.Shapes.ApiTest do
   @start_offset_50 LogOffset.new(Lsn.from_integer(50), 0)
 
   # Higher timeout is needed for some tests that tend to run slower on CI.
-  @receive_timeout 1000
+  @receive_timeout ExUnit.configuration()[:assert_receive_timeout]
 
   @moduletag :tmp_dir
 
@@ -710,6 +711,45 @@ defmodule Electric.Shapes.ApiTest do
       refute response.no_changes
     end
 
+    test "clamps the advertised chunk offset to the committed shape offset", ctx do
+      committed_offset = @test_offset
+      uncommitted_chunk_boundary = LogOffset.new(Lsn.from_integer(200), 0)
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, committed_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      expect_storage(
+        get_chunk_end_log_offset: fn @start_offset_50, _ ->
+          uncommitted_chunk_boundary
+        end,
+        get_log_stream: fn @start_offset_50, _up_to, @test_opts ->
+          [Jason.encode!(%{key: "log", value: "foo", headers: %{}, offset: committed_offset})]
+        end
+      )
+
+      assert {:ok, request} =
+               Api.validate(
+                 ctx.api,
+                 %{
+                   table: "public.users",
+                   offset: "#{@start_offset_50}",
+                   handle: @test_shape_handle
+                 }
+               )
+
+      response = Api.serve_shape_response(request)
+
+      assert response.status == 200
+      assert response.offset == committed_offset
+    end
+
     test "returns immediate up-to-date message when offset is 'now'", ctx do
       patch_shape_cache(
         fetch_handle_by_shape: fn @test_shape, _opts -> {:ok, @test_shape_handle} end,
@@ -911,17 +951,44 @@ defmodule Electric.Shapes.ApiTest do
 
       assert response = Api.serve_shape_response(request)
 
-      # The out-of-bounds half-timeout fires at div(200, 2) = 100ms and returns
-      # a 400 error. If instead the full long_poll_timeout fires, we'd get a 200.
-      # The status code alone proves which path was taken — no wall-clock check needed.
-      assert response.status == 400
+      # The out-of-bounds half-timeout fires at div(200, 2) = 100ms and answers must-refetch.
+      # If instead the full long_poll_timeout fires, we'd get a 200. The status code alone
+      # proves which path was taken — no wall-clock check needed.
+      assert response.status == 409
 
-      assert response_body(response) == %{
-               message: "Invalid request",
-               errors: %{
-                 offset: ["out of bounds for this shape"]
-               }
-             }
+      assert response_body(response) == [%{headers: %{control: "must-refetch"}}]
+
+      assert response.handle == @test_shape_handle,
+             "the shape has not rotated, so the client must be told which shape to refetch"
+    end
+
+    @tag long_poll_timeout: 200
+    test "answers a covered out-of-bounds wait_for_lsn request as any out-of-bounds request",
+         ctx do
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end
+      )
+
+      out_of_bounds_offset = LogOffset.increment(@test_offset)
+
+      assert {:ok, request} =
+               Api.validate(
+                 ctx.api,
+                 %{
+                   table: "public.users",
+                   handle: "#{@test_shape_handle}",
+                   offset: "#{out_of_bounds_offset}",
+                   live: true,
+                   wait_for_lsn: "0"
+                 }
+               )
+
+      assert response = Api.serve_shape_response(request)
+
+      assert response.status == 409
+      assert response_body(response) == [%{headers: %{control: "must-refetch"}}]
     end
 
     for live <- [true, false] do
@@ -1391,6 +1458,130 @@ defmodule Electric.Shapes.ApiTest do
       assert response.no_changes
     end
 
+    # Far longer than the Task.await below, so only the shutdown can end the long poll in time.
+    @tag long_poll_timeout: 60_000
+    test "answers a parked long poll at once when its connection is shut down", ctx do
+      test_pid = self()
+
+      patch_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end
+      )
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      expect_storage(
+        get_chunk_end_log_offset: fn @test_offset, _ -> nil end,
+        get_log_stream: fn @test_offset, _, @test_opts ->
+          send(test_pid, :got_log_stream)
+          []
+        end
+      )
+
+      # The request runs as in a ThousandIsland connection: a process that traps exits, which
+      # its supervisor stops with an exit signal of reason :shutdown.
+      task =
+        Task.async(fn ->
+          Process.flag(:trap_exit, true)
+
+          assert {:ok, request} =
+                   Api.validate(
+                     ctx.api,
+                     %{
+                       table: "public.users",
+                       offset: "#{@test_offset}",
+                       handle: @test_shape_handle,
+                       live: true
+                     }
+                   )
+
+          response = Api.serve_shape_response(request)
+
+          signal_kept? =
+            receive do
+              {:EXIT, ^test_pid, :shutdown} -> true
+            after
+              0 -> false
+            end
+
+          {response, response_body(response), signal_kept?}
+        end)
+
+      assert_receive :got_log_stream, @receive_timeout
+      Process.exit(task.pid, :shutdown)
+
+      assert {response, body, signal_kept?} = Task.await(task, @receive_timeout)
+
+      assert response.status == 200
+      assert [%{headers: %{control: "up-to-date"}}] = body
+      assert response.no_changes
+
+      assert signal_kept?,
+             "the shutdown signal must stay in the mailbox for the connection's own loop"
+    end
+
+    # As above; the out-of-bounds check fires at half of it, still far past the Task.await.
+    @tag long_poll_timeout: 60_000
+    test "asks a client ahead of the log to retry when its connection is shut down", ctx do
+      test_pid = self()
+
+      expect_shape_cache(
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end,
+        # notify_changes_since_request_start, just before the request parks
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          send(test_pid, :parking)
+          {@test_shape_handle, @test_offset}
+        end
+      )
+
+      out_of_bounds_offset = LogOffset.increment(@test_offset)
+
+      task =
+        Task.async(fn ->
+          Process.flag(:trap_exit, true)
+
+          assert {:ok, request} =
+                   Api.validate(
+                     ctx.api,
+                     %{
+                       table: "public.users",
+                       handle: "#{@test_shape_handle}",
+                       offset: "#{out_of_bounds_offset}",
+                       live: true
+                     }
+                   )
+
+          response = Api.serve_shape_response(request)
+
+          signal_kept? =
+            receive do
+              {:EXIT, ^test_pid, :shutdown} -> true
+            after
+              0 -> false
+            end
+
+          {response, signal_kept?}
+        end)
+
+      assert_receive :parking, @receive_timeout
+      Process.exit(task.pid, :shutdown)
+
+      assert {response, signal_kept?} = Task.await(task, @receive_timeout)
+
+      # Not the timeout's 200 up-to-date at @test_offset, which would move the client back.
+      assert response.status == 503
+      assert response.retry_after == 5
+      assert response.offset == nil
+
+      assert signal_kept?,
+             "the shutdown signal must stay in the mailbox for the connection's own loop"
+    end
+
     @tag long_poll_timeout: 200
     test "returns the latest lsn after the long poll timeout even if stack has failed", ctx do
       patch_shape_cache(
@@ -1549,6 +1740,31 @@ defmodule Electric.Shapes.ApiTest do
       # Only mark shape metadata ready — not full active
       Electric.StatusMonitor.mark_shape_metadata_ready(ctx.stack_id, self())
       Electric.StatusMonitor.wait_for_messages_to_be_processed(ctx.stack_id)
+    end
+
+    # The monitor's table goes with it, and the stack reads as starting until the processes it
+    # watches report again.
+    defp restart_status_monitor(ctx) do
+      pid = GenServer.whereis(Electric.StatusMonitor.name(ctx.stack_id))
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+      assert Electric.StatusMonitor.status(ctx.stack_id).shape == :starting
+    end
+
+    # The shape's consumer runs on this node, which it does only once this node holds the
+    # replication lock, and here before the status monitor reports the stack up.
+    defp run_consumer_here(ctx) do
+      Electric.Shapes.ConsumerRegistry.registry_table(ctx.stack_id)
+
+      :ok =
+        Electric.Shapes.ConsumerRegistry.register_consumer(
+          self(),
+          @test_shape_handle,
+          ctx.stack_id
+        )
+
+      assert Electric.StatusMonitor.status(ctx.stack_id).shape == :read_only
     end
 
     test "sets read_only flag on request when in read-only mode", ctx do
@@ -1845,8 +2061,457 @@ defmodule Electric.Shapes.ApiTest do
              ] = response_body(response)
     end
 
+    # Far longer than the Task.await below: only the new changes can end the long poll in time.
+    @tag long_poll_timeout: 60_000
+    test "a long poll parked while read-only reads the writer's changes once active", ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      # The disk, all a read-only read sees, stays at @test_offset: the writer buffers the change.
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, opts ->
+          if opts[:read_only?],
+            do: {@test_shape_handle, @test_offset},
+            else: {@test_shape_handle, next_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, read_only?: opts[:read_only?]})
+
+          if opts[:read_only?],
+            do: {:ok, []},
+            else:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]}
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(ctx.api, %{
+                     table: "public.users",
+                     offset: "#{@test_offset}",
+                     handle: @test_shape_handle,
+                     live: true
+                   })
+
+          assert request.read_only?
+          response = Api.serve_shape_response(request)
+          {response, response_body(response)}
+        end)
+
+      # The request found nothing new and is subscribed: the stack goes active, then a consumer
+      # announces a change.
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      set_status_to_active(ctx)
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, next_offset})
+      end)
+
+      assert_receive {:log_read, read_only?: false}, @receive_timeout
+      assert {response, body} = Task.await(task, @receive_timeout)
+
+      # Not a 409 must-refetch from the disk's offset looking like a regression.
+      assert response.status == 200
+      assert [%{"key" => "log1"}, %{headers: %{control: "up-to-date"}}] = body
+    end
+
+    # The log collector reports ready to the status monitor and replays at once, so the shape's
+    # consumer can write a change and announce it before the stack reports up. The disk does not
+    # have it yet: read there, the request parked again and answered 409 must-refetch.
+    @tag long_poll_timeout: 60_000
+    test "a long poll parked while read-only reads the writer's changes once the consumer runs here",
+         ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      # The disk, all a read-only read sees, stays at @test_offset: the writer buffers the change.
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, opts ->
+          if opts[:read_only?],
+            do: {@test_shape_handle, @test_offset},
+            else: {@test_shape_handle, next_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, read_only?: opts[:read_only?]})
+
+          if opts[:read_only?],
+            do: {:ok, []},
+            else:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]}
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(ctx.api, %{
+                     table: "public.users",
+                     offset: "#{@test_offset}",
+                     handle: @test_shape_handle,
+                     live: true
+                   })
+
+          assert request.read_only?
+          response = Api.serve_shape_response(request)
+          {response, response_body(response)}
+        end)
+
+      # The request found nothing new and is subscribed: the shape's consumer starts here and
+      # announces a change, and the stack still reads as read-only.
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      run_consumer_here(ctx)
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, next_offset})
+      end)
+
+      assert_receive {:log_read, read_only?: false}, @receive_timeout
+      assert {response, body} = Task.await(task, @receive_timeout)
+
+      # Not a 409 must-refetch from the disk's offset looking like a regression.
+      assert response.status == 200
+      assert [%{"key" => "log1"}, %{headers: %{control: "up-to-date"}}] = body
+    end
+
+    # An SSE stream that starts while another instance writes the shape sends itself the changes
+    # that instance flushed since the request began. Its segment read the log through a writable
+    # storage handle, whose data-loss handling removes the shape from the shared storage.
+    test "an SSE stream on a standby reads the active instance's changes read-only", ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      # The request starts at @test_offset; the check after subscribing finds the writer ahead.
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          if Process.put(:resolved, true),
+            do: {@test_shape_handle, next_offset},
+            else: {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, up_to: opts[:up_to], read_only?: opts[:read_only?]})
+          {:ok, []}
+        end
+      )
+
+      assert {:ok, request} =
+               Api.validate(%{ctx.api | sse_timeout: 200}, %{
+                 table: "public.users",
+                 offset: "#{@test_offset}",
+                 handle: @test_shape_handle,
+                 live: true,
+                 live_sse: true
+               })
+
+      assert request.read_only?
+      response = Api.serve_shape_response(request)
+      _ = Enum.to_list(response.body)
+
+      assert_received {:log_read, up_to: ^next_offset, read_only?: true}
+    end
+
+    # A stack that reads as starting is not up: the shape may still be another instance's.
+    test "an SSE stream on a standby stays read-only while its status monitor restarts", ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      # The request starts at @test_offset; the check after subscribing finds the writer ahead.
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          if Process.put(:resolved, true),
+            do: {@test_shape_handle, next_offset},
+            else: {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, up_to: opts[:up_to], read_only?: opts[:read_only?]})
+          {:ok, []}
+        end
+      )
+
+      assert {:ok, request} =
+               Api.validate(%{ctx.api | sse_timeout: 200}, %{
+                 table: "public.users",
+                 offset: "#{@test_offset}",
+                 handle: @test_shape_handle,
+                 live: true,
+                 live_sse: true
+               })
+
+      assert request.read_only?
+      restart_status_monitor(ctx)
+      response = Api.serve_shape_response(request)
+      _ = Enum.to_list(response.body)
+
+      assert_received {:log_read, up_to: ^next_offset, read_only?: true}
+    end
+
+    # As for a long poll: once the shape's consumer runs here, the change it announces is the
+    # writer's, which the disk may not have yet.
+    test "an SSE stream that started read-only reads through the writer once the consumer runs here",
+         ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      # The request starts at @test_offset; the check after subscribing finds the writer ahead.
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          if Process.put(:resolved, true),
+            do: {@test_shape_handle, next_offset},
+            else: {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, up_to: opts[:up_to], read_only?: opts[:read_only?]})
+
+          # Only the writer has the change.
+          if opts[:read_only?],
+            do: {:ok, []},
+            else:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]}
+        end
+      )
+
+      assert {:ok, request} =
+               Api.validate(%{ctx.api | sse_timeout: 200}, %{
+                 table: "public.users",
+                 offset: "#{@test_offset}",
+                 handle: @test_shape_handle,
+                 live: true,
+                 live_sse: true
+               })
+
+      assert request.read_only?
+      run_consumer_here(ctx)
+      response = Api.serve_shape_response(request)
+      body = response.body |> Enum.to_list() |> IO.iodata_to_binary()
+
+      assert_received {:log_read, up_to: ^next_offset, read_only?: false}
+      assert body =~ ~s("key":"log1")
+    end
+
+    @tag long_poll_timeout: 60_000
+    test "a wait_for_lsn long poll parked while read-only serves the writer's changes before covering once active",
+         ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, opts ->
+          if opts[:read_only?],
+            do: {@test_shape_handle, @test_offset},
+            else: {@test_shape_handle, next_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, read_only?: opts[:read_only?]})
+
+          if opts[:read_only?],
+            do: {:ok, []},
+            else:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]}
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(ctx.api, %{
+                     table: "public.users",
+                     offset: "#{@test_offset}",
+                     handle: @test_shape_handle,
+                     live: true,
+                     wait_for_lsn: "1000"
+                   })
+
+          assert request.read_only?
+          response = Api.serve_shape_response(request)
+          {response, response_body(response)}
+        end)
+
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      set_status_to_active(ctx)
+      Electric.LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 2000)
+
+      assert_receive {:log_read, read_only?: false}, @receive_timeout
+      assert {response, body} = Task.await(task, @receive_timeout)
+
+      assert response.status == 200
+      assert [%{"key" => "log1"}, %{headers: %{control: "up-to-date"}}] = body
+    end
+
+    # As above: only the new changes can end the long poll in time.
+    @tag long_poll_timeout: 60_000
+    test "a long poll woken while still read-only keeps reading the disk", ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+      # Another instance writes the shape: the change reaches the disk, and this read-only
+      # instance's writer path has nothing.
+      on_disk = :counters.new(1, [])
+
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          send(test_pid, {:log_read, read_only?: opts[:read_only?]})
+
+          if opts[:read_only?] and :counters.get(on_disk, 1) == 1,
+            do:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]},
+            else: {:ok, []}
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(ctx.api, %{
+                     table: "public.users",
+                     offset: "#{@test_offset}",
+                     handle: @test_shape_handle,
+                     live: true
+                   })
+
+          response = Api.serve_shape_response(request)
+          {response, response_body(response)}
+        end)
+
+      # The request found nothing new and is subscribed; the change reaches the disk and the
+      # request is told, as its own check of the disk on parking does. The stack stays read-only.
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      :counters.put(on_disk, 1, 1)
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, next_offset})
+      end)
+
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      assert {response, body} = Task.await(task, @receive_timeout)
+      refute_received {:log_read, read_only?: false}
+
+      assert response.status == 200
+      assert [%{"key" => "log1"}, %{headers: %{control: "up-to-date"}}] = body
+    end
+
+    # As above: only the new changes can end the long poll in time.
+    @tag long_poll_timeout: 60_000
+    test "a long poll woken while its status monitor restarts keeps reading the disk", ctx do
+      set_read_only(ctx)
+      test_pid = self()
+      next_offset = LogOffset.increment(@test_offset)
+      # Another instance writes the shape: the change reaches the disk, and this read-only
+      # instance's writer path has nothing.
+      on_disk = :counters.new(1, [])
+
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_calls(Electric.Shapes,
+        get_chunk_end_log_offset: fn _stack_id, @test_shape_handle, _offset, _opts -> nil end,
+        get_merged_log_stream: fn _stack_id, @test_shape_handle, opts ->
+          # Read before the test hears of the read, which then puts the change on the disk.
+          on_disk? = :counters.get(on_disk, 1) == 1
+          send(test_pid, {:log_read, read_only?: opts[:read_only?]})
+
+          if opts[:read_only?] and on_disk?,
+            do:
+              {:ok,
+               [Jason.encode!(%{key: "log1", value: "foo", headers: %{}, offset: next_offset})]},
+            else: {:ok, []}
+        end
+      )
+
+      task =
+        Task.async(fn ->
+          assert {:ok, request} =
+                   Api.validate(ctx.api, %{
+                     table: "public.users",
+                     offset: "#{@test_offset}",
+                     handle: @test_shape_handle,
+                     live: true
+                   })
+
+          response = Api.serve_shape_response(request)
+          {response, response_body(response)}
+        end)
+
+      # The request found nothing new and is subscribed; the status monitor restarts, the change
+      # reaches the disk and the request is told. The stack reads as starting, not up.
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      restart_status_monitor(ctx)
+      :counters.put(on_disk, 1, 1)
+
+      Registry.dispatch(ctx.registry, @test_shape_handle, fn [{pid, ref}] ->
+        send(pid, {ref, :new_changes, next_offset})
+      end)
+
+      assert_receive {:log_read, read_only?: true}, @receive_timeout
+      assert {response, body} = Task.await(task, @receive_timeout)
+      refute_received {:log_read, read_only?: false}
+
+      assert response.status == 200
+      assert [%{"key" => "log1"}, %{headers: %{control: "up-to-date"}}] = body
+    end
+
     @tag long_poll_timeout: 100
-    test "out-of-bounds still returns 400 when disk has not caught up", ctx do
+    test "out-of-bounds answers 503 while read-only when the disk has not caught up", ctx do
       set_read_only(ctx)
       next_offset = LogOffset.increment(@test_offset)
 
@@ -1878,13 +2543,52 @@ defmodule Electric.Shapes.ApiTest do
                  live: true
                })
 
+      # The disk holds synced bytes only, and a killed writer recovers further once the stack is
+      # active: the client retries at its offset instead of refetching the shape.
       assert response = Api.serve_shape_response(request)
-      assert response.status == 400
+      assert response.status == 503
+      assert response.retry_after == 5
 
-      assert response_body(response) == %{
-               message: "Invalid request",
-               errors: %{offset: ["out of bounds for this shape"]}
-             }
+      # The request subscribed to the shape's changes while it waited; reading the response
+      # unregisters it, so a reused connection gets no notifications for it.
+      assert response.handle == @test_shape_handle
+      assert [_] = Registry.lookup(ctx.registry, @test_shape_handle)
+      response_body(response)
+      assert [] == Registry.lookup(ctx.registry, @test_shape_handle)
+    end
+
+    # A status monitor that restarts reports the stack starting, and the client was asked to
+    # refetch the shape.
+    @tag long_poll_timeout: 100
+    test "out-of-bounds answers 503 while the status monitor of a read-only stack restarts",
+         ctx do
+      set_read_only(ctx)
+      next_offset = LogOffset.increment(@test_offset)
+
+      patch_shape_cache(
+        has_shape?: fn @test_shape_handle, _opts -> true end,
+        await_snapshot_start: fn @test_shape_handle, _ -> :started end,
+        resolve_shape_handle: fn @test_shape_handle, @test_shape, _stack_id, _opts ->
+          {@test_shape_handle, @test_offset}
+        end
+      )
+
+      patch_storage(for_shape: fn @test_shape_handle, _opts -> @test_opts end)
+
+      assert {:ok, request} =
+               Api.validate(ctx.api, %{
+                 table: "public.users",
+                 offset: "#{next_offset}",
+                 handle: @test_shape_handle,
+                 live: true
+               })
+
+      assert request.read_only?
+      restart_status_monitor(ctx)
+      assert response = Api.serve_shape_response(request)
+      assert response.status == 503
+      assert response.retry_after == 5
+      response_body(response)
     end
   end
 
@@ -1917,6 +2621,36 @@ defmodule Electric.Shapes.ApiTest do
       {:error, response} = Task.await(task)
 
       assert response.status == 400
+    end
+  end
+
+  # Every 503 path picks a constant retry-after, and the client takes the larger of the server
+  # minimum and its own jittered backoff - so until the backoff doubles past the constant, every
+  # client turned away by one restart comes back in the same millisecond.
+  describe "Api.Response.spread_retry_after/1" do
+    test "never asks a client back sooner than the base" do
+      draws = Enum.map(1..2_000, fn _ -> Api.Response.spread_retry_after(10) end)
+
+      assert Enum.min(draws) >= 10
+      assert Enum.max(draws) <= 20
+    end
+
+    test "gives clients turned away by the same event different return times" do
+      draws = Enum.map(1..2_000, fn _ -> Api.Response.spread_retry_after(10) end)
+
+      assert MapSet.size(MapSet.new(draws)) > 1
+    end
+
+    test "spreads a one-second base over both whole seconds it covers" do
+      draws = Enum.map(1..2_000, fn _ -> Api.Response.spread_retry_after(1) end)
+
+      assert MapSet.new(draws) == MapSet.new([1, 2])
+    end
+
+    test "reaches both ends of the range" do
+      draws = Enum.map(1..2_000, fn _ -> Api.Response.spread_retry_after(10) end)
+
+      assert {10, 20} == Enum.min_max(draws)
     end
   end
 end

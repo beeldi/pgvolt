@@ -1,8 +1,10 @@
 defmodule Electric.Shapes.Api.Response do
   alias Electric.Plug.Utils
   alias Electric.Shapes.Api
+  alias Electric.Shapes.Api.ServeWatchdog
   alias Electric.Shapes.Shape
   alias Electric.Telemetry.OpenTelemetry
+  alias Electric.Telemetry.RequestValues
 
   require Logger
 
@@ -10,6 +12,8 @@ defmodule Electric.Shapes.Api.Response do
   @electric_handle_header "electric-handle"
   @electric_offset_header "electric-offset"
   @electric_schema_header "electric-schema"
+  @electric_source_positions_header "electric-source-positions"
+  @electric_source_generation_header "electric-source-generation"
   @electric_up_to_date_header "electric-up-to-date"
   @electric_has_data_header "electric-has-data"
   @electric_snapshot_header "electric-snapshot"
@@ -18,6 +22,8 @@ defmodule Electric.Shapes.Api.Response do
 
   # List of all Electric-specific headers that may be included in API responses
   @electric_headers [
+    @electric_source_generation_header,
+    @electric_source_positions_header,
     @electric_cursor_header,
     @electric_handle_header,
     @electric_has_data_header,
@@ -184,6 +190,14 @@ defmodule Electric.Shapes.Api.Response do
     |> send_stream(response)
   end
 
+  def send_source_generation(conn, response) do
+    conn
+    |> put_source_positions_header(response)
+    |> Plug.Conn.put_resp_header("cache-control", "no-store")
+    |> Plug.Conn.put_resp_header("surrogate-control", "no-store")
+    |> Plug.Conn.send_resp(200, "")
+  end
+
   # append the cleanup operations onto the end of the stream for every response
   # by concating a dummy stream with only an `after` function.
   #
@@ -242,6 +256,7 @@ defmodule Electric.Shapes.Api.Response do
 
   defp put_resp_headers(conn, %__MODULE__{response_type: :subset} = response) do
     conn
+    |> put_source_positions_header(response)
     |> put_cache_header("cache-control", "no-cache", response.api)
     |> Plug.Conn.put_resp_header(@electric_snapshot_header, "true")
     |> put_shape_handle_header(response)
@@ -252,6 +267,7 @@ defmodule Electric.Shapes.Api.Response do
 
   defp put_resp_headers(conn, response) do
     conn
+    |> put_source_positions_header(response)
     |> put_cache_headers(response)
     |> put_cursor_headers(response)
     |> put_etag_headers(response)
@@ -263,6 +279,29 @@ defmodule Electric.Shapes.Api.Response do
     |> put_known_error_header(response)
     |> put_retry_after_header(response)
     |> put_sse_headers(response)
+  end
+
+  defp put_source_positions_header(conn, %__MODULE__{
+         status: status,
+         shape_definition: %Shape{source_positions: :full_xid, source_generation: generation},
+         params: %{source_positions: :full_xid}
+       })
+       when status in [200, 204, 304] and is_binary(generation) do
+    conn
+    |> Plug.Conn.put_resp_header(@electric_source_positions_header, "mvcc-full-xid-v1")
+    |> Plug.Conn.put_resp_header(@electric_source_generation_header, generation)
+  end
+
+  defp put_source_positions_header(conn, _response), do: conn
+
+  @doc false
+  @spec client_headers(t(), map()) :: %{binary() => binary()}
+  def client_headers(%__MODULE__{} = response, query_params \\ %{}) do
+    %Plug.Conn{method: "GET", query_params: query_params}
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> put_resp_headers(response)
+    |> Map.fetch!(:resp_headers)
+    |> Map.new()
   end
 
   defp put_shape_handle_header(conn, %__MODULE__{handle: nil}) do
@@ -433,12 +472,27 @@ defmodule Electric.Shapes.Api.Response do
     Plug.Conn.get_resp_header(conn, @electric_known_error_header) == ["true"]
   end
 
+  @doc """
+  Spread a retry-after base over `[base, 2 * base]` seconds.
+
+  Every 503 path picks a constant, so without this every client that is turned away by one event
+  returns in the same millisecond. The client cannot repair that on its own: it takes the larger of
+  the server minimum and its own jittered backoff, and the server minimum wins until the backoff has
+  doubled past it, so the first retries after a restart are exactly synchronised. The header is whole
+  seconds, so the spread has to come from the range rather than from sub-second precision - and it
+  only ever waits longer than asked, never sooner.
+  """
+  @spec spread_retry_after(pos_integer()) :: pos_integer()
+  def spread_retry_after(base) when is_integer(base) and base > 0 do
+    base + :rand.uniform(base + 1) - 1
+  end
+
   defp put_retry_after_header(conn, %__MODULE__{retry_after: nil}) do
     conn
   end
 
   defp put_retry_after_header(conn, %__MODULE__{retry_after: seconds}) do
-    Plug.Conn.put_resp_header(conn, "retry-after", "#{seconds}")
+    Plug.Conn.put_resp_header(conn, @retry_after_header, "#{spread_retry_after(seconds)}")
   end
 
   defp validate_response_finalized!(%__MODULE__{finalized?: false} = _response) do
@@ -452,12 +506,27 @@ defmodule Electric.Shapes.Api.Response do
   defp put_sse_headers(conn, %__MODULE__{params: %{live: true, live_sse: true}}) do
     conn
     |> Plug.Conn.put_resp_header("content-type", "text/event-stream")
-    |> Plug.Conn.put_resp_header("connection", "keep-alive")
+    |> put_keep_alive_header()
   end
 
   defp put_sse_headers(conn, _response) do
     conn
   end
+
+  # `connection` is a connection-specific header, which HTTP/2 forbids
+  # (RFC 9113 section 8.2.2): a conforming client treats a response that
+  # carries it as malformed and resets the stream.
+  @spec put_keep_alive_header(Plug.Conn.t()) :: Plug.Conn.t()
+  def put_keep_alive_header(conn) do
+    if http_1?(conn) do
+      Plug.Conn.put_resp_header(conn, "connection", "keep-alive")
+    else
+      conn
+    end
+  end
+
+  defp http_1?(conn),
+    do: Plug.Conn.get_http_protocol(conn) in [:"HTTP/1", :"HTTP/1.0", :"HTTP/1.1"]
 
   defp send_stream(%Plug.Conn{} = conn, %__MODULE__{status: status} = response) do
     validate_response_finalized!(response)
@@ -470,6 +539,7 @@ defmodule Electric.Shapes.Api.Response do
     sample_rate_attrs = Electric.Plug.TraceContextPlug.sample_rate_attrs(conn, status)
 
     conn = Plug.Conn.send_chunked(conn, status)
+    watchdog = watchdog_context(conn, stack_id, response)
 
     {conn, bytes_sent} =
       response.body
@@ -481,7 +551,7 @@ defmodule Electric.Shapes.Api.Response do
           Map.put(sample_rate_attrs, "chunk_size", chunk_size),
           stack_id,
           fn ->
-            case Plug.Conn.chunk(conn, chunk) do
+            case write_in_bounded_pieces(conn, chunk, chunk_size, watchdog) do
               {:ok, conn} ->
                 {:cont, {conn, bytes_sent + chunk_size}}
 
@@ -491,7 +561,9 @@ defmodule Electric.Shapes.Api.Response do
                 {:halt, {conn, bytes_sent}}
 
               {:error, reason} ->
-                error_str = "Error while streaming response: #{inspect(reason)}"
+                error_str =
+                  "Error while streaming response: #{RequestValues.inspect_error(reason)}"
+
                 Logger.error(error_str)
                 conn = Plug.Conn.assign(conn, :error_str, error_str)
                 {:halt, {conn, bytes_sent}}
@@ -501,6 +573,93 @@ defmodule Electric.Shapes.Api.Response do
       end)
 
     Plug.Conn.assign(conn, :streaming_bytes_sent, bytes_sent)
+  end
+
+  # Socket writes are split into pieces of at most this size. Bounding the
+  # write unit bounds the response data queued in the socket's driver queue
+  # at any moment and — because a bounded write to a live client completes
+  # once the transport buffers drain — gives the stall watchdog below a
+  # progress signal: each completed piece is proof the client accepted data.
+  #
+  # Derived from the encoder's batch cap so that ordinary body elements are
+  # written as-is (no flattening or splitting) and only oversized single
+  # items (e.g. one very large row) are split. Making pieces smaller would
+  # not sharpen the watchdog: write completion is quantized by the OS at up
+  # to a kernel send buffer of drain, which dwarfs the piece size.
+  @socket_write_bytes Electric.Shapes.Api.Encoder.JSON.max_batch_bytes()
+
+  # See Electric.Shapes.Api.ServeWatchdog for the design rationale. The
+  # context carries what arming each write's deadline needs; `nil` disables
+  # reaping for this serve: when the timeout is not positive, when no
+  # watchdog is running for the stack, or when the plug does not run in the
+  # socket-owning process. Only Bandit over HTTP/1 does. Under proxying
+  # adapters like Plug.Test or Cowboy, writes complete without touching a
+  # socket, so a deadline would measure nothing. Under HTTP/2 the plug runs in
+  # a stream process: killing it leaves the stream's queued data in Bandit's
+  # connection process and ends the stream with neither END_STREAM nor
+  # RST_STREAM, so the client would wait on it forever.
+  defp watchdog_context(%Plug.Conn{adapter: {Bandit.Adapter, _}} = conn, stack_id, response) do
+    # Fallback for stacks whose seed config omits the key (e.g. minimal
+    # unit-test stacks); Electric.Config is the single source of truth.
+    timeout =
+      Electric.StackConfig.lookup(
+        stack_id,
+        :stalled_serve_timeout,
+        Electric.Config.default(:stalled_serve_timeout)
+      )
+
+    with true <- http_1?(conn),
+         true <- is_integer(timeout) and timeout > 0,
+         watchdog when is_pid(watchdog) <- ServeWatchdog.resolve(stack_id) do
+      {watchdog, response.handle, timeout}
+    else
+      _ -> nil
+    end
+  end
+
+  defp watchdog_context(%Plug.Conn{}, _stack_id, _response), do: nil
+
+  # Write one response body element as a sequence of bounded socket writes,
+  # notifying the watchdog around each one. Elements within the bound — the
+  # common case, as the bound is derived from the encoder's batch cap — are
+  # written directly without flattening.
+  defp write_in_bounded_pieces(conn, chunk, chunk_size, watchdog)
+       when chunk_size <= @socket_write_bytes do
+    guarded_chunk(conn, chunk, watchdog)
+  end
+
+  defp write_in_bounded_pieces(conn, chunk, _chunk_size, watchdog) do
+    chunk
+    |> IO.iodata_to_binary()
+    |> write_pieces(conn, watchdog)
+  end
+
+  defp write_pieces(<<piece::binary-size(@socket_write_bytes), rest::binary>>, conn, watchdog)
+       when byte_size(rest) > 0 do
+    case guarded_chunk(conn, piece, watchdog) do
+      {:ok, conn} -> write_pieces(rest, conn, watchdog)
+      error -> error
+    end
+  end
+
+  defp write_pieces(piece, conn, watchdog) do
+    guarded_chunk(conn, piece, watchdog)
+  end
+
+  defp guarded_chunk(conn, data, nil) do
+    Plug.Conn.chunk(conn, data)
+  end
+
+  defp guarded_chunk(conn, data, {watchdog, shape_handle, timeout}) do
+    write = ServeWatchdog.arm(watchdog, shape_handle, timeout)
+
+    # Disarming in `after` ends the write on any exit path, so a timer that
+    # fires later cannot kill a handler that is no longer inside it.
+    try do
+      Plug.Conn.chunk(conn, data)
+    after
+      ServeWatchdog.disarm(write)
+    end
   end
 
   def etag(response, opts \\ [])

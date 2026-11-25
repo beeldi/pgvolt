@@ -4,6 +4,9 @@ defmodule Electric.Postgres.SnapshotQuery do
   alias Electric.Shapes.{Querying, Shape}
   alias Electric.Telemetry.OpenTelemetry
 
+  @snapshot_info_query "SELECT pg_current_snapshot(), pg_current_wal_lsn(), " <>
+                         Electric.Postgres.display_settings_select_list()
+
   @type pg_snapshot() ::
           {xmin :: pos_integer(), xmax :: pos_integer(), xip_list :: [pos_integer()]}
 
@@ -68,16 +71,12 @@ defmodule Electric.Postgres.SnapshotQuery do
               span_name: "shape_snapshot.start_readonly_txn"
             )
 
-            [%{rows: [[pg_snapshot, lsn]]}] =
-              query!(ctx, "SELECT pg_current_snapshot(), pg_current_wal_lsn()",
-                span_name: "shape_snapshot.get_pg_snapshot"
-              )
+            # The display settings ride along in the snapshot query instead of one SET each:
+            # every shape snapshot pays these round trips before its first row.
+            [%{rows: [[pg_snapshot, lsn | _settings]]}] =
+              query!(ctx, @snapshot_info_query, span_name: "shape_snapshot.get_pg_snapshot")
 
             snapshot_info_fn.(shape_handle, pg_snapshot, lsn)
-
-            query!(ctx, Electric.Postgres.display_settings(),
-              span_name: "shape_snapshot.set_display_settings"
-            )
 
             OpenTelemetry.start_interval(:"shape_snapshot.query.duration_us")
 
@@ -127,6 +126,9 @@ defmodule Electric.Postgres.SnapshotQuery do
     pool = Electric.Connection.Manager.pool_name(stack_id, :snapshot)
     mark = Enum.random(0..(2 ** 31 - 1))
     headers = %{snapshot_mark: mark}
+    max_rows = Map.get(opts, :subset_max_rows)
+    probe_limit = if max_rows && is_nil(subset.limit), do: max_rows + 1
+    subset = if probe_limit, do: %{subset | limit: probe_limit}, else: subset
 
     execute_for_shape(pool, shape_handle, shape,
       snapshot_info_fn: fn _, pg_snapshot, lsn ->
@@ -151,7 +153,12 @@ defmodule Electric.Postgres.SnapshotQuery do
               raise "failed to execute snapshot query for shape #{shape_handle}: missing pg_snapshot_info"
           end
 
-        {:ok, {metadata, result}}
+        if probe_limit && length(result) == probe_limit do
+          {:error,
+           {:limit, ["subset exceeds #{max_rows} rows, add a limit of at most #{max_rows}"]}}
+        else
+          {:ok, {metadata, result}}
+        end
 
       {:error, error} ->
         {:error, error}

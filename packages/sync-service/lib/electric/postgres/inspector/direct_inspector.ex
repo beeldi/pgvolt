@@ -164,18 +164,25 @@ defmodule Electric.Postgres.Inspector.DirectInspector do
       attndims as array_dimensions,
       atttypmod as type_mod,
       attnotnull as not_null,
+      pg_collation.collisdeterministic AS deterministic_collation,
       attgenerated != '' as is_generated,
       pg_type.typname as type,
       pg_type.typtype as type_kind, -- e.g. an enum is kind 'e'
       elem_pg_type.typname as array_type, -- type of the element inside the array or nil if it's not an array
+      elem_pg_type.typtype as array_element_kind, -- the element's own kind, so an enum array stays an enum array
       format_type(pg_attribute.atttypid, pg_attribute.atttypmod) AS formatted_type,
       array_position(indkey, attnum) as pk_position
     FROM pg_class
     JOIN pg_namespace ON relnamespace = pg_namespace.oid
     JOIN pg_attribute ON attrelid = pg_class.oid AND attnum >= 0
     JOIN pg_type ON atttypid = pg_type.oid
+    LEFT JOIN pg_catalog.pg_collation ON attcollation = pg_collation.oid
     LEFT JOIN pg_index ON indrelid = pg_class.oid AND indisprimary
-    LEFT JOIN pg_type AS elem_pg_type ON pg_type.typelem = elem_pg_type.oid
+    -- typelem is set on plenty of types that are not arrays -- point carries float8 in it --
+    -- so joining on it alone reports a point column as an array of floats. typcategory 'A'
+    -- is the catalog's own answer to "is this an array type".
+    LEFT JOIN pg_type AS elem_pg_type
+      ON pg_type.typcategory = 'A' AND pg_type.typelem = elem_pg_type.oid
   """
 
   @doc """
@@ -229,6 +236,8 @@ defmodule Electric.Postgres.Inspector.DirectInspector do
         Enum.map(rows, fn row ->
           Enum.zip_with(columns, row, fn
             :type_kind, val -> {:type_kind, parse_type_kind(val)}
+            :array_element_kind, nil -> {:array_element_kind, nil}
+            :array_element_kind, val -> {:array_element_kind, parse_type_kind(val)}
             col, val -> {col, val}
           end)
           |> Map.new()

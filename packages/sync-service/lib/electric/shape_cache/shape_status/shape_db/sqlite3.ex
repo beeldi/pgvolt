@@ -46,6 +46,10 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Sqlite3 do
   @type connection :: :esqlite3.esqlite3()
   @type statement :: :esqlite3.esqlite3_stmt()
 
+  # A step that cannot get its lock within the busy timeout comes back from the driver as the atom
+  # `:"$busy"`, not as an error tuple, so it is turned into the code every other result carries.
+  @sqlite_busy 5
+
   # ── Connection lifecycle ───────────────────────────────────────────────────
 
   @doc """
@@ -74,6 +78,12 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Sqlite3 do
   @spec execute(connection(), String.t()) :: :ok | {:error, term()}
   def execute(conn, sql) do
     :esqlite3.exec(conn, sql)
+  end
+
+  @doc "Whether the connection is outside any transaction."
+  @spec autocommit?(connection()) :: boolean()
+  def autocommit?(conn) do
+    :esqlite3.get_autocommit(conn)
   end
 
   # ── Prepared statements ────────────────────────────────────────────────────
@@ -110,6 +120,7 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Sqlite3 do
     case :esqlite3.step(stmt) do
       :"$done" -> :done
       row when is_list(row) -> {:row, row}
+      :"$busy" -> {:error, @sqlite_busy}
       {:error, _} = err -> err
     end
   end
@@ -121,9 +132,15 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Sqlite3 do
 
   @doc "Fetch all remaining rows from a prepared statement."
   @spec fetch_all(connection(), statement()) :: {:ok, list(list())} | {:error, term()}
-  def fetch_all(_conn, stmt) do
-    case :esqlite3.fetchall(stmt) do
-      rows when is_list(rows) -> {:ok, rows}
+  def fetch_all(conn, stmt) do
+    # Not `:esqlite3.fetchall/1`: it has no clause for a busy step and raises on one.
+    fetch_all_rows(conn, stmt, [])
+  end
+
+  defp fetch_all_rows(conn, stmt, acc) do
+    case step(conn, stmt) do
+      {:row, row} -> fetch_all_rows(conn, stmt, [row | acc])
+      :done -> {:ok, Enum.reverse(acc)}
       {:error, _} = err -> err
     end
   end
@@ -160,6 +177,9 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Sqlite3 do
 
       row when is_list(row) ->
         do_multi_step(stmt, remaining - 1, [row | acc])
+
+      :"$busy" ->
+        {:error, @sqlite_busy}
 
       {:error, _} = err ->
         err

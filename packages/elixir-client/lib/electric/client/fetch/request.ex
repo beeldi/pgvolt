@@ -7,6 +7,12 @@ defmodule Electric.Client.Fetch.Request do
 
   require Logger
 
+  @redacted_value "[REDACTED]"
+  @sensitive_header_names MapSet.new(
+                            ~w(authorization proxy-authorization cookie set-cookie x-api-key x-auth-token x-electric-secret electric-secret)
+                          )
+  @sensitive_param_names MapSet.new(~w(secret api_secret token access_token api_key password))
+
   defstruct [
     :stream_id,
     :endpoint,
@@ -117,6 +123,41 @@ defmodule Electric.Client.Fetch.Request do
   end
 
   @doc false
+  @spec loggable(t()) :: map()
+  def loggable(%__MODULE__{} = request) do
+    %{
+      method: request.method,
+      endpoint: redact_endpoint(request.endpoint),
+      shape_handle: request.shape_handle,
+      headers: redact(request.headers, @sensitive_header_names),
+      params: redact(params(request), @sensitive_param_names)
+    }
+  end
+
+  defp redact(map, sensitive_names) do
+    Map.new(map, fn {name, value} ->
+      if MapSet.member?(sensitive_names, String.downcase(to_string(name))),
+        do: {name, @redacted_value},
+        else: {name, value}
+    end)
+  end
+
+  defp redact_endpoint(%URI{} = uri) do
+    query =
+      case uri.query do
+        nil ->
+          nil
+
+        query ->
+          query |> URI.decode_query() |> redact(@sensitive_param_names) |> URI.encode_query()
+      end
+
+    userinfo = if is_nil(uri.userinfo), do: nil, else: @redacted_value
+
+    URI.to_string(%{uri | userinfo: userinfo, query: query})
+  end
+
+  @doc false
   def child_spec({request_id, _request, _client, _monitor_pid} = args) do
     %{
       id: {__MODULE__, request_id},
@@ -134,7 +175,7 @@ defmodule Electric.Client.Fetch.Request do
   @impl true
   def init({request_id, request, client, monitor_pid}) do
     Logger.debug(fn ->
-      "Starting request for #{inspect(request_id)}"
+      "Starting request for #{inspect(loggable(request))}"
     end)
 
     state = %{

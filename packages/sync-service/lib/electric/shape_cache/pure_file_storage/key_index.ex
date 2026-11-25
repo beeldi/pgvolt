@@ -40,53 +40,13 @@ defmodule Electric.ShapeCache.PureFileStorage.KeyIndex do
 
           _ ->
             raise Storage.Error,
+              kind: :data_loss,
               message:
                 "Incomplete keyfile entry at #{pos} (started reading from #{pos}, file #{path})"
         end
       end)
       |> Enum.to_list()
     end)
-  end
-
-  def trim(path, log_file_path, search_start_pos)
-      when is_binary(path) and is_binary(log_file_path) and is_integer(search_start_pos) do
-    # We are syncing the main log more often than the keyfile, so keyfile might be behind the log.
-    # We need to find the last full entry.
-    log_file_entry_end =
-      File.open!(path, [:read, :raw, :write, :read_ahead], fn file ->
-        :file.position(file, search_start_pos)
-
-        find_end_position(file, search_start_pos)
-      end)
-
-    LogFile.stream_entries(log_file_path, log_file_entry_end)
-    |> Stream.map(fn {entry, pos} -> elem(make_entry(entry, pos), 0) end)
-    |> Stream.into(File.stream!(path, [:delayed_write]))
-  end
-
-  defp find_end_position(file, search_start_pos) do
-    Stream.unfold(search_start_pos, fn position ->
-      with <<total_size::32, _::8, _::64, _::64, _::8, line_start_pos::64, json_size::64>> <-
-             IO.binread(file, @key_index_full_size),
-           <<_::binary-size(^total_size - @key_index_full_size)>> <-
-             IO.binread(file, total_size - @key_index_full_size) do
-        {
-          LogFile.expected_position(
-            line_start_pos,
-            total_size - @key_index_entry_size,
-            json_size
-          ),
-          position + total_size + 4
-        }
-      else
-        _ ->
-          # Either EOF, or incomplete write - truncate works for both
-          :file.position(file, position)
-          :file.truncate(file)
-          nil
-      end
-    end)
-    |> Enum.reduce(0, fn elem, _acc -> elem end)
   end
 
   def stream_for_actions(path, starting_pos \\ 0) do
@@ -112,6 +72,7 @@ defmodule Electric.ShapeCache.PureFileStorage.KeyIndex do
 
           _ ->
             raise Storage.Error,
+              kind: :data_loss,
               message:
                 "Incomplete keyfile entry at #{pos} (started reading from #{starting_pos}, file #{path})"
         end
@@ -140,7 +101,9 @@ defmodule Electric.ShapeCache.PureFileStorage.KeyIndex do
 
         {file, LogFile.expected_position(write_position, line)}
       end,
-      &File.close(elem(&1, 0))
+      # A delayed write reports its failure on a later write or on the close, so the close is the
+      # last chance to notice that this index does not describe the log it was built from.
+      &(:ok = File.close(elem(&1, 0)))
     )
   end
 
@@ -151,10 +114,17 @@ defmodule Electric.ShapeCache.PureFileStorage.KeyIndex do
     |> Stream.run()
   end
 
+  # By key, then by offset: a compaction sorts the new part of the log with the previous compacted
+  # generation, and sorted by key alone, a key in both came out in file order, the new part first.
+  # The merge then took the older compacted entry for the key's newest, kept its offset and value,
+  # and dropped every update to the key since the previous compaction.
   def sort(inputs, output) do
     :ok =
       :file_sorter.sort(inputs |> Enum.map(&to_charlist/1), to_charlist(output),
-        format: fn <<_::binary-size(@key_index_entry_size), key::binary>> -> key end
+        format: fn <<_label::8, offset::binary-size(16),
+                     _::binary-size(@key_index_entry_size - 17), key::binary>> ->
+          {key, offset}
+        end
       )
   end
 

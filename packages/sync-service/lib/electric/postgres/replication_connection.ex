@@ -59,7 +59,8 @@ defmodule Electric.Postgres.ReplicationConnection do
             # Pause/resume extensions
             paused: false,
             buffered_copies: [],
-            buffered_sock_msg: nil
+            buffered_sock_msg: nil,
+            overflow_sock_msgs: []
 
   ## PUBLIC API ##
 
@@ -236,6 +237,13 @@ defmodule Electric.Postgres.ReplicationConnection do
   @doc false
   @impl :gen_statem
   def init({mod, arg, opts}) do
+    # Postgrex traps exits as it connects, which `sync_connect: false` leaves until after the
+    # callback module's init/1. Trap them before it runs instead: a logger handler can link a
+    # process to the one that logs and drain its exit only if the logging process traps exits
+    # then (ExUnit's capture-log handler does), and an exit it leaves behind reaches
+    # handle_info/2 as a linked process exiting.
+    Process.flag(:trap_exit, true)
+
     case mod.init(arg) do
       {:ok, mod_state} ->
         opts =
@@ -311,16 +319,13 @@ defmodule Electric.Postgres.ReplicationConnection do
     {:keep_state, %{s | buffered_sock_msg: msg}}
   end
 
-  # Second socket message while paused — shouldn't happen with {active, :once}
-  # but handle defensively in case of future OTP behavior changes.
+  # Further socket-shaped messages while one is already buffered. Rare but legal:
+  # the protocol self-injects leftover recv buffer as a synthetic socket message
+  # when a gulp exceeds its copy budget, and resume re-injects while still paused.
+  # These are WAL bytes — chain them in arrival order instead of dropping them.
   def handle_event(:info, msg, @state, %{paused: true} = s)
       when is_socket_msg(msg) do
-    Logger.warning(
-      "Unexpected second socket message while paused (#{elem(msg, 0)}). " <>
-        "This should not happen with {active, :once}."
-    )
-
-    {:keep_state, s}
+    {:keep_state, %{s | overflow_sock_msgs: s.overflow_sock_msgs ++ [msg]}}
   end
 
   # Normal (unpaused) socket message processing.
@@ -435,20 +440,25 @@ defmodule Electric.Postgres.ReplicationConnection do
     end
   end
 
-  # Process buffered copies and then any buffered socket message.
-  defp resume(%{buffered_copies: copies, buffered_sock_msg: sock_msg} = s) do
-    s = %{s | buffered_copies: [], buffered_sock_msg: nil}
+  # Process buffered copies and then any buffered socket message(s).
+  defp resume(
+         %{buffered_copies: copies, buffered_sock_msg: sock_msg, overflow_sock_msgs: overflow} = s
+       ) do
+    s = %{s | buffered_copies: [], buffered_sock_msg: nil, overflow_sock_msgs: []}
 
     case handle_data(copies, s) do
       {:keep_state, s} when sock_msg != nil ->
-        # Re-inject the buffered socket message for normal processing.
+        # Re-inject the buffered socket message(s) in arrival order. If the copy
+        # drain paused again, the paused clauses re-buffer them — one extra
+        # mailbox hop, same order.
         send(self(), sock_msg)
+        Enum.each(overflow, &send(self(), &1))
         {:keep_state, s}
 
       {:keep_state_and_pause, s} ->
         # Callback paused again while processing remaining copies.
-        # Re-attach the socket message for when we resume next time.
-        {:keep_state, %{s | buffered_sock_msg: sock_msg}}
+        # Re-attach the socket message(s) for when we resume next time.
+        {:keep_state, %{s | buffered_sock_msg: sock_msg, overflow_sock_msgs: overflow}}
 
       other ->
         other
@@ -495,8 +505,14 @@ defmodule Electric.Postgres.ReplicationConnection do
     {:keep_state, s} = maybe_handle(mod, :handle_disconnect, [mod_state], s)
 
     {:keep_state,
-     %{s | streaming: nil, paused: false, buffered_copies: [], buffered_sock_msg: nil},
-     {:next_event, :internal, {:connect, :reconnect}}}
+     %{
+       s
+       | streaming: nil,
+         paused: false,
+         buffered_copies: [],
+         buffered_sock_msg: nil,
+         overflow_sock_msgs: []
+     }, {:next_event, :internal, {:connect, :reconnect}}}
   end
 
   defp pid_or_name do

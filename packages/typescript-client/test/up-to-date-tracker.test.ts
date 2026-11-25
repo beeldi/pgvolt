@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest'
 import { type Message, ShapeStream } from '../src'
 import { UpToDateTracker, upToDateTracker } from '../src/up-to-date-tracker'
+import { hashShapeKey } from '../src/shape-key-hash'
 
 describe(`UpToDateTracker`, () => {
   let tracker: UpToDateTracker
@@ -72,13 +73,43 @@ describe(`UpToDateTracker`, () => {
 
     // Check that localStorage was updated
     const storedData = JSON.parse(
-      localStorage.getItem(`electric_up_to_date_tracker`) || `{}`
+      localStorage.getItem(`electric_up_to_date_tracker_v2`) || `{}`
     )
-    expect(storedData[shapeKey]).toEqual({
+    expect(storedData[hashShapeKey(shapeKey)]).toEqual({
       timestamp: expect.any(Number),
       cursor: `cursor-100`,
     })
-    expect(Date.now() - storedData[shapeKey].timestamp).toBeLessThan(100)
+    expect(
+      Date.now() - storedData[hashShapeKey(shapeKey)].timestamp
+    ).toBeLessThan(100)
+  })
+
+  it(`should not persist the parameters of a shape's request`, () => {
+    const secretKey = `https://example.com/v1/shape?table=test&token=secret-value`
+
+    tracker.recordUpToDate(secretKey, `cursor-100`)
+
+    expect(tracker.shouldEnterReplayMode(secretKey)).toBe(`cursor-100`)
+    const stored = localStorage.getItem(`electric_up_to_date_tracker_v2`) ?? ``
+    expect(stored).toContain(`cursor-100`)
+    expect(stored).not.toContain(`secret-value`)
+    expect(stored).not.toContain(`example.com`)
+  })
+
+  it(`should remove what an earlier version stored under its own key`, () => {
+    localStorage.setItem(
+      `electric_up_to_date_tracker`,
+      JSON.stringify({
+        [`https://example.com/v1/shape?token=secret-value`]: {
+          timestamp: Date.now(),
+          cursor: `cursor-old`,
+        },
+      })
+    )
+
+    new UpToDateTracker()
+
+    expect(localStorage.getItem(`electric_up_to_date_tracker`)).toBeNull()
   })
 
   it(`should load from localStorage on initialization`, () => {
@@ -87,13 +118,13 @@ describe(`UpToDateTracker`, () => {
 
     // Pre-populate localStorage
     const existingData = {
-      [existingShapeKey]: {
+      [hashShapeKey(existingShapeKey)]: {
         timestamp,
         cursor: `cursor-existing`,
       },
     }
     localStorage.setItem(
-      `electric_up_to_date_tracker`,
+      `electric_up_to_date_tracker_v2`,
       JSON.stringify(existingData)
     )
 
@@ -114,17 +145,17 @@ describe(`UpToDateTracker`, () => {
 
     // Pre-populate localStorage with both old and recent entries
     const existingData = {
-      [oldShapeKey]: {
+      [hashShapeKey(oldShapeKey)]: {
         timestamp: oldTimestamp,
         cursor: `cursor-old`,
       },
-      [recentShapeKey]: {
+      [hashShapeKey(recentShapeKey)]: {
         timestamp: recentTimestamp,
         cursor: `cursor-recent`,
       },
     }
     localStorage.setItem(
-      `electric_up_to_date_tracker`,
+      `electric_up_to_date_tracker_v2`,
       JSON.stringify(existingData)
     )
 
@@ -403,7 +434,7 @@ describe(`UpToDateTracker`, () => {
     const shapeKey = `${shapeUrl}?table=test`
     const timestamp = Date.now() - 1000 // 1 second ago
     localStorage.setItem(
-      `electric_up_to_date_tracker`,
+      `electric_up_to_date_tracker_v2`,
       JSON.stringify({
         [shapeKey]: {
           timestamp,

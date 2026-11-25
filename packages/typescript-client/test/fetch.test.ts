@@ -8,19 +8,42 @@ import {
   type Mock,
 } from 'vitest'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { FetchError, FetchBackoffAbortError } from '../src/error'
+import {
+  FetchError,
+  FetchBodyReadError,
+  FetchBackoffAbortError,
+  ResponseTooLargeError,
+} from '../src/error'
 import {
   createFetchWithBackoff,
   BackoffDefaults,
   createFetchWithChunkBuffer,
   createFetchWithConsumedMessages,
+  consumeResponseBody,
+  observeResponseBodyChunks,
   parseRetryAfterHeader,
+  retryOnBodyReadFailure,
 } from '../src/fetch'
 import {
   CHUNK_LAST_OFFSET_HEADER,
+  CHUNK_UP_TO_DATE_HEADER,
   SHAPE_HANDLE_HEADER,
   SNAPSHOT_HEADER,
 } from '../src/constants'
+
+// Makes every setTimeout fire right away and returns the delays it was given.
+function recordTimeoutDelays(): Array<number | undefined> {
+  const delays: Array<number | undefined> = []
+  vi.spyOn(globalThis, `setTimeout`).mockImplementation(((
+    fn: () => void,
+    ms?: number
+  ) => {
+    delays.push(ms)
+    queueMicrotask(fn)
+    return 0
+  }) as unknown as typeof setTimeout)
+  return delays
+}
 
 describe(`createFetchWithBackoff`, () => {
   const initialDelay = 10
@@ -230,6 +253,54 @@ describe(`createFetchWithBackoff`, () => {
     expect(result.ok).toBe(true)
   })
 
+  describe(`retry-after jitter`, () => {
+    const retryAfterMs = 60_000
+
+    // Runs one failed attempt followed by a success and returns the delay
+    // passed to setTimeout for the backoff wait.
+    async function backoffWaitFor(random: number): Promise<number> {
+      vi.spyOn(Math, `random`).mockReturnValue(random)
+      const waits = recordTimeoutDelays()
+
+      mockFetchClient
+        .mockResolvedValueOnce(
+          new Response(null, {
+            status: 503,
+            headers: new Headers({ 'retry-after': `${retryAfterMs / 1000}` }),
+          })
+        )
+        .mockResolvedValueOnce(new Response(null, { status: 200 }))
+
+      const fetchWithBackoff = createFetchWithBackoff(mockFetchClient, {
+        ...BackoffDefaults,
+        initialDelay: 1,
+      })
+      await fetchWithBackoff(`https://example.com`)
+
+      expect(waits).toHaveLength(1)
+      return waits[0]!
+    }
+
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it(`should add positive jitter on top of a dominating retry-after`, async () => {
+      // 10% of 60s is 6s, capped at 5s, so a random value of 0.5 adds 2.5s
+      expect(await backoffWaitFor(0.5)).toBe(retryAfterMs + 2_500)
+    })
+
+    it(`should never wait less than retry-after`, async () => {
+      expect(await backoffWaitFor(0)).toBe(retryAfterMs)
+    })
+
+    it(`should keep the added jitter within the cap`, async () => {
+      expect(await backoffWaitFor(0.999999)).toBeLessThanOrEqual(
+        retryAfterMs + 5_000
+      )
+    })
+  })
+
   // it(`should retry multiple times and eventually throw if no success`, async () => {
   //   const mockErrorResponse = new Response(null, { status: 500 })
   //   mockFetchClient.mockImplementation(
@@ -394,6 +465,66 @@ describe(`createFetchWithChunkBuffer`, () => {
       nextUrl,
       expect.objectContaining({ method: `POST` })
     )
+  })
+
+  describe(`headers of a prefetched response`, () => {
+    async function prefetchUnder(
+      fetchWrapper: typeof fetch,
+      headers: Record<string, string>
+    ) {
+      mockFetch
+        .mockResolvedValueOnce(
+          new Response(`initial chunk`, {
+            status: 200,
+            headers: responseHeaders({
+              [SHAPE_HANDLE_HEADER]: `123`,
+              [CHUNK_LAST_OFFSET_HEADER]: `456`,
+            }),
+          })
+        )
+        .mockResolvedValueOnce(
+          new Response(`fetched with the old token`, { status: 200 })
+        )
+        .mockResolvedValue(
+          new Response(`fetched with the new token`, { status: 200 })
+        )
+      await fetchWrapper(baseUrl, { headers })
+      await sleep()
+      return sortUrlParams(`${baseUrl}&handle=123&offset=456`)
+    }
+
+    it(`should not consume a response prefetched under other headers`, async () => {
+      const fetchWrapper = createFetchWithChunkBuffer(mockFetch)
+      const nextUrl = await prefetchUnder(fetchWrapper, {
+        Authorization: `Bearer old`,
+      })
+
+      const result = await fetchWrapper(nextUrl, {
+        headers: { Authorization: `Bearer new` },
+      })
+
+      expect(await result.text()).toBe(`fetched with the new token`)
+      expect(mockFetch).toHaveBeenLastCalledWith(
+        nextUrl,
+        expect.objectContaining({ headers: { Authorization: `Bearer new` } })
+      )
+    })
+
+    it(`should still consume a response prefetched under the same headers`, async () => {
+      const fetchWrapper = createFetchWithChunkBuffer(mockFetch)
+      const nextUrl = await prefetchUnder(fetchWrapper, {
+        Authorization: `Bearer same`,
+      })
+
+      const result = await fetchWrapper(nextUrl, {
+        // another case for the name, the same request
+        headers: { authorization: `Bearer same` },
+      })
+
+      expect(await result.text()).toBe(`fetched with the old token`)
+      // the initial request and the prefetch, nothing fetched afresh
+      expect(mockFetch).toHaveBeenCalledTimes(2)
+    })
   })
 
   it(`should not prefetch a snapshot (subset) GET response`, async () => {
@@ -936,6 +1067,695 @@ describe(`createFetchWithConsumedMessages`, () => {
         expect(error.message).toBe(`failed to read body`)
       }
     }
+  })
+  it(`should not flag a body that was already read as a FetchBodyReadError`, async () => {
+    // A custom fetchClient that read the body before returning the response.
+    // That can never succeed, so it must not be retried.
+    const res = new Response(`[]`, {
+      status: 200,
+      headers: { 'electric-handle': `h1` },
+    })
+    await res.text()
+
+    const error = await createFetchWithConsumedMessages(async () => res)(
+      `http://example.com`
+    ).catch((e) => e)
+
+    expect(error).toBeInstanceOf(FetchError)
+    expect(error).not.toBeInstanceOf(FetchBodyReadError)
+    expect(error.status).toBe(200)
+    expect(error.url).toBe(`http://example.com`)
+    expect(error.headers[`electric-handle`]).toBe(`h1`)
+    expect(error.message).toContain(`Body is unusable`)
+  })
+
+  it(`should not flag a locked body as a FetchBodyReadError`, async () => {
+    const res = new Response(`[]`, { status: 200 })
+    res.body!.getReader()
+
+    const error = await createFetchWithConsumedMessages(async () => res)(
+      `http://example.com`
+    ).catch((e) => e)
+
+    expect(error).toBeInstanceOf(FetchError)
+    expect(error).not.toBeInstanceOf(FetchBodyReadError)
+  })
+
+  it(`should still flag a body that is cut off after its first bytes`, async () => {
+    // Unread when the client started; marked used only once it fails.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`[`))
+        controller.error(new TypeError(`terminated`))
+      },
+    })
+    const res = new Response(body, { status: 200 })
+
+    await expect(
+      createFetchWithConsumedMessages(async () => res)(`http://example.com`)
+    ).rejects.toBeInstanceOf(FetchBodyReadError)
+  })
+})
+
+describe(`retryOnBodyReadFailure`, () => {
+  const backoff = { initialDelay: 1, maxDelay: 2, multiplier: 2 }
+  const signal = new AbortController().signal
+  const bodyReadError = () =>
+    new FetchBodyReadError(200, undefined, undefined, {}, `http://example.com`)
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it(`should return the result when the operation succeeds`, async () => {
+    const operation = vi.fn().mockResolvedValue(`ok`)
+    await expect(
+      retryOnBodyReadFailure(operation, backoff, signal)
+    ).resolves.toBe(`ok`)
+    expect(operation).toHaveBeenCalledTimes(1)
+  })
+
+  it(`should run the operation again after a body read failure`, async () => {
+    const onFailedAttempt = vi.fn()
+    const operation = vi
+      .fn()
+      .mockRejectedValueOnce(bodyReadError())
+      .mockRejectedValueOnce(bodyReadError())
+      .mockResolvedValue(`ok`)
+
+    await expect(
+      retryOnBodyReadFailure(operation, { ...backoff, onFailedAttempt }, signal)
+    ).resolves.toBe(`ok`)
+    expect(operation).toHaveBeenCalledTimes(3)
+    expect(onFailedAttempt).toHaveBeenCalledTimes(2)
+  })
+
+  it(`should wait with backoff between attempts and honour Retry-After`, async () => {
+    vi.spyOn(Math, `random`).mockReturnValue(0.5)
+    const waits = recordTimeoutDelays()
+    const operation = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new FetchBodyReadError(
+          200,
+          undefined,
+          undefined,
+          { 'retry-after': `7` },
+          `http://example.com`
+        )
+      )
+      .mockResolvedValue(`ok`)
+
+    await retryOnBodyReadFailure(operation, backoff, signal)
+
+    // 7s from the header, plus half of the 10% (700ms) Retry-After jitter.
+    expect(waits).toEqual([7_350])
+  })
+
+  it(`should report the earliest time a retry may come, with its own Retry-After jitter`, async () => {
+    vi.spyOn(Math, `random`).mockReturnValue(0.5)
+    recordTimeoutDelays()
+    const onRetryWait = vi.fn()
+    const operation = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new FetchBodyReadError(
+          200,
+          undefined,
+          undefined,
+          { 'retry-after': `7` },
+          `http://example.com`
+        )
+      )
+      .mockRejectedValueOnce(bodyReadError())
+      .mockResolvedValue(`ok`)
+
+    await retryOnBodyReadFailure(operation, { ...backoff, onRetryWait }, signal)
+
+    // 7s from the header and half of the 10% jitter; then nothing, as the
+    // second failure carries no Retry-After.
+    expect(onRetryWait.mock.calls).toEqual([
+      [{ notBeforeMs: 7_350 }],
+      [{ notBeforeMs: 0 }],
+    ])
+  })
+
+  it(`should not retry errors that are not body read failures`, async () => {
+    const onFailedAttempt = vi.fn()
+    const failure = new FetchError(
+      404,
+      undefined,
+      undefined,
+      {},
+      `http://example.com`
+    )
+    const operation = vi.fn().mockRejectedValue(failure)
+
+    await expect(
+      retryOnBodyReadFailure(operation, { ...backoff, onFailedAttempt }, signal)
+    ).rejects.toBe(failure)
+    expect(operation).toHaveBeenCalledTimes(1)
+    expect(onFailedAttempt).not.toHaveBeenCalled()
+  })
+
+  it(`should give up and rethrow after maxRetries`, async () => {
+    const failure = bodyReadError()
+    const operation = vi.fn().mockRejectedValue(failure)
+
+    await expect(
+      retryOnBodyReadFailure(operation, { ...backoff, maxRetries: 2 }, signal)
+    ).rejects.toBe(failure)
+    expect(operation).toHaveBeenCalledTimes(3)
+  })
+
+  it(`should stop with FetchBackoffAbortError when the signal aborts the wait`, async () => {
+    const controller = new AbortController()
+    const operation = vi.fn().mockRejectedValue(bodyReadError())
+    vi.spyOn(Math, `random`).mockReturnValue(0.999)
+    // Long enough that only the abort can end the wait.
+    const pending = retryOnBodyReadFailure(
+      operation,
+      { initialDelay: 60_000, maxDelay: 60_000, multiplier: 1 },
+      controller.signal
+    )
+
+    await sleep(5)
+    controller.abort()
+
+    await expect(pending).rejects.toBeInstanceOf(FetchBackoffAbortError)
+    expect(operation).toHaveBeenCalledTimes(1)
+  })
+
+  it(`should not start another attempt once the signal is already aborted`, async () => {
+    const controller = new AbortController()
+    const operation = vi.fn().mockImplementation(async () => {
+      controller.abort()
+      throw bodyReadError()
+    })
+
+    await expect(
+      retryOnBodyReadFailure(operation, backoff, controller.signal)
+    ).rejects.toBeInstanceOf(FetchBackoffAbortError)
+    expect(operation).toHaveBeenCalledTimes(1)
+  })
+
+  describe(`around a request that has its own fetch backoff`, () => {
+    const url = `http://example.com`
+
+    // Calls alternate between a network failure and a body that is cut off.
+    function failingRequest(options: {
+      initialDelay: number
+      maxDelay: number
+      multiplier: number
+      maxRetries: number
+    }) {
+      const controller = new AbortController()
+      const fetchClient = vi.fn(async () => {
+        if (fetchClient.mock.calls.length % 2 === 1) {
+          throw new TypeError(`fetch failed`)
+        }
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`[`))
+              controller.error(new TypeError(`terminated`))
+            },
+          }),
+          { status: 200 }
+        )
+      })
+      const request = createFetchWithBackoff(fetchClient, options)
+      const result = retryOnBodyReadFailure(
+        async () =>
+          consumeResponseBody(
+            await request(url, { signal: controller.signal }),
+            url,
+            controller.signal
+          ),
+        options,
+        controller.signal
+      )
+      return { fetchClient, result }
+    }
+
+    it(`should spend one retry budget on failed requests and cut-off bodies`, async () => {
+      const { fetchClient, result } = failingRequest({
+        ...backoff,
+        maxRetries: 3,
+      })
+
+      await expect(result).rejects.toBeInstanceOf(FetchBodyReadError)
+
+      // The first attempt plus three retries, however they failed.
+      expect(fetchClient).toHaveBeenCalledTimes(4)
+    })
+
+    it(`should keep growing the backoff after a cut-off body`, async () => {
+      vi.spyOn(Math, `random`).mockReturnValue(0.5)
+      const waits = recordTimeoutDelays()
+      const { result } = failingRequest({
+        initialDelay: 100,
+        maxDelay: 1_000,
+        multiplier: 2,
+        maxRetries: 4,
+      })
+
+      await expect(result).rejects.toBeInstanceOf(TypeError)
+
+      // Half of the delay each time, which doubles on every retry.
+      expect(waits).toEqual([50, 100, 200, 400])
+    })
+  })
+
+  describe(`around a response that was prefetched`, () => {
+    const baseUrl = `http://example.com/v1/shape?table=foo`
+    const nextUrl = sortUrlParams(`${baseUrl}&handle=h1&offset=1_0`)
+
+    // The first chunk has a next one, which the chunk buffer prefetches. Its
+    // first fetch fails before the headers and its second is cut off in the
+    // body, after which every fetch works.
+    function prefetchedChunkThatFailsTwice(options: {
+      initialDelay: number
+      maxDelay: number
+      multiplier: number
+      maxRetries?: number
+    }) {
+      let nextChunkFetches = 0
+      const fetchClient = vi.fn(async (input: RequestInfo | URL) => {
+        if (input.toString() !== nextUrl) {
+          return new Response(`[]`, {
+            status: 200,
+            headers: {
+              [SHAPE_HANDLE_HEADER]: `h1`,
+              [CHUNK_LAST_OFFSET_HEADER]: `1_0`,
+            },
+          })
+        }
+        nextChunkFetches++
+        if (nextChunkFetches === 1) throw new TypeError(`fetch failed`)
+        const headers = {
+          [SHAPE_HANDLE_HEADER]: `h1`,
+          [CHUNK_LAST_OFFSET_HEADER]: `2_0`,
+          [CHUNK_UP_TO_DATE_HEADER]: ``,
+        }
+        if (nextChunkFetches > 2)
+          return new Response(`[]`, { status: 200, headers })
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(`[`))
+              controller.error(new TypeError(`terminated`))
+            },
+          }),
+          { status: 200, headers }
+        )
+      })
+      const client = createFetchWithChunkBuffer(
+        createFetchWithBackoff(fetchClient, options)
+      )
+
+      // A request for the next chunk, made after the first chunk was fetched.
+      async function readNextChunk() {
+        await client(baseUrl, { signal: new AbortController().signal })
+        const controller = new AbortController()
+        return retryOnBodyReadFailure(
+          async () =>
+            consumeResponseBody(
+              await client(nextUrl, { signal: controller.signal }),
+              nextUrl,
+              controller.signal
+            ),
+          options,
+          controller.signal
+        )
+      }
+      return { fetchClient, readNextChunk }
+    }
+
+    it(`should spend the retries of the prefetch from the budget of the body`, async () => {
+      const { fetchClient, readNextChunk } = prefetchedChunkThatFailsTwice({
+        ...backoff,
+        maxRetries: 1,
+      })
+
+      await expect(readNextChunk()).rejects.toBeInstanceOf(FetchBodyReadError)
+
+      // The first chunk, the failed fetch of the next one and its retry. The
+      // one retry of the budget is spent, so the cut-off body is not retried.
+      expect(fetchClient).toHaveBeenCalledTimes(3)
+    })
+
+    it(`should carry the grown backoff of the prefetch over to the body`, async () => {
+      vi.spyOn(Math, `random`).mockReturnValue(0.5)
+      const waits = recordTimeoutDelays()
+      const { readNextChunk } = prefetchedChunkThatFailsTwice({
+        initialDelay: 100,
+        maxDelay: 1_000,
+        multiplier: 2,
+      })
+
+      await readNextChunk()
+
+      // Half of 100 before the prefetch retried, then half of the 200 it grew
+      // to before the body was read again.
+      expect(waits).toEqual([50, 100])
+    })
+  })
+})
+
+describe(`consumeResponseBody size limit`, () => {
+  const url = `https://example.com/v1/shape?offset=-1&token=secret-value`
+
+  const streamedResponse = (chunks: Array<Uint8Array>) => {
+    const cancel = vi.fn()
+    let next = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (next === chunks.length) return controller.close()
+        controller.enqueue(chunks[next++])
+      },
+      cancel,
+    })
+    return { response: new Response(body, { status: 200 }), cancel }
+  }
+
+  const bytes = (length: number) => new Uint8Array(length).fill(97)
+
+  it(`returns a body of exactly the limit`, async () => {
+    const { response } = streamedResponse([bytes(4), bytes(6)])
+
+    const consumed = await consumeResponseBody(response, url, undefined, 10)
+
+    await expect(consumed.text()).resolves.toBe(`a`.repeat(10))
+  })
+
+  it(`decodes a character split across two chunks`, async () => {
+    const encoded = new TextEncoder().encode(`é`)
+    const { response } = streamedResponse([
+      encoded.slice(0, 1),
+      encoded.slice(1),
+    ])
+
+    const consumed = await consumeResponseBody(response, url, undefined, 10)
+
+    await expect(consumed.text()).resolves.toBe(`é`)
+  })
+
+  it(`stops reading and fails past the limit`, async () => {
+    const { response, cancel } = streamedResponse([
+      bytes(6),
+      bytes(6),
+      bytes(6),
+    ])
+
+    const error = await consumeResponseBody(response, url, undefined, 10).catch(
+      (e) => e
+    )
+
+    expect(error).toBeInstanceOf(ResponseTooLargeError)
+    expect(error.maxBytes).toBe(10)
+    expect(error.message).not.toContain(`secret-value`)
+    expect(cancel).toHaveBeenCalledOnce()
+  })
+
+  it(`is not retried like a body cut off mid-read`, async () => {
+    const operation = vi.fn(() =>
+      consumeResponseBody(
+        streamedResponse([bytes(11)]).response,
+        url,
+        undefined,
+        10
+      )
+    )
+
+    await expect(
+      retryOnBodyReadFailure(
+        operation,
+        BackoffDefaults,
+        new AbortController().signal
+      )
+    ).rejects.toBeInstanceOf(ResponseTooLargeError)
+    expect(operation).toHaveBeenCalledOnce()
+  })
+
+  it(`refuses a declared length over the limit when the body cannot be streamed`, async () => {
+    const text = vi.fn(async () => `a`.repeat(11))
+    const response = {
+      status: 200,
+      body: null,
+      bodyUsed: false,
+      headers: new Headers({ 'content-length': `11` }),
+      text,
+    } as unknown as Response
+
+    await expect(
+      consumeResponseBody(response, url, undefined, 10)
+    ).rejects.toBeInstanceOf(ResponseTooLargeError)
+    expect(text).not.toHaveBeenCalled()
+  })
+
+  it(`fails a body that cannot be streamed once it is known to be too long`, async () => {
+    const response = {
+      status: 200,
+      body: null,
+      bodyUsed: false,
+      headers: new Headers(),
+      text: async () => `a`.repeat(11),
+    } as unknown as Response
+
+    await expect(
+      consumeResponseBody(response, url, undefined, 10)
+    ).rejects.toBeInstanceOf(ResponseTooLargeError)
+  })
+
+  it.each([
+    [`two-byte characters`, `é`.repeat(6)],
+    [`surrogate pairs`, `😀`.repeat(3)],
+  ])(
+    `counts UTF-8 bytes of %s when the body cannot be streamed`,
+    async (_name, body) => {
+      const response = {
+        status: 200,
+        body: null,
+        bodyUsed: false,
+        headers: new Headers(),
+        text: async () => body,
+      } as unknown as Response
+
+      await expect(
+        consumeResponseBody(response, url, undefined, 10)
+      ).rejects.toBeInstanceOf(ResponseTooLargeError)
+    }
+  )
+
+  it(`keeps a body that cannot be streamed when its UTF-8 bytes fit the limit`, async () => {
+    const response = {
+      status: 200,
+      body: null,
+      bodyUsed: false,
+      headers: new Headers(),
+      text: async () => `é`.repeat(5),
+    } as unknown as Response
+
+    const consumed = await consumeResponseBody(response, url, undefined, 10)
+
+    expect(await consumed.text()).toBe(`é`.repeat(5))
+  })
+})
+
+describe(`observeResponseBodyChunks`, () => {
+  const encode = (text: string) => new TextEncoder().encode(text)
+
+  function streamedResponse(chunks: string[], init?: ResponseInit) {
+    return new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encode(chunk))
+          controller.close()
+        },
+      }),
+      init
+    )
+  }
+
+  it(`calls back once per chunk and passes the body through unchanged`, async () => {
+    const onChunk = vi.fn()
+    const res = observeResponseBodyChunks(
+      streamedResponse([`a`, `: keep-alive\n\n`, `b`]),
+      onChunk
+    )
+
+    expect(onChunk).not.toHaveBeenCalled()
+    expect(await res.text()).toBe(`a: keep-alive\n\nb`)
+    expect(onChunk).toHaveBeenCalledTimes(3)
+  })
+
+  it(`keeps the status, status text and headers`, () => {
+    const res = observeResponseBodyChunks(
+      streamedResponse([`a`], {
+        status: 203,
+        statusText: `Non-Authoritative`,
+        headers: { 'electric-handle': `h1` },
+      }),
+      () => {}
+    )
+
+    expect(res.status).toBe(203)
+    expect(res.statusText).toBe(`Non-Authoritative`)
+    expect(res.headers.get(`electric-handle`)).toBe(`h1`)
+  })
+
+  it(`returns a response without a body as it is`, () => {
+    const original = new Response(null, { status: 204 })
+
+    expect(observeResponseBodyChunks(original, () => {})).toBe(original)
+  })
+
+  it(`cancels the underlying body when the consumer cancels`, async () => {
+    const cancelled = vi.fn()
+    const res = observeResponseBodyChunks(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            controller.enqueue(encode(`a`))
+          },
+          cancel: cancelled,
+        })
+      ),
+      () => {}
+    )
+
+    const reader = res.body!.getReader()
+    await reader.read()
+    await reader.cancel(`stop`)
+
+    expect(cancelled).toHaveBeenCalledWith(`stop`)
+  })
+
+  it(`cancels a body that is stalled while the consumer waits for a chunk`, async () => {
+    const cancelled = vi.fn()
+    const res = observeResponseBodyChunks(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull: () => new Promise<void>(() => {}),
+          cancel: cancelled,
+        })
+      ),
+      () => {}
+    )
+
+    const reader = res.body!.getReader()
+    const pendingRead = reader.read()
+    await reader.cancel(`stop`)
+
+    expect(cancelled).toHaveBeenCalledWith(`stop`)
+    expect(await pendingRead).toEqual({ done: true, value: undefined })
+  })
+
+  describe(`with the signal of the request`, () => {
+    // A source that ignores everything but a cancel, like the body of a
+    // wedged connection.
+    function wedgedBody(cancel: (reason?: unknown) => void) {
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          pull: () => new Promise<void>(() => {}),
+          cancel,
+        })
+      )
+    }
+
+    it(`cancels the underlying body and fails a pending read when the signal aborts`, async () => {
+      const cancelled = vi.fn()
+      const controller = new AbortController()
+      const res = observeResponseBodyChunks(
+        wedgedBody(cancelled),
+        () => {},
+        controller.signal
+      )
+      const pendingRead = res.body!.getReader().read()
+
+      controller.abort(`stop`)
+
+      await expect(pendingRead).rejects.toBe(`stop`)
+      expect(cancelled).toHaveBeenCalledWith(`stop`)
+    })
+
+    it(`cancels the underlying body of a request that was already aborted`, async () => {
+      const cancelled = vi.fn()
+      const controller = new AbortController()
+      controller.abort(`stop`)
+      const res = observeResponseBodyChunks(
+        wedgedBody(cancelled),
+        () => {},
+        controller.signal
+      )
+
+      expect(cancelled).toHaveBeenCalledWith(`stop`)
+      await expect(res.body!.getReader().read()).rejects.toBe(`stop`)
+    })
+
+    it(`stops listening to the signal once the body has ended`, async () => {
+      const controller = new AbortController()
+      const removeListener = vi.spyOn(controller.signal, `removeEventListener`)
+      const res = observeResponseBodyChunks(
+        streamedResponse([`a`]),
+        () => {},
+        controller.signal
+      )
+
+      expect(await res.text()).toBe(`a`)
+
+      expect(removeListener).toHaveBeenCalledWith(`abort`, expect.any(Function))
+    })
+
+    it(`stops listening to the signal once the consumer cancels`, async () => {
+      const controller = new AbortController()
+      const removeListener = vi.spyOn(controller.signal, `removeEventListener`)
+      const res = observeResponseBodyChunks(
+        wedgedBody(() => {}),
+        () => {},
+        controller.signal
+      )
+
+      await res.body!.cancel(`stop`)
+
+      expect(removeListener).toHaveBeenCalledWith(`abort`, expect.any(Function))
+    })
+
+    it(`stops listening to the signal once the body fails`, async () => {
+      const controller = new AbortController()
+      const removeListener = vi.spyOn(controller.signal, `removeEventListener`)
+      const res = observeResponseBodyChunks(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull() {
+              throw new Error(`connection reset`)
+            },
+          })
+        ),
+        () => {},
+        controller.signal
+      )
+
+      await expect(res.text()).rejects.toThrow(`connection reset`)
+
+      expect(removeListener).toHaveBeenCalledWith(`abort`, expect.any(Function))
+    })
+  })
+
+  it(`passes a body read error on to the consumer`, async () => {
+    const res = observeResponseBodyChunks(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull() {
+            throw new Error(`connection reset`)
+          },
+        })
+      ),
+      () => {}
+    )
+
+    await expect(res.text()).rejects.toThrow(`connection reset`)
   })
 })
 

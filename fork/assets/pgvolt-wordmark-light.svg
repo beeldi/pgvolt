@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 232 70" width="232" height="70" fill="none">
+  <g transform="translate(4, 10) scale(0.5081)">
+    <polygon points="0,0 52,0 26,45.033" fill="#000000"/>
+    <polygon points="64,0 100,0 50,86.603 32,55.426" fill="#000000"/>
+  </g>
+  <text x="70" y="52" fill="#000000" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="56" font-weight="700" letter-spacing="-2.4">PgVolt</text>
+</svg>

@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ShapeStream,
+  ShapeStreamOptions,
+  Shape,
   FetchError,
+  FetchBackoffAbortError,
   isChangeMessage,
   isControlMessage,
   Message,
+  ChangeMessage,
+  Offset,
   Row,
   _resetHttpWarningForTesting,
 } from '../src'
@@ -55,6 +60,159 @@ describe(`ShapeStream`, () => {
       process.off(`unhandledRejection`, onUnhandledRejection)
     }
   })
+
+  it(`Shape rejects rows/value when the stream fails terminally with a non-FetchError`, async () => {
+    // A 200 response missing the required Electric headers makes the stream throw
+    // a MissingHeadersError — a terminal, non-FetchError error. Before the fix the
+    // Shape dropped it, leaving rows/value pending forever.
+    const stream = new ShapeStream({
+      url: shapeUrl,
+      params: { table: `test` },
+      signal: aborter.signal,
+      fetchClient: async () =>
+        new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { 'content-type': `application/json` },
+        }),
+    })
+    const shape = new Shape(stream)
+
+    // An early reader, subscribed before the failure, must be rejected when it lands.
+    await expect(shape.rows).rejects.toBeInstanceOf(Error)
+
+    // A late reader, attached after the stream already failed, must reject up front
+    // rather than wait for a notification that can never arrive.
+    await expect(shape.value).rejects.toBeInstanceOf(Error)
+  })
+
+  it(`applies overlapping subset snapshots by database_lsn so a stale one cannot overwrite a newer row`, async () => {
+    // Two overlapping snapshots for the same key. The newer one (database_lsn 100)
+    // is applied first; the older one (database_lsn 50) completes last and must NOT
+    // overwrite the newer row.
+    const snapshots = [
+      { database_lsn: `100`, v: `new` },
+      { database_lsn: `50`, v: `old` },
+    ]
+    let snapshotCall = 0
+
+    const fetchClient = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (url.includes(`subset__`)) {
+        const spec = snapshots[snapshotCall++]
+        return new Response(
+          JSON.stringify({
+            metadata: {
+              snapshot_mark: snapshotCall,
+              xmin: `1`,
+              xmax: `2`,
+              xip_list: [],
+              database_lsn: spec.database_lsn,
+            },
+            data: [
+              {
+                key: `shared`,
+                value: { id: `shared`, v: spec.v },
+                headers: { operation: `insert`, relation: [`public`, `test`] },
+                offset: `0_0`,
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': `application/json`,
+              'electric-handle': `handle-1`,
+              'electric-offset': `0_0`,
+              'electric-schema': `{"id":{"type":"text"},"v":{"type":"text"}}`,
+            },
+          }
+        )
+      }
+
+      // Regular fetch: report up-to-date with no rows so the stream idles.
+      return new Response(
+        JSON.stringify([{ headers: { control: `up-to-date` } }]),
+        {
+          status: 200,
+          headers: {
+            'content-type': `application/json`,
+            'electric-handle': `handle-1`,
+            'electric-offset': `0_0`,
+            'electric-schema': `{"id":{"type":"text"},"v":{"type":"text"}}`,
+            'electric-cursor': `1`,
+          },
+        }
+      )
+    }
+
+    const stream = new ShapeStream({
+      url: shapeUrl,
+      params: { table: `test` },
+      log: `changes_only`,
+      signal: aborter.signal,
+      fetchClient,
+      subscribe: false,
+    })
+    const shape = new Shape(stream)
+
+    await stream.requestSnapshot({ limit: 1 }) // newer snapshot, lsn 100
+    await stream.requestSnapshot({ limit: 1 }) // older snapshot, lsn 50, completes last
+
+    expect(shape.currentValue.get(`shared`)).toEqual({ id: `shared`, v: `new` })
+  })
+
+  it.each([
+    { method: `fetchSnapshot`, subsetMethod: `GET` },
+    { method: `fetchSnapshot`, subsetMethod: `POST` },
+    { method: `requestSnapshot`, subsetMethod: `GET` },
+    { method: `requestSnapshot`, subsetMethod: `POST` },
+  ] as const)(
+    `$method aborts an in-flight $subsetMethod snapshot with the stream signal`,
+    async ({ method, subsetMethod }) => {
+      let signal: AbortSignal | null | undefined
+      let rejectFetch!: (error: unknown) => void
+      const fetchMock = vi.fn(
+        (_input: RequestInfo | URL, init?: RequestInit) => {
+          signal = init?.signal
+          return new Promise<Response>((_resolve, reject) => {
+            rejectFetch = reject
+            signal?.addEventListener(`abort`, () => reject(signal!.reason), {
+              once: true,
+            })
+          })
+        }
+      )
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        subsetMethod,
+        log: `changes_only`,
+        fetchClient: fetchMock,
+        backoffOptions: {
+          initialDelay: 1,
+          maxDelay: 1,
+          multiplier: 1,
+          maxRetries: 0,
+        },
+      })
+      const result = stream[method]({ limit: 1 }).catch((error) => error)
+
+      try {
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+        expect(signal).toBe(aborter.signal)
+        expect(signal?.aborted).toBe(false)
+        aborter.abort()
+        expect(await result).toBeInstanceOf(FetchBackoffAbortError)
+        expect(fetchMock).toHaveBeenCalledOnce()
+      } finally {
+        aborter.abort()
+        // Settle the request even if the signal assertion fails.
+        rejectFetch(aborter.signal.reason)
+        await result
+      }
+    }
+  )
 
   it(`requestSnapshot waits for snapshot messages to be published to subscribers before resolving`, async () => {
     const snapshotRow = {
@@ -375,6 +533,634 @@ describe(`ShapeStream`, () => {
     } finally {
       warnSpy.mockRestore()
     }
+  })
+
+  const encodeEvent = (message: unknown) =>
+    new TextEncoder().encode(`data: ${JSON.stringify(message)}\n\n`)
+
+  const insertRow = (n: number, offset: string) => ({
+    key: `row-${n}`,
+    value: { id: `${n}` },
+    headers: { operation: `insert`, relation: [`public`, `test`] },
+    offset,
+  })
+
+  const electricHeaders = (offset: string, cursor: string) => ({
+    'electric-handle': `handle-1`,
+    'electric-offset': offset,
+    'electric-cursor': cursor,
+    'electric-schema': `{"id":{"type":"text"}}`,
+  })
+
+  const sseResponse = (body: ReadableStream<Uint8Array>, offset: string) =>
+    new Response(body, {
+      status: 200,
+      headers: {
+        ...electricHeaders(offset, `cursor-1`),
+        'content-type': `text/event-stream`,
+      },
+    })
+
+  const upToDateResponse = (
+    messages: Array<unknown>,
+    offset: string,
+    cursor = `cursor-1`
+  ) =>
+    new Response(JSON.stringify(messages), {
+      status: 200,
+      headers: {
+        ...electricHeaders(offset, cursor),
+        'content-type': `application/json`,
+        'electric-up-to-date': ``,
+      },
+    })
+
+  const initialResponse = () =>
+    upToDateResponse(
+      [{ headers: { control: `up-to-date` }, offset: `0_0` }],
+      `0_0`,
+      `cursor-0`
+    )
+
+  /** Starts a live SSE stream and returns the keys of the rows it receives. */
+  function startLiveSseStream(fetchClient: typeof fetch): Array<string> {
+    const stream = new ShapeStream({
+      url: shapeUrl,
+      params: { table: `test` },
+      signal: aborter.signal,
+      fetchClient,
+      liveSse: true,
+    })
+    const received: Array<string> = []
+    stream.subscribe((messages) => {
+      for (const message of messages) {
+        if (isChangeMessage(message)) received.push(message.key)
+      }
+    })
+    return received
+  }
+
+  describe.each([
+    [
+      `ends cleanly`,
+      (controller: ReadableStreamDefaultController) => controller.close(),
+    ],
+    [
+      `breaks`,
+      (controller: ReadableStreamDefaultController) =>
+        controller.error(new Error(`connection reset`)),
+    ],
+  ])(`SSE body that %s before its up-to-date`, (_, endBody) => {
+    it(`resumes from the last applied offset with a long poll, then returns to SSE`, async () => {
+      const row = insertRow(1, `3_0`)
+      const requests: URL[] = []
+      let liveAfterCatchUp = false
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        requests.push(url)
+
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        if (url.searchParams.get(`live_sse`) !== `true`) {
+          return Promise.resolve(
+            upToDateResponse(
+              [
+                row,
+                {
+                  headers: { control: `up-to-date`, global_last_seen_lsn: `5` },
+                },
+              ],
+              `5_0`
+            )
+          )
+        }
+
+        if (url.searchParams.get(`offset`) === `0_0`) {
+          // A catch-up chunk: its header is the chunk's end, and the body
+          // stops before any up-to-date.
+          const body = new ReadableStream<Uint8Array>({
+            async start(controller) {
+              controller.enqueue(encodeEvent(row))
+              // Let the client read the event before the body ends.
+              await resolveInMacrotask(undefined)
+              endBody(controller)
+            },
+          })
+          return Promise.resolve(sseResponse(body, `5_0`))
+        }
+
+        liveAfterCatchUp = true
+        return new Promise<Response>(() => {})
+      })
+
+      const received = startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(liveAfterCatchUp).toBe(true)
+      })
+
+      const params = requests.map((url) => ({
+        offset: url.searchParams.get(`offset`),
+        sse: url.searchParams.get(`live_sse`),
+      }))
+      expect(params.slice(1)).toEqual([
+        { offset: `0_0`, sse: `true` },
+        { offset: `0_0`, sse: null },
+        { offset: `5_0`, sse: `true` },
+      ])
+      expect(received).toEqual([`row-1`])
+    })
+  })
+
+  describe(`SSE memory limits`, () => {
+    const filler = (n: number, offset: string) => ({
+      ...insertRow(n, offset),
+      value: { id: `${n}`, data: `x`.repeat(200) },
+    })
+
+    it(`closes a connection whose messages pass the limit before an up-to-date, then long polls`, async () => {
+      const requests: URL[] = []
+      const cancelled = vi.fn()
+      let liveAfterCatchUp = false
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        requests.push(url)
+
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        if (url.searchParams.get(`live_sse`) !== `true`) {
+          return Promise.resolve(
+            upToDateResponse(
+              [
+                insertRow(9, `5_0`),
+                {
+                  headers: { control: `up-to-date`, global_last_seen_lsn: `5` },
+                },
+              ],
+              `5_0`
+            )
+          )
+        }
+
+        if (url.searchParams.get(`offset`) === `0_0`) {
+          let n = 0
+          const body = new ReadableStream<Uint8Array>(
+            {
+              async pull(controller) {
+                await resolveInMacrotask(undefined)
+                controller.enqueue(encodeEvent(filler(++n, `0_${n}`)))
+              },
+              cancel: cancelled,
+            },
+            { highWaterMark: 0 }
+          )
+          return Promise.resolve(sseResponse(body, `5_0`))
+        }
+
+        liveAfterCatchUp = true
+        return new Promise<Response>(() => {})
+      })
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        liveSse: true,
+        maxResponseBytes: 2_000,
+      })
+      const received: Array<string> = []
+      stream.subscribe((messages) => {
+        for (const message of messages) {
+          if (isChangeMessage(message)) received.push(message.key)
+        }
+      })
+
+      await vi.waitFor(() => {
+        expect(liveAfterCatchUp).toBe(true)
+      })
+
+      expect(cancelled).toHaveBeenCalledOnce()
+      expect(
+        requests.slice(1).map((url) => ({
+          offset: url.searchParams.get(`offset`),
+          sse: url.searchParams.get(`live_sse`),
+        }))
+      ).toEqual([
+        { offset: `0_0`, sse: `true` },
+        { offset: `0_0`, sse: null },
+        { offset: `5_0`, sse: `true` },
+      ])
+      expect(received).toEqual([`row-9`])
+    })
+
+    it(`closes the connection and waits for subscribers when delivered batches pile up`, async () => {
+      const upToDate = (n: number) => ({
+        headers: { control: `up-to-date`, global_last_seen_lsn: `${n}` },
+      })
+      const closed = vi.fn()
+      const liveRequestTimes: Array<number> = []
+      let releaseSubscriber = () => {}
+      let released = 0
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        liveRequestTimes.push(released)
+        if (liveRequestTimes.length > 1) {
+          return new Promise<Response>(() => {})
+        }
+
+        let n = 0
+        const body = new ReadableStream<Uint8Array>(
+          {
+            async pull(controller) {
+              await resolveInMacrotask(undefined)
+              n++
+              controller.enqueue(encodeEvent(filler(n, `${n}_0`)))
+              controller.enqueue(encodeEvent(upToDate(n)))
+            },
+            cancel: closed,
+          },
+          { highWaterMark: 0 }
+        )
+        return Promise.resolve(sseResponse(body, `1_0`))
+      })
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        liveSse: true,
+        maxResponseBytes: 2_000,
+      })
+      let firstBatch = true
+      stream.subscribe(async () => {
+        if (firstBatch) {
+          firstBatch = false
+          return
+        }
+        await new Promise<void>((resolve) => {
+          releaseSubscriber = () => {
+            released++
+            resolve()
+          }
+        })
+      })
+
+      await vi.waitFor(() => {
+        expect(closed).toHaveBeenCalledOnce()
+      })
+
+      await resolveInMacrotask(undefined)
+      expect(liveRequestTimes).toHaveLength(1)
+
+      await vi.waitFor(() => {
+        releaseSubscriber()
+        expect(liveRequestTimes).toHaveLength(2)
+      })
+      expect(liveRequestTimes[1]).toBeGreaterThan(0)
+    })
+
+    it(`does not read a close for slow subscribers as a short connection`, async () => {
+      const warnSpy = vi.spyOn(console, `warn`).mockImplementation(() => {})
+      const upToDate = (n: number) => ({
+        headers: { control: `up-to-date`, global_last_seen_lsn: `${n}` },
+      })
+      const batchBytes =
+        encodeEvent(filler(1, `1_0`)).byteLength +
+        encodeEvent(upToDate(1)).byteLength
+      const emptyBatchBytes = encodeEvent(upToDate(1)).byteLength
+      let releaseSubscriber = () => {}
+      const liveRequests: Array<string | null> = []
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+        liveRequests.push(url.searchParams.get(`live_sse`))
+        const connection = liveRequests.length
+        if (connection > 6 || url.searchParams.get(`live_sse`) !== `true`) {
+          return new Promise<Response>(() => {})
+        }
+        const round = Math.ceil(connection / 2)
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (connection % 2 === 1) {
+              controller.enqueue(encodeEvent(filler(round, `${round}_0`)))
+              controller.enqueue(encodeEvent(upToDate(round)))
+              controller.close()
+              return
+            }
+            controller.enqueue(encodeEvent(upToDate(round)))
+          },
+          cancel: () => releaseSubscriber(),
+        })
+        return Promise.resolve(sseResponse(body, `${round}_0`))
+      })
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        liveSse: true,
+        maxResponseBytes: batchBytes + emptyBatchBytes - 1,
+      })
+      stream.subscribe(async (messages) => {
+        if (messages.some(isChangeMessage)) {
+          await new Promise<void>((resolve) => {
+            releaseSubscriber = resolve
+          })
+        }
+      })
+
+      await vi.waitFor(
+        () => {
+          expect(liveRequests).toHaveLength(7)
+        },
+        { timeout: 15_000 }
+      )
+
+      expect(liveRequests[6]).toBe(`true`)
+      expect(warnSpy).not.toHaveBeenCalled()
+      warnSpy.mockRestore()
+    })
+  })
+
+  describe(`column mapping of hostile column names`, () => {
+    it(`keeps a __proto__ column as an ordinary field of the row`, async () => {
+      const responseBody = `[{"key":"row-1","value":{"__proto__":{"isAdmin":true},"id":"1"},"headers":{"operation":"insert"},"offset":"0_0"},{"headers":{"control":"up-to-date"},"offset":"0_0"}]`
+      const fetchMock = vi.fn(() =>
+        Promise.resolve(
+          new Response(responseBody, {
+            status: 200,
+            headers: {
+              ...electricHeaders(`0_0`, `cursor-0`),
+              'electric-schema': `{"id":{"type":"text"}}`,
+              'content-type': `application/json`,
+              'electric-up-to-date': ``,
+            },
+          })
+        )
+      )
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        subscribe: false,
+        columnMapper: { decode: (name) => name, encode: (name) => name },
+      })
+      const rows: Array<Row> = []
+      await new Promise<void>((resolve) => {
+        stream.subscribe((messages) => {
+          for (const message of messages) {
+            if (isChangeMessage(message)) rows.push(message.value)
+          }
+          resolve()
+        })
+      })
+
+      expect(Object.getPrototypeOf(rows[0])).toBe(Object.prototype)
+      expect((rows[0] as Record<string, unknown>).isAdmin).toBeUndefined()
+      expect(Object.keys(rows[0]).sort()).toEqual([`__proto__`, `id`])
+    })
+  })
+
+  describe(`SSE short-connection fallback`, () => {
+    let warnSpy: ReturnType<typeof vi.spyOn>
+
+    beforeEach(() => {
+      warnSpy = vi.spyOn(console, `warn`).mockImplementation(() => {})
+    })
+
+    afterEach(() => warnSpy.mockRestore())
+
+    const warnedOfSseFallback = () =>
+      warnSpy.mock.calls.some((args: Array<unknown>) =>
+        String(args[0]).includes(`SSE connections are closing immediately`)
+      )
+
+    it(`keeps using SSE when the server closes catch-up responses that carried messages`, async () => {
+      const catchUps = 4
+      let sseRequests = 0
+      const liveRequests: Array<string> = []
+
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`live`) !== `true`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        liveRequests.push(url.toString())
+        if (url.searchParams.get(`live_sse`) !== `true`) {
+          return new Promise<Response>(() => {})
+        }
+
+        const n = ++sseRequests
+        if (n > catchUps) {
+          return Promise.resolve(
+            sseResponse(new ReadableStream<Uint8Array>(), `${catchUps}_0`)
+          )
+        }
+
+        // Behind the log end: the server sends the catch-up, then closes.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encodeEvent(insertRow(n, `${n}_0`)))
+            controller.enqueue(
+              encodeEvent({
+                headers: {
+                  control: `up-to-date`,
+                  global_last_seen_lsn: `${n}`,
+                },
+              })
+            )
+            controller.close()
+          },
+        })
+        return Promise.resolve(sseResponse(body, `${n}_0`))
+      })
+
+      startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(liveRequests).toHaveLength(catchUps + 1)
+      })
+
+      expect(sseRequests).toBe(catchUps + 1)
+      expect(warnedOfSseFallback()).toBe(false)
+    })
+
+    it(`falls back to long polling when short SSE responses carry messages but leave the offset where it was`, async () => {
+      const liveRequests: Array<string> = []
+
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`live`) !== `true`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        liveRequests.push(url.toString())
+        if (url.searchParams.get(`live_sse`) !== `true`) {
+          return new Promise<Response>(() => {})
+        }
+
+        // Every response replays the same transaction at LSN 0 and ends with
+        // an up-to-date naming that LSN, which leaves the offset at `0_0`.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            for (const op of [1, 2]) {
+              controller.enqueue(encodeEvent(insertRow(op, `0_${op}`)))
+            }
+            controller.enqueue(
+              encodeEvent({
+                headers: { control: `up-to-date`, global_last_seen_lsn: `0` },
+              })
+            )
+            controller.close()
+          },
+        })
+        return Promise.resolve(sseResponse(body, `0_0`))
+      })
+
+      startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(liveRequests).toHaveLength(4)
+      })
+
+      const sentOffsets = liveRequests.map((url) =>
+        new URL(url).searchParams.get(`offset`)
+      )
+      const usedSse = liveRequests.map(
+        (url) => new URL(url).searchParams.get(`live_sse`) === `true`
+      )
+      expect(sentOffsets).toEqual([`0_0`, `0_0`, `0_0`, `0_0`])
+      expect(usedSse).toEqual([true, true, true, false])
+      expect(warnedOfSseFallback()).toBe(true)
+    })
+
+    it(`keeps using SSE when catch-up bodies end inside a chunk, before their up-to-date`, async () => {
+      const catchUps = 4
+      let sseRequests = 0
+      const requests: Array<{ offset: string | null; sse: boolean }> = []
+
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`live`) !== `true`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        const sse = url.searchParams.get(`live_sse`) === `true`
+        requests.push({ offset: url.searchParams.get(`offset`), sse })
+        // Never reached when the stream behaves; stops a regression from
+        // looping on instant long-poll responses.
+        if (requests.length > 12) return new Promise<Response>(() => {})
+
+        const n = sseRequests + (sse ? 1 : 0)
+        const row = insertRow(n, `${n}_0`)
+
+        if (!sse) {
+          // The long poll that follows reads the whole chunk, then it is
+          // up to date and SSE resumes.
+          return Promise.resolve(
+            upToDateResponse(
+              [row, { headers: { control: `up-to-date` } }],
+              `${n}_0`,
+              `cursor-${n}`
+            )
+          )
+        }
+
+        sseRequests++
+        if (sseRequests > catchUps) {
+          return Promise.resolve(
+            sseResponse(new ReadableStream<Uint8Array>(), `${catchUps}_0`)
+          )
+        }
+
+        // A catch-up that crosses a chunk boundary: the server sends the
+        // chunk and closes without an up-to-date because more is waiting.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encodeEvent(row))
+            controller.close()
+          },
+        })
+        return Promise.resolve(sseResponse(body, `${n}_0`))
+      })
+
+      const received = startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(sseRequests).toBe(catchUps + 1)
+      })
+
+      // Each short body is followed by a long poll from the same offset, and
+      // SSE is never given up on.
+      expect(requests.map((r) => r.sse)).toEqual([
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+        false,
+        true,
+      ])
+      expect(received).toEqual([`row-1`, `row-2`, `row-3`, `row-4`])
+      expect(warnedOfSseFallback()).toBe(false)
+    })
+
+    it(`falls back to long polling after three short SSE responses without messages`, async () => {
+      const liveRequests: Array<string> = []
+
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`live`) !== `true`) {
+          return Promise.resolve(initialResponse())
+        }
+
+        liveRequests.push(url.toString())
+        if (url.searchParams.get(`live_sse`) !== `true`) {
+          return new Promise<Response>(() => {})
+        }
+
+        // A buffering proxy: the body ends before any event reaches the
+        // client, though the header already names the end of a catch-up.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(`: keep-alive\n\n`))
+            controller.close()
+          },
+        })
+        return Promise.resolve(sseResponse(body, `1_0`))
+      })
+
+      startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(liveRequests).toHaveLength(4)
+      })
+
+      const usedSse = liveRequests.map(
+        (url) => new URL(url).searchParams.get(`live_sse`) === `true`
+      )
+      expect(usedSse).toEqual([true, true, true, false])
+      expect(warnedOfSseFallback()).toBe(true)
+    })
   })
 
   it(`reentrant requestSnapshot may re-enter bystander subscribers before their earlier callback completes`, async () => {
@@ -998,6 +1784,7 @@ describe(`ShapeStream`, () => {
     expect(caughtError!.message).toContain(`troubleshooting`)
 
     expect(warnSpy).toHaveBeenCalledWith(
+      `[Electric]`,
       expect.stringContaining(`Clearing client-side caches`),
       expect.any(Error)
     )
@@ -1180,7 +1967,9 @@ describe(`ShapeStream`, () => {
     // Should have made many rapid requests without triggering fast-loop detection
     expect(requestCount).toBeGreaterThan(5)
     expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining(`fast retry loop`)
+      `[Electric]`,
+      expect.stringContaining(`fast retry loop`),
+      expect.any(Error)
     )
 
     warnSpy.mockRestore()
@@ -1243,10 +2032,151 @@ describe(`ShapeStream`, () => {
     )
 
     expect(warnSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining(`fast retry loop`)
+      `[Electric]`,
+      expect.stringContaining(`fast retry loop`),
+      expect.any(Error)
     )
 
     warnSpy.mockRestore()
+  })
+
+  describe(`fast-loop detection with subset snapshots`, () => {
+    const snapshotResponse = () =>
+      new Response(
+        JSON.stringify({
+          metadata: {
+            snapshot_mark: 1,
+            xmin: `1`,
+            xmax: `2`,
+            xip_list: [],
+            database_lsn: `0`,
+          },
+          data: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': `application/json`,
+            'electric-handle': `my-handle`,
+            'electric-offset': `0_0`,
+            'electric-schema': `{"id":{"type":"text"}}`,
+          },
+        }
+      )
+
+    const isSnapshotRequest = (input: Parameters<typeof fetch>[0]) =>
+      new URL(input.toString()).searchParams.has(`subset__limit`)
+
+    const warnedFastLoop = (warnSpy: { mock: { calls: unknown[][] } }) =>
+      warnSpy.mock.calls.some((args) =>
+        args.some((arg) => String(arg).includes(`fast retry loop`))
+      )
+
+    it(`does not count requests that a snapshot pause aborted`, async () => {
+      // Each requestSnapshot pauses the stream, which aborts the in-flight
+      // request, and the stream restarts at the same offset once the snapshot
+      // is done. An aborted request got no response, so many snapshots in a
+      // row are not a retry loop.
+      const warnSpy = vi.spyOn(console, `warn`).mockImplementation(() => {})
+      let caughtError: Error | null = null
+      let mainRequestCount = 0
+
+      const fetchMock = (
+        input: Parameters<typeof fetch>[0],
+        init?: Parameters<typeof fetch>[1]
+      ): Promise<Response> => {
+        if (isSnapshotRequest(input)) {
+          return Promise.resolve(snapshotResponse())
+        }
+        mainRequestCount++
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener(`abort`, () => {
+            reject(new DOMException(`Aborted`, `AbortError`))
+          })
+        })
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        log: `changes_only`,
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        onError: (error) => {
+          caughtError = error
+        },
+      })
+
+      stream.subscribe(() => {})
+
+      for (let i = 0; i < 30; i++) {
+        await stream.requestSnapshot({ limit: 1 })
+      }
+
+      expect(warnedFastLoop(warnSpy)).toBe(false)
+      expect(caughtError).toBe(null)
+      // The stream is still running: it resumes once the last snapshot is done.
+      const requestsBeforeResume = mainRequestCount
+      await vi.waitFor(() => {
+        expect(mainRequestCount).toBe(requestsBeforeResume + 1)
+      })
+
+      warnSpy.mockRestore()
+    })
+
+    it(`still detects a loop of responses when snapshots run in between`, async () => {
+      let requestCount = 0
+      let caughtError: Error | null = null
+      const warnSpy = vi.spyOn(console, `warn`).mockImplementation(() => {})
+
+      const fetchMock = (
+        input: Parameters<typeof fetch>[0]
+      ): Promise<Response> => {
+        if (isSnapshotRequest(input)) {
+          return Promise.resolve(snapshotResponse())
+        }
+        requestCount++
+        return Promise.resolve(
+          new Response(`[]`, {
+            status: 409,
+            headers: {
+              'content-type': `application/json`,
+              'electric-handle': `handle-${requestCount}`,
+            },
+          })
+        )
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        log: `changes_only`,
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        subscribe: false,
+        onError: (error) => {
+          caughtError = error
+        },
+      })
+
+      stream.subscribe(() => {})
+
+      for (let i = 0; i < 5; i++) {
+        await stream.requestSnapshot({ limit: 1 })
+      }
+
+      await vi.waitFor(
+        () => {
+          expect(caughtError).not.toBe(null)
+        },
+        { timeout: 15_000 }
+      )
+
+      expect(caughtError!.message).toContain(`fast retry loop`)
+      expect(warnedFastLoop(warnSpy)).toBe(true)
+
+      warnSpy.mockRestore()
+    })
   })
 
   it(`backs off before retrying when onError returns retry options`, async () => {
@@ -1604,6 +2534,128 @@ describe(`ShapeStream`, () => {
     expect(subscriberError).toBeNull()
   })
 
+  describe(`a batch that cannot be processed`, () => {
+    const withBadLsn = (row: ReturnType<typeof insertRow>) => ({
+      ...row,
+      headers: { ...row.headers, lsn: `not-a-number` },
+    })
+    const upToDate = { headers: { control: `up-to-date` } }
+    const fastBackoff = {
+      initialDelay: 2,
+      maxDelay: 2,
+      multiplier: 1,
+      maxRetries: Infinity,
+    }
+
+    it(`is asked for again from the same offset after an SSE batch fails`, async () => {
+      const row = insertRow(1, `3_0`)
+      const requests: URL[] = []
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+        requests.push(url)
+        if (requests.length === 1) {
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encodeEvent(withBadLsn(row)))
+              controller.enqueue(encodeEvent(upToDate))
+            },
+          })
+          return Promise.resolve(sseResponse(body, `3_0`))
+        }
+        if (requests.length === 2) {
+          return Promise.resolve(upToDateResponse([row, upToDate], `3_0`))
+        }
+        return new Promise<Response>(() => {})
+      })
+
+      const received = startLiveSseStream(fetchMock)
+
+      await vi.waitFor(() => {
+        expect(received).toEqual([row.key])
+      })
+      expect(requests[1]?.searchParams.get(`offset`)).toBe(`0_0`)
+    })
+
+    it(`is asked for again from the same offset after an onError retry`, async () => {
+      const row = insertRow(1, `3_0`)
+      const requests: URL[] = []
+      const fetchMock = vi.fn((input: string | URL | Request) => {
+        const url = new URL(input.toString())
+        if (url.searchParams.get(`offset`) === `-1`) {
+          return Promise.resolve(initialResponse())
+        }
+        requests.push(url)
+        if (requests.length === 1) {
+          return Promise.resolve(
+            upToDateResponse([withBadLsn(row), upToDate], `3_0`)
+          )
+        }
+        if (requests.length === 2) {
+          return Promise.resolve(upToDateResponse([row, upToDate], `3_0`))
+        }
+        return new Promise<Response>(() => {})
+      })
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        backoffOptions: fastBackoff,
+        onError: () => ({}),
+      })
+      const received: Array<string> = []
+      stream.subscribe((messages) => {
+        for (const message of messages) {
+          if (isChangeMessage(message)) received.push(message.key)
+        }
+      })
+
+      await vi.waitFor(() => {
+        expect(received).toEqual([row.key])
+      })
+      expect(requests[1]?.searchParams.get(`offset`)).toBe(`0_0`)
+    })
+
+    it(`stops the stream with an error when it stays bad`, async () => {
+      const row = insertRow(1, `3_0`)
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        await resolveInMacrotask(undefined)
+        const url = new URL(input.toString())
+        return url.searchParams.get(`offset`) === `-1`
+          ? initialResponse()
+          : upToDateResponse([withBadLsn(row), upToDate], `3_0`)
+      })
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        backoffOptions: fastBackoff,
+        onError: () => ({}),
+      })
+      const subscriberError = vi.fn()
+      const received: Array<string> = []
+      stream.subscribe((messages) => {
+        for (const message of messages) {
+          if (isChangeMessage(message)) received.push(message.key)
+        }
+      }, subscriberError)
+
+      await vi.waitFor(
+        () => {
+          expect(subscriberError).toHaveBeenCalledOnce()
+        },
+        { timeout: 5_000 }
+      )
+      expect(received).toEqual([])
+    })
+  })
+
   it(`malformed 200 responses are bounded by the retry counter`, async () => {
     // A proxy/CDN returning 200 OK with invalid JSON (non-array body)
     // must still be bounded. The counter must NOT reset before the body
@@ -1679,6 +2731,985 @@ describe(`ShapeStream`, () => {
     // assertion fails because the stream loops forever.
     expect(subscriberError).not.toBeNull()
     expect(requestCount).toBeLessThan(200)
+  })
+
+  describe(`requestSnapshot offset coordination`, () => {
+    const change = (
+      id: string,
+      status: string,
+      txid?: number
+    ): ChangeMessage => ({
+      key: `run-${id}`,
+      value: { id, status },
+      headers: {
+        operation: txid === undefined ? `insert` : `update`,
+        relation: [`public`, `runs`],
+        ...(txid === undefined ? {} : { txids: [txid] }),
+      },
+    })
+
+    const response = (body: unknown, offset: Offset, snapshot = false) =>
+      new Response(JSON.stringify(body), {
+        headers: {
+          'content-type': `application/json`,
+          'electric-handle': `handle-1`,
+          'electric-offset': offset,
+          'electric-schema': `{"id":{"type":"text"},"status":{"type":"text"}}`,
+          ...(snapshot
+            ? { 'electric-snapshot': `true` }
+            : { 'electric-up-to-date': `` }),
+        },
+      })
+
+    const logResponse = (offset: Offset, ...data: ChangeMessage[]) =>
+      response(
+        [...data, { headers: { control: `up-to-date` }, offset }],
+        offset
+      )
+
+    const snapshotResponse = (
+      mark: number,
+      offset: Offset,
+      ...data: ChangeMessage[]
+    ) =>
+      response(
+        {
+          metadata: {
+            snapshot_mark: mark,
+            xmin: `1`,
+            xmax: `10`,
+            xip_list: [],
+            database_lsn: offset.split(`_`)[0],
+          },
+          data,
+        },
+        offset,
+        true
+      )
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void
+      let reject!: (reason: unknown) => void
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return { promise, resolve, reject }
+    }
+
+    // Explicit request/response barriers keep the race independent of timing.
+    function holdRequest() {
+      const received = deferred<URL>()
+      const reply = deferred<Response>()
+      return {
+        received: received.promise,
+        respond: reply.resolve,
+        fetch: (url: URL, init?: RequestInit) => {
+          received.resolve(url)
+          const abort = () =>
+            reply.reject(new DOMException(`Aborted`, `AbortError`))
+          if (init?.signal?.aborted) abort()
+          else init?.signal?.addEventListener(`abort`, abort, { once: true })
+          return reply.promise.finally(() =>
+            init?.signal?.removeEventListener(`abort`, abort)
+          )
+        },
+      }
+    }
+
+    function createStream(
+      offset: Offset,
+      onError?: ShapeStreamOptions[`onError`]
+    ) {
+      const pendingFetch = (url: URL, init?: RequestInit) =>
+        holdRequest().fetch(url, init)
+      const logFetch = vi.fn(pendingFetch)
+      const snapshotFetch = vi.fn(pendingFetch)
+      const seenChanges: string[] = []
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `runs` },
+        log: `changes_only`,
+        offset,
+        ...(offset === `now` || offset === `-1` ? {} : { handle: `handle-1` }),
+        liveSse: false,
+        signal: aborter.signal,
+        onError,
+        fetchClient: (input, init) => {
+          const url = new URL(input.toString())
+          return url.searchParams.has(`subset__limit`)
+            ? snapshotFetch(url, init)
+            : logFetch(url, init)
+        },
+      })
+      stream.subscribe((messages) => {
+        for (const message of messages) {
+          if (isChangeMessage(message)) {
+            seenChanges.push(`${message.key}:${message.value.status}`)
+          }
+        }
+      })
+      return { stream, logFetch, snapshotFetch, seenChanges }
+    }
+
+    it(`replays changes outside the subset and deduplicates changes inside it`, async () => {
+      const { stream, logFetch, snapshotFetch, seenChanges } =
+        createStream(`1_0`)
+      const live = holdRequest()
+      logFetch.mockResolvedValueOnce(logResponse(`1_0`, change(`a`, `running`)))
+      logFetch.mockImplementationOnce(live.fetch)
+      await live.received
+
+      const snapshot = holdRequest()
+      snapshotFetch.mockImplementationOnce(snapshot.fetch)
+      const loading = stream.requestSnapshot({ where: `id = 'b'`, limit: 1 })
+      await snapshot.received
+
+      // A completes while B's snapshot is in flight. B's older update will
+      // also be replayed, but must not overwrite its newer snapshot value.
+      const replay = holdRequest()
+      logFetch.mockImplementationOnce(replay.fetch)
+      snapshot.respond(snapshotResponse(1, `5_0`, change(`b`, `completed`)))
+      await loading
+      expect((await replay.received).searchParams.get(`offset`)).toBe(`1_0`)
+      replay.respond(
+        logResponse(
+          `5_0`,
+          change(`a`, `completed`, 2),
+          change(`b`, `running`, 3)
+        )
+      )
+
+      await vi.waitFor(() =>
+        expect(seenChanges).toEqual([
+          `run-a:running`,
+          `run-b:completed`,
+          `run-a:completed`,
+        ])
+      )
+    })
+
+    it(`keeps deduplicating a batch that failed after retiring a snapshot`, async () => {
+      const withLsn = (message: ChangeMessage, lsn: string): ChangeMessage => ({
+        ...message,
+        headers: { ...message.headers, lsn },
+      })
+      const { stream, logFetch, snapshotFetch, seenChanges } = createStream(
+        `1_0`,
+        () => ({})
+      )
+      const live = holdRequest()
+      logFetch.mockResolvedValueOnce(logResponse(`1_0`, change(`a`, `running`)))
+      logFetch.mockImplementationOnce(live.fetch)
+      await live.received
+
+      const snapshot = holdRequest()
+      snapshotFetch.mockImplementationOnce(snapshot.fetch)
+      const loading = stream.requestSnapshot({ where: `id = 'b'`, limit: 1 })
+      await snapshot.received
+
+      const replay = holdRequest()
+      logFetch.mockImplementationOnce(replay.fetch)
+      snapshot.respond(snapshotResponse(1, `5_0`, change(`b`, `completed`)))
+      await loading
+      await replay.received
+
+      const covered = change(`b`, `running`, 3)
+      const retiring = withLsn(change(`c`, `running`), `7`)
+      const retry = holdRequest()
+      logFetch.mockImplementationOnce(retry.fetch)
+      replay.respond(
+        logResponse(
+          `8_0`,
+          covered,
+          retiring,
+          withLsn(change(`d`, `running`), `not-a-number`)
+        )
+      )
+
+      expect((await retry.received).searchParams.get(`offset`)).toBe(`1_0`)
+      const retried = logResponse(
+        `8_0`,
+        covered,
+        retiring,
+        withLsn(change(`d`, `running`), `8`)
+      )
+      retried.headers.set(`electric-cursor`, `cursor-1`)
+      retry.respond(retried)
+
+      await vi.waitFor(() =>
+        expect(seenChanges).toEqual([
+          `run-a:running`,
+          `run-b:completed`,
+          `run-c:running`,
+          `run-d:running`,
+        ])
+      )
+    })
+
+    it.each([`now`, `-1`] as const)(
+      `adopts the snapshot position when the stream starts at %s`,
+      async (initialOffset) => {
+        const { stream, logFetch, snapshotFetch, seenChanges } =
+          createStream(initialOffset)
+        const snapshot = holdRequest()
+        snapshotFetch.mockImplementationOnce(snapshot.fetch)
+        const loading = stream.requestSnapshot({ limit: 1 })
+        await snapshot.received
+
+        const replay = holdRequest()
+        logFetch.mockImplementationOnce(replay.fetch)
+        snapshot.respond(snapshotResponse(1, `5_0`, change(`a`, `running`)))
+        await loading
+        const resumeUrl = await replay.received
+        expect(resumeUrl.searchParams.get(`offset`)).toBe(`5_0`)
+        expect(resumeUrl.searchParams.get(`handle`)).toBe(`handle-1`)
+        replay.respond(logResponse(`6_0`, change(`a`, `completed`, 11)))
+
+        await vi.waitFor(() =>
+          expect(seenChanges).toEqual([`run-a:running`, `run-a:completed`])
+        )
+      }
+    )
+
+    it.each([`earlier`, `later`] as const)(
+      `replays from the earliest cold snapshot when %s completes first`,
+      async (first) => {
+        const { stream, logFetch, snapshotFetch, seenChanges } =
+          createStream(`now`)
+        const earlier = holdRequest()
+        const later = holdRequest()
+        snapshotFetch
+          .mockImplementationOnce(earlier.fetch)
+          .mockImplementationOnce(later.fetch)
+        const earlierLoad = stream.requestSnapshot({
+          where: `id = 'a'`,
+          limit: 1,
+        })
+        const laterLoad = stream.requestSnapshot({
+          where: `id = 'b'`,
+          limit: 1,
+        })
+        await Promise.all([earlier.received, later.received])
+
+        const completions = [
+          {
+            request: earlier,
+            load: earlierLoad,
+            response: snapshotResponse(1, `3_0`, change(`a`, `running`)),
+          },
+          {
+            request: later,
+            load: laterLoad,
+            response: snapshotResponse(2, `5_0`, change(`b`, `running`)),
+          },
+        ]
+        if (first === `later`) completions.reverse()
+        const replay = holdRequest()
+        logFetch.mockImplementationOnce(replay.fetch)
+        completions[0].request.respond(completions[0].response)
+        await completions[0].load
+        expect(stream.isPaused()).toBe(true)
+        completions[1].request.respond(completions[1].response)
+        await completions[1].load
+
+        expect((await replay.received).searchParams.get(`offset`)).toBe(`3_0`)
+        replay.respond(logResponse(`5_0`, change(`a`, `completed`, 11)))
+        const snapshots =
+          first === `earlier`
+            ? [`run-a:running`, `run-b:running`]
+            : [`run-b:running`, `run-a:running`]
+        await vi.waitFor(() =>
+          expect(seenChanges).toEqual([...snapshots, `run-a:completed`])
+        )
+      }
+    )
+
+    it.each([
+      // First completion, second completion, expected resume offset.
+      [`7_2`, `7_10`, `7_2`],
+      [`7_10`, `7_2`, `7_2`],
+      [`9007199254740992_0`, `9007199254740993_0`, `9007199254740992_0`],
+      [`9007199254740993_0`, `9007199254740992_0`, `9007199254740992_0`],
+      [`5_0`, `5_0`, `5_0`],
+      [`0_inf`, `0_inf`, `0_inf`],
+      [`0_2`, `0_inf`, `0_2`],
+      [`0_inf`, `0_2`, `0_2`],
+      [`0_inf`, `1_0`, `0_inf`],
+      [`1_0`, `0_inf`, `0_inf`],
+    ] as const)(
+      `cold snapshots at %s then %s resume at %s`,
+      async (first, second, expected) => {
+        const { stream, logFetch, snapshotFetch } = createStream(`now`)
+        const firstRequest = holdRequest()
+        const secondRequest = holdRequest()
+        snapshotFetch
+          .mockImplementationOnce(firstRequest.fetch)
+          .mockImplementationOnce(secondRequest.fetch)
+        const firstLoad = stream.requestSnapshot({ limit: 1 })
+        const secondLoad = stream.requestSnapshot({ limit: 2 })
+        await Promise.all([firstRequest.received, secondRequest.received])
+
+        const replay = holdRequest()
+        logFetch.mockImplementationOnce(replay.fetch)
+        firstRequest.respond(snapshotResponse(1, first))
+        await firstLoad
+        secondRequest.respond(snapshotResponse(2, second))
+        await secondLoad
+        expect((await replay.received).searchParams.get(`offset`)).toBe(
+          expected
+        )
+      }
+    )
+
+    it(`resumes a live stream on the new handle when a snapshot hits a 409`, async () => {
+      // The 409 moves the stream to the new handle. Its old offset belongs to
+      // the old handle, so the snapshot's earlier offset replaces it.
+      const { stream, logFetch, snapshotFetch } = createStream(`10_0`)
+      const conflict = holdRequest()
+      const retried = holdRequest()
+      snapshotFetch
+        .mockImplementationOnce(conflict.fetch)
+        .mockImplementationOnce(retried.fetch)
+      const loading = stream.requestSnapshot({ limit: 1 })
+      await conflict.received
+
+      conflict.respond(
+        new Response(`[{"headers":{"control":"must-refetch"}}]`, {
+          status: 409,
+          headers: {
+            'content-type': `application/json`,
+            'electric-handle': `handle-2`,
+          },
+        })
+      )
+      await retried.received
+
+      const replay = holdRequest()
+      logFetch.mockImplementationOnce(replay.fetch)
+      const retriedResponse = snapshotResponse(1, `0_inf`)
+      retried.respond(
+        new Response(retriedResponse.body, {
+          headers: {
+            ...Object.fromEntries(retriedResponse.headers),
+            'electric-handle': `handle-2`,
+          },
+        })
+      )
+      await loading
+
+      const resumeUrl = await replay.received
+      expect(resumeUrl.searchParams.get(`handle`)).toBe(`handle-2`)
+      expect(resumeUrl.searchParams.get(`offset`)).toBe(`0_inf`)
+    })
+  })
+
+  describe(`parse failure and retry regressions`, () => {
+    it(`rolls the offset back when a live chunk body fails to parse, so the retry re-requests it`, async () => {
+      const requestedOffsets: string[] = []
+      let requestCount = 0
+
+      const fetchMock = vi.fn(
+        async (url: RequestInfo | URL, init?: RequestInit) => {
+          await new Promise((r) => setTimeout(r, 0))
+          if (init?.signal?.aborted) return Response.error()
+          requestedOffsets.push(
+            new URL(url.toString()).searchParams.get(`offset`) ?? ``
+          )
+          requestCount++
+
+          // Request 1: establish the shape and reach up-to-date at offset 0_0.
+          if (requestCount === 1) {
+            return new Response(
+              JSON.stringify([
+                {
+                  key: `k1`,
+                  value: { id: 1 },
+                  headers: { operation: `insert` },
+                  offset: `0_0`,
+                },
+                { headers: { control: `up-to-date` }, offset: `0_0` },
+              ]),
+              {
+                status: 200,
+                headers: {
+                  'electric-handle': `handle-1`,
+                  'electric-offset': `0_0`,
+                  'electric-schema': `{"id":"int4"}`,
+                  'electric-up-to-date': ``,
+                },
+              }
+            )
+          }
+
+          // Request 2: a live chunk whose offset header advances to 5_0 but
+          // whose body is a non-array (proxy/CDN corruption). Parsing throws
+          // after the header offset was already committed by #onInitialResponse.
+          if (requestCount === 2) {
+            return new Response(`{"corrupted":"not an array"}`, {
+              status: 200,
+              headers: {
+                'electric-handle': `handle-1`,
+                'electric-offset': `5_0`,
+                'electric-schema': `{"id":"int4"}`,
+                'electric-cursor': `cursor-2`,
+              },
+            })
+          }
+
+          // Request 3+: hang until aborted so the retry's offset can be read.
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              `abort`,
+              () => reject(new Error(`AbortError`)),
+              { once: true }
+            )
+          })
+        }
+      )
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+        backoffOptions: {
+          initialDelay: 2,
+          maxDelay: 2,
+          multiplier: 1,
+          maxRetries: Infinity,
+        },
+        onError: () => ({}),
+      })
+      stream.subscribe(
+        () => {},
+        () => {}
+      )
+
+      await vi.waitFor(() => expect(stream.isUpToDate).toBe(true))
+      expect(stream.lastOffset).toBe(`0_0`)
+
+      await vi.waitFor(() => expect(requestCount).toBeGreaterThanOrEqual(3))
+
+      // The retry must re-request the chunk at 0_0, not resume from the advanced
+      // 5_0 header — stepping past an unparsed body silently drops those rows.
+      expect(requestedOffsets[2]).toBe(`0_0`)
+      expect(requestedOffsets).not.toContain(`5_0`)
+      expect(stream.lastOffset).toBe(`0_0`)
+    })
+
+    it(`does not advance a warm stream's offset to a subset snapshot's position`, async () => {
+      let mainRequestCount = 0
+
+      const fetchMock = vi.fn(
+        async (url: RequestInfo | URL, init?: RequestInit) => {
+          const requestUrl = new URL(url.toString())
+
+          // Subset snapshot: offset 99_0 sits far ahead of the stream's
+          // established position.
+          if (requestUrl.searchParams.has(`subset__limit`)) {
+            return new Response(
+              JSON.stringify({
+                metadata: {
+                  snapshot_mark: 1,
+                  xmin: `1`,
+                  xmax: `2`,
+                  xip_list: [],
+                  database_lsn: `0`,
+                },
+                data: [
+                  {
+                    key: `snap-1`,
+                    value: { id: `1` },
+                    headers: { operation: `insert` },
+                  },
+                ],
+              }),
+              {
+                status: 200,
+                headers: {
+                  'content-type': `application/json`,
+                  'electric-handle': `handle-1`,
+                  'electric-offset': `99_0`,
+                  'electric-schema': `{"id":{"type":"text"}}`,
+                },
+              }
+            )
+          }
+
+          await new Promise((r) => setTimeout(r, 0))
+          mainRequestCount++
+
+          // Request 1: reach up-to-date at offset 0_5 (an established position).
+          if (mainRequestCount === 1) {
+            return new Response(
+              JSON.stringify([
+                { headers: { control: `up-to-date` }, offset: `0_5` },
+              ]),
+              {
+                status: 200,
+                headers: {
+                  'content-type': `application/json`,
+                  'electric-handle': `handle-1`,
+                  'electric-offset': `0_5`,
+                  'electric-schema': `{"id":{"type":"text"}}`,
+                  'electric-up-to-date': ``,
+                },
+              }
+            )
+          }
+
+          // Later live requests hang until aborted (pause lock or teardown).
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              `abort`,
+              () => reject(new Error(`AbortError`)),
+              { once: true }
+            )
+          })
+        }
+      )
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        log: `changes_only`,
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+      })
+      stream.subscribe(() => {})
+
+      await vi.waitFor(() => expect(stream.isUpToDate).toBe(true))
+      expect(stream.lastOffset).toBe(`0_5`)
+
+      await stream.requestSnapshot({ limit: 1, orderBy: `id ASC` })
+
+      // The snapshot must not drag the stream past updates to rows an earlier
+      // subset already loaded.
+      expect(stream.lastOffset).toBe(`0_5`)
+    })
+
+    it(`passes the stream's abort signal to snapshot fetches`, async () => {
+      let snapshotSeen = false
+      let capturedSnapshotSignal: AbortSignal | null = null
+
+      const fetchMock = vi.fn(
+        async (url: RequestInfo | URL, init?: RequestInit) => {
+          const requestUrl = new URL(url.toString())
+
+          if (requestUrl.searchParams.has(`subset__limit`)) {
+            snapshotSeen = true
+            capturedSnapshotSignal = init?.signal ?? null
+            // Model a hung snapshot request: it settles only when its signal
+            // aborts, so the test can observe whether the stream's abort reaches it.
+            return await new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(`abort`, () =>
+                reject(new DOMException(`Aborted`, `AbortError`))
+              )
+            })
+          }
+
+          await new Promise((r) => setTimeout(r, 0))
+          return new Response(
+            JSON.stringify([
+              { headers: { control: `up-to-date` }, offset: `0_0` },
+            ]),
+            {
+              status: 200,
+              headers: {
+                'content-type': `application/json`,
+                'electric-handle': `handle-1`,
+                'electric-offset': `0_0`,
+                'electric-schema': `{"id":{"type":"text"}}`,
+                'electric-up-to-date': ``,
+              },
+            }
+          )
+        }
+      )
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        log: `changes_only`,
+        signal: aborter.signal,
+        fetchClient: fetchMock,
+      })
+
+      const snapshotPromise = stream
+        .requestSnapshot({ limit: 1 })
+        .catch(() => {})
+
+      // Wait until the snapshot fetch is in flight, then abort the stream.
+      // Without the stream signal the snapshot fetch (and its default-infinite
+      // retry loop) keeps running and holds the pause lock; with it, aborting the
+      // stream aborts the in-flight snapshot fetch. The fetch pipeline wraps the
+      // passed signal, so assert propagation, not reference identity.
+      await vi.waitFor(() => expect(snapshotSeen).toBe(true))
+      expect(capturedSnapshotSignal).not.toBeNull()
+      expect(capturedSnapshotSignal!.aborted).toBe(false)
+      aborter.abort()
+      expect(capturedSnapshotSignal!.aborted).toBe(true)
+      await snapshotPromise
+    })
+  })
+
+  const nextError = (stream: ShapeStream) =>
+    new Promise<Error>((resolve) => {
+      stream.subscribe(() => {}, resolve)
+    })
+
+  describe(`response body read failures`, () => {
+    const backoffOptions = {
+      initialDelay: 2,
+      maxDelay: 2,
+      multiplier: 1,
+      maxRetries: Infinity,
+    }
+
+    // A request that stays open until the stream aborts it.
+    const hangUntilAborted = (init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          `abort`,
+          () => reject(new Error(`AbortError`)),
+          { once: true }
+        )
+      })
+
+    // A response whose headers arrive but whose body errors after the first
+    // bytes, like a connection dropped mid-body.
+    function cutOffResponse(headers: Record<string, string>): Response {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(`[`))
+          controller.error(new TypeError(`terminated`))
+        },
+      })
+      return new Response(body, { status: 200, headers })
+    }
+
+    const upToDateRows = (id: number) =>
+      JSON.stringify([
+        { key: `k${id}`, value: { id }, headers: { operation: `insert` } },
+        { headers: { control: `up-to-date` } },
+      ])
+
+    const initialHeaders = {
+      'electric-handle': `handle-1`,
+      'electric-offset': `0_0`,
+      'electric-schema': `{"id":"int4"}`,
+      'electric-up-to-date': ``,
+    }
+    const liveHeaders = (cursor: string) => ({
+      ...initialHeaders,
+      'electric-offset': `1_0`,
+      'electric-cursor': cursor,
+    })
+
+    it(`retries an initial request whose body is cut off, without ending the stream`, async () => {
+      const requestedOffsets: Array<string | null> = []
+      let requestCount = 0
+      const onFailedAttempt = vi.fn()
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions: { ...backoffOptions, onFailedAttempt },
+        fetchClient: async (url, init) => {
+          requestCount++
+          requestedOffsets.push(
+            new URL(url.toString()).searchParams.get(`offset`)
+          )
+          if (requestCount === 1) return cutOffResponse(initialHeaders)
+          if (requestCount === 2) {
+            return new Response(upToDateRows(1), {
+              status: 200,
+              headers: initialHeaders,
+            })
+          }
+          return hangUntilAborted(init)
+        },
+      })
+
+      const messages: Array<Message<Row>> = []
+      const errors: Array<Error> = []
+      stream.subscribe(
+        (batch) => {
+          messages.push(...batch)
+        },
+        (err) => errors.push(err)
+      )
+
+      await vi.waitFor(() => expect(stream.isUpToDate).toBe(true))
+
+      expect(errors).toEqual([])
+      expect(stream.error).toBeNull()
+      expect(messages.filter(isChangeMessage)).toHaveLength(1)
+      // The retry asks for the same chunk again, from the same offset.
+      expect(requestedOffsets.slice(0, 2)).toEqual([`-1`, `-1`])
+      expect(onFailedAttempt).toHaveBeenCalledTimes(1)
+    })
+
+    it(`retries a live request whose body is cut off and keeps receiving updates`, async () => {
+      const requests: Array<{ live: boolean; offset: string | null }> = []
+      let liveCount = 0
+      let requestCount = 0
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions,
+        fetchClient: async (url, init) => {
+          requestCount++
+          const params = new URL(url.toString()).searchParams
+          const live = params.get(`live`) === `true`
+          requests.push({ live, offset: params.get(`offset`) })
+
+          if (!live) {
+            return new Response(upToDateRows(1), {
+              status: 200,
+              headers: initialHeaders,
+            })
+          }
+          liveCount++
+          if (liveCount === 1) return cutOffResponse(liveHeaders(`c1`))
+          if (liveCount === 2) {
+            return new Response(upToDateRows(2), {
+              status: 200,
+              headers: liveHeaders(`c2`),
+            })
+          }
+          return hangUntilAborted(init)
+        },
+      })
+
+      const ids: Array<unknown> = []
+      const errors: Array<Error> = []
+      stream.subscribe(
+        (batch) => {
+          for (const m of batch) if (isChangeMessage(m)) ids.push(m.value.id)
+        },
+        (err) => errors.push(err)
+      )
+
+      await vi.waitFor(() => expect(ids).toEqual([1, 2]))
+
+      expect(errors).toEqual([])
+      expect(stream.error).toBeNull()
+      // Both live attempts used the offset the stream had before the cut-off.
+      const liveRequests = requests.filter((r) => r.live)
+      expect(liveRequests[0].offset).toBe(`0_0`)
+      expect(liveRequests[1].offset).toBe(`0_0`)
+      expect(requestCount).toBeGreaterThanOrEqual(3)
+    })
+
+    it(`reports the error once the retries are exhausted`, async () => {
+      let requestCount = 0
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions: { ...backoffOptions, maxRetries: 2 },
+        fetchClient: async () => {
+          requestCount++
+          return cutOffResponse(initialHeaders)
+        },
+      })
+
+      const error = await nextError(stream)
+      expect(error).toBeInstanceOf(FetchError)
+      expect((error as FetchError).status).toBe(200)
+      // The first attempt plus two retries.
+      expect(requestCount).toBe(3)
+    })
+
+    it(`counts failed requests and cut-off bodies against one retry budget`, async () => {
+      let requestCount = 0
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions: { ...backoffOptions, maxRetries: 2 },
+        fetchClient: async () => {
+          requestCount++
+          // Two network failures, then a body that is cut off, over and over.
+          if (requestCount % 3 !== 0) throw new TypeError(`fetch failed`)
+          return cutOffResponse(initialHeaders)
+        },
+      })
+
+      const error = await nextError(stream)
+
+      expect(error).toBeInstanceOf(FetchError)
+      expect((error as FetchError).status).toBe(200)
+      expect(requestCount).toBe(3)
+    })
+
+    it(`counts the retries of a prefetched chunk against the budget of its body`, async () => {
+      const requestedOffsets: Array<string | null> = []
+      let secondChunkRequests = 0
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions: { ...backoffOptions, maxRetries: 1 },
+        fetchClient: async (url) => {
+          const offset = new URL(url.toString()).searchParams.get(`offset`)
+          requestedOffsets.push(offset)
+          if (offset === `-1`) {
+            // Not up to date, so the chunk after it is prefetched.
+            return new Response(`[]`, {
+              status: 200,
+              headers: {
+                'electric-handle': `handle-1`,
+                'electric-offset': `0_1`,
+                'electric-schema': `{"id":"int4"}`,
+              },
+            })
+          }
+          // The prefetched chunk fails before its headers, then its body is
+          // cut off.
+          secondChunkRequests++
+          if (secondChunkRequests === 1) throw new TypeError(`fetch failed`)
+          return cutOffResponse({ ...initialHeaders, 'electric-offset': `0_2` })
+        },
+      })
+
+      const error = await nextError(stream)
+      expect(error).toBeInstanceOf(FetchError)
+      expect((error as FetchError).status).toBe(200)
+
+      // Several backoff periods later there is still no third request for the
+      // chunk: the one retry of the budget went to the failed prefetch.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(requestedOffsets).toEqual([`-1`, `0_1`, `0_1`])
+    })
+
+    it(`ends the stream, without a retry, when a fetchClient already read the body`, async () => {
+      // A body that was consumed before the client reads it can never be read,
+      // so retrying it forever (maxRetries is Infinity by default) would hang.
+      let requestCount = 0
+      const onError = vi.fn()
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions,
+        onError,
+        fetchClient: async () => {
+          requestCount++
+          const res = new Response(upToDateRows(1), {
+            status: 200,
+            headers: initialHeaders,
+          })
+          await res.text()
+          return res
+        },
+      })
+
+      const error = await nextError(stream)
+
+      expect(error).toBeInstanceOf(FetchError)
+      expect((error as FetchError).status).toBe(200)
+      expect(error.message).toContain(`Body is unusable`)
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(stream.isConnected()).toBe(false)
+
+      // Several backoff periods later there is still only the one request.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(requestCount).toBe(1)
+    })
+  })
+
+  describe(`non-Error failures`, () => {
+    // maxRetries: 0 makes the fetch layer give up on the first rejection, so the
+    // raw rejection value reaches the stream's own error handling.
+    const giveUpImmediately = {
+      initialDelay: 1,
+      maxDelay: 1,
+      multiplier: 1,
+      maxRetries: 0,
+    }
+
+    function streamRejectingWith(
+      reason: unknown,
+      extra: Partial<ShapeStreamOptions> = {}
+    ) {
+      return new ShapeStream({
+        url: shapeUrl,
+        params: { table: `test` },
+        signal: aborter.signal,
+        backoffOptions: giveUpImmediately,
+        fetchClient: () => Promise.reject(reason),
+        ...extra,
+      })
+    }
+
+    it.each([
+      [`a string`, `connection reset`],
+      [`a plain object`, { code: `E_RESET` }],
+    ])(
+      `tells subscribers when the stream stops on %s and there is no onError`,
+      async (_, reason) => {
+        const stream = streamRejectingWith(reason)
+
+        const error = await nextError(stream)
+
+        expect(error).toBeInstanceOf(Error)
+        expect(error.cause).toBe(reason)
+        expect(stream.error).toBe(reason)
+      }
+    )
+
+    it(`keeps the message of a thrown string`, async () => {
+      const stream = streamRejectingWith(`connection reset`)
+
+      const error = await nextError(stream)
+
+      expect(error.message).toBe(`connection reset`)
+    })
+
+    it(`tells subscribers when onError declines to retry`, async () => {
+      const reason = { code: `E_RESET` }
+      const onError = vi.fn()
+      const stream = streamRejectingWith(reason, { onError })
+
+      const error = await nextError(stream)
+
+      expect(error.cause).toBe(reason)
+      expect(onError).toHaveBeenCalledWith(reason)
+    })
+
+    it(`tells subscribers when the onError retries are exhausted`, async () => {
+      const warnSpy = vi.spyOn(console, `warn`).mockImplementation(() => {})
+      const reason = `still failing`
+      const stream = streamRejectingWith(reason, { onError: () => ({}) })
+
+      try {
+        const error = await nextError(stream)
+
+        expect(error.cause).toBe(reason)
+        expect(warnSpy).toHaveBeenCalledWith(
+          `[Electric]`,
+          expect.stringContaining(`retry loop exhausted`),
+          expect.any(Error)
+        )
+      } finally {
+        warnSpy.mockRestore()
+      }
+    })
+
+    it(`passes an Error through to subscribers unchanged`, async () => {
+      const reason = new Error(`boom`)
+      const stream = streamRejectingWith(reason)
+
+      const error = await nextError(stream)
+
+      expect(error).toBe(reason)
+    })
   })
 
   describe(`HTTP URL warning`, () => {

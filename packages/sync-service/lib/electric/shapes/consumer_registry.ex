@@ -19,6 +19,14 @@ defmodule Electric.Shapes.ConsumerRegistry do
 
   @consumer_suspend_reason Electric.ShapeCache.ShapeCleaner.consumer_suspend_reason()
 
+  # How long broadcast waits for consumer replies before escalating to a kill of the
+  # unresponsive writers (:broadcast_reply_grace config). A reply covers one bounded
+  # fragment write, not a snapshot (buffering consumers reply immediately and defer
+  # instead), so a minute is generous. Must stay well below the collector's
+  # :gather_stall_timeout — the kill here is the recovery that lets the gather
+  # finalize before that deadline crashes the whole stack.
+  defp broadcast_reply_grace, do: Electric.Config.get_env(:broadcast_reply_grace)
+
   def name(stack_id, shape_handle) when is_stack_id(stack_id) and is_shape_handle(shape_handle) do
     {:via, __MODULE__, {stack_id, shape_handle}}
   end
@@ -165,8 +173,9 @@ defmodule Electric.Shapes.ConsumerRegistry do
   - `delivered` is a map of `shape_handle => pid` for handles whose consumers
     processed the event
 
-  There is no timeout so if the GenServers do not respond or die, this
-  function will block indefinitely.
+  A consumer that neither replies nor dies within the reply grace period is
+  killed and classified as crashed with reason `{:killed, :broadcast_unresponsive}`,
+  so this function always returns.
   """
   @spec broadcast([{shape_handle(), term(), pid() | nil}]) ::
           {%{shape_handle() => term()}, %{shape_handle() => term()}, %{shape_handle() => pid()}}
@@ -179,28 +188,12 @@ defmodule Electric.Shapes.ConsumerRegistry do
     # When start_consumer_for_handle returns {:error, :no_shape}, the pid is nil.
     handle_event_pids
     |> Enum.reject(fn {_handle, _event, pid} -> is_nil(pid) end)
-    |> Enum.map(fn {handle, event, pid} ->
+    |> Map.new(fn {handle, event, pid} ->
       ref = Process.monitor(pid)
       send(pid, {:"$gen_call", {self(), ref}, event})
-      {handle, event, ref, pid}
+      {ref, {handle, event, pid}}
     end)
-    |> Enum.reduce({%{}, %{}, %{}}, fn {handle, event, ref, pid},
-                                       {suspended, crashed, delivered} ->
-      receive do
-        {^ref, _reply} ->
-          Process.demonitor(ref, [:flush])
-          {suspended, crashed, Map.put(delivered, handle, pid)}
-
-        {:DOWN, ^ref, _, _, @consumer_suspend_reason} ->
-          # Consumer is in the act of suspending as the txn arrives.
-          # Return for retry (publish/2 will start a new consumer instance).
-          {Map.put(suspended, handle, event), crashed, delivered}
-
-        {:DOWN, ^ref, _, _, reason} ->
-          # Consumer crashed — do not retry, return the crash reason.
-          {suspended, Map.put(crashed, handle, reason), delivered}
-      end
-    end)
+    |> await_replies({%{}, %{}, %{}})
     |> tap(fn
       {suspended, crashed, _delivered} when suspended == %{} and crashed == %{} ->
         :ok
@@ -219,6 +212,116 @@ defmodule Electric.Shapes.ConsumerRegistry do
         end
     end)
   end
+
+  # Replies are taken in arrival order. Waiting on one specific ref at a time makes
+  # every out-of-turn reply rescan the mailbox, which is quadratic in the number of
+  # shapes a single transaction touches: at 8,000 shapes that is 4.2 s of scanning
+  # against 17 ms here, all of it on the ShapeLogCollector's single process.
+  # The grace is one deadline for the whole broadcast, not a fresh countdown per message.
+  # `after` restarts every time the mailbox delivers, so a per-message grace expires only once
+  # the LAST healthy consumer has replied: the effective wait is the consumer count times the
+  # grace. That erases the margin this value exists to hold. It is set an order of magnitude
+  # below :gather_stall_timeout precisely so the kill is the recovery that lets the gather
+  # finalize, and ten slow consumers are enough to carry the broadcast past the stall deadline
+  # that crashes the whole stack instead.
+  defp await_replies(outstanding, acc, phase \\ nil)
+
+  defp await_replies(outstanding, acc, _phase) when outstanding == %{}, do: acc
+
+  defp await_replies(outstanding, acc, nil),
+    do: await_replies(outstanding, acc, {:awaiting, deadline_in(broadcast_reply_grace())})
+
+  defp await_replies(outstanding, {suspended, crashed, delivered}, {stage, _deadline} = phase) do
+    force_killed? = stage == :draining
+
+    receive do
+      {ref, _reply} when :erlang.is_map_key(ref, outstanding) ->
+        Process.demonitor(ref, [:flush])
+        {handle, _event, pid} = Map.fetch!(outstanding, ref)
+
+        await_replies(
+          Map.delete(outstanding, ref),
+          {suspended, crashed, Map.put(delivered, handle, pid)},
+          phase
+        )
+
+      {:DOWN, ref, _, _, @consumer_suspend_reason} when :erlang.is_map_key(ref, outstanding) ->
+        # Consumer is in the act of suspending as the txn arrives.
+        # Return for retry (publish/2 will start a new consumer instance).
+        {handle, event, _pid} = Map.fetch!(outstanding, ref)
+
+        await_replies(
+          Map.delete(outstanding, ref),
+          {Map.put(suspended, handle, event), crashed, delivered},
+          phase
+        )
+
+      {:DOWN, ref, _, _, reason} when :erlang.is_map_key(ref, outstanding) ->
+        # Consumer crashed — do not retry, return the crash reason.
+        {handle, _event, _pid} = Map.fetch!(outstanding, ref)
+
+        await_replies(
+          Map.delete(outstanding, ref),
+          {suspended, Map.put(crashed, handle, down_reason(reason, force_killed?)), delivered},
+          phase
+        )
+    after
+      remaining_ms(phase) ->
+        handle_deadline(phase, outstanding, {suspended, crashed, delivered})
+    end
+  end
+
+  defp deadline_in(ms), do: System.monotonic_time(:millisecond) + ms
+
+  defp remaining_ms({_stage, deadline}),
+    do: max(0, deadline - System.monotonic_time(:millisecond))
+
+  # A consumer that stays alive but never replies wedges the whole pipeline behind this wait —
+  # the monitors above only catch death. Kill the unresponsive writers: their DOWNs land in this
+  # same receive and classify them as crashes, invalidating the shapes instead of pinning the
+  # stack.
+  defp handle_deadline({:awaiting, _}, outstanding, {suspended, crashed, delivered}) do
+    handles = Enum.map(outstanding, fn {_ref, {handle, _event, _pid}} -> handle end)
+
+    Logger.error(
+      "Killing #{map_size(outstanding)} consumer(s) unresponsive to a broadcast " <>
+        "for #{broadcast_reply_grace()}ms: #{inspect(handles)}"
+    )
+
+    Enum.each(outstanding, fn {_ref, {_handle, _event, pid}} -> Process.exit(pid, :kill) end)
+
+    await_replies(
+      outstanding,
+      {suspended, crashed, delivered},
+      {:draining, deadline_in(broadcast_reply_grace())}
+    )
+  end
+
+  # An untrappable kill always produces a DOWN, so draining normally ends by emptying
+  # `outstanding` through the receive above. Classifying here rather than looping is what makes
+  # "this function always returns" true of the code and not just of the docstring.
+  defp handle_deadline({:draining, _}, outstanding, {suspended, crashed, delivered}) do
+    Logger.error(
+      "#{map_size(outstanding)} killed consumer(s) never reported DOWN; " <>
+        "classifying them as unresponsive"
+    )
+
+    crashed =
+      Enum.reduce(outstanding, crashed, fn {ref, {handle, _event, _pid}}, acc ->
+        Process.demonitor(ref, [:flush])
+        Map.put(acc, handle, down_reason(:killed, true))
+      end)
+
+    {suspended, crashed, delivered}
+  end
+
+  # A plain :killed after our own kill escalation is that kill coming back. Report
+  # it as a distinguishable crash: downstream, the ShapeLogCollector classifies
+  # bare :killed with supervisor teardowns (entry left pinned, no invalidation),
+  # which would contradict the escalation's whole point — an unresponsive writer's
+  # shape must be invalidated now, not pinned until the stall check fires.
+  defp down_reason(:killed, true), do: {:killed, :broadcast_unresponsive}
+  defp down_reason(reason, _force_killed?), do: reason
 
   @doc """
   Dynamically (re-)enable consumer suspension on all running consumers.

@@ -3,6 +3,7 @@ defmodule Electric.AsyncDeleterTest do
   import Support.ComponentSetup
 
   alias Electric.AsyncDeleter
+  require Repatch
   @moduletag :tmp_dir
 
   # Use a very short interval to keep tests fast
@@ -42,10 +43,12 @@ defmodule Electric.AsyncDeleterTest do
   end
 
   setup ctx do
-    start_link_supervised!(
-      {AsyncDeleter,
-       stack_id: ctx.stack_id, storage_dir: ctx.tmp_dir, cleanup_interval_ms: @interval}
-    )
+    unless ctx[:blocked_trash_dir] do
+      start_link_supervised!(
+        {AsyncDeleter,
+         stack_id: ctx.stack_id, storage_dir: ctx.tmp_dir, cleanup_interval_ms: @interval}
+      )
+    end
 
     :ok
   end
@@ -151,7 +154,124 @@ defmodule Electric.AsyncDeleterTest do
     assert_dir_empty(trash_dir)
   end
 
-  defp assert_dir_empty(dir, timeout \\ 500) do
+  # A trash directory that cannot be created is the shape a full volume takes: this process is the
+  # only thing that empties the trash, so crashing on it means the disk never gets reclaimed and the
+  # stack supervisor goes down with us. Blocking the path with a regular file reproduces that
+  # without needing a real ENOSPC, and it fails for root too, unlike a permissions-based fixture.
+  @tag blocked_trash_dir: true
+  test "starts idle when the trash directory cannot be created", %{
+    stack_id: stack_id,
+    tmp_dir: base,
+    trash_dir: trash_dir
+  } do
+    File.mkdir_p!(Path.dirname(Path.dirname(trash_dir)))
+    File.write!(Path.dirname(trash_dir), "not a directory")
+
+    pid =
+      start_link_supervised!(
+        {AsyncDeleter, stack_id: stack_id, storage_dir: base, cleanup_interval_ms: @interval}
+      )
+
+    assert Process.alive?(pid)
+
+    # And it refuses the delete out loud rather than reporting the untouched path as reclaimed.
+    dir = create_temp_dir(%{tmp_dir: base}, "unreclaimable")
+    assert {:error, _reason} = AsyncDeleter.delete(stack_id, dir)
+    assert File.exists?(dir)
+  end
+
+  test "recreates a trash directory that went missing instead of dropping the delete", %{
+    stack_id: stack_id,
+    tmp_dir: base,
+    trash_dir: trash_dir
+  } do
+    dir = create_temp_dir(%{tmp_dir: base}, "to_delete")
+    create_temp_file(dir, "f.txt")
+    File.rm_rf!(trash_dir)
+
+    assert :ok = AsyncDeleter.delete(stack_id, dir)
+
+    refute File.exists?(dir)
+    assert_dir_empty(trash_dir)
+  end
+
+  describe "a path on another filesystem than the stack's trash" do
+    test "goes to a trash in its root", %{stack_id: stack_id, tmp_dir: base, trash_dir: trash_dir} do
+      root = create_temp_dir(%{tmp_dir: base}, "store")
+      dir = create_temp_dir(%{tmp_dir: root}, "ab/cd/shape")
+      create_temp_file(dir, "f.txt")
+      refuse_renames_into(trash_dir, :exdev)
+
+      assert :ok = AsyncDeleter.delete(stack_id, dir, root)
+
+      assert File.ls!(Path.join(root, "ab/cd")) == []
+      assert_dir_empty(Path.join(root, ".electric_trash"))
+    end
+
+    test "gives its entries to a trash in it when it is the root", %{
+      stack_id: stack_id,
+      tmp_dir: base,
+      trash_dir: trash_dir
+    } do
+      root = create_temp_dir(%{tmp_dir: base}, "store")
+      create_temp_file(root, "f.txt")
+      create_temp_file(create_temp_dir(%{tmp_dir: root}, "ab/cd/shape"), "g.txt")
+      refuse_renames_into(trash_dir, :ebusy)
+
+      assert :ok = AsyncDeleter.delete(stack_id, root, root)
+
+      assert File.ls!(root) == [".electric_trash"]
+      assert_dir_empty(Path.join(root, ".electric_trash"))
+    end
+
+    test "goes to a trash in its root once a recreated trash cannot take it either", %{
+      stack_id: stack_id,
+      tmp_dir: base,
+      trash_dir: trash_dir
+    } do
+      root = create_temp_dir(%{tmp_dir: base}, "store")
+      dir = create_temp_dir(%{tmp_dir: root}, "shape")
+      File.rm_rf!(trash_dir)
+      refuse_renames_into(trash_dir, :exdev)
+
+      assert :ok = AsyncDeleter.delete(stack_id, dir, root)
+
+      refute File.exists?(dir)
+      assert File.dir?(trash_dir)
+      assert_dir_empty(Path.join(root, ".electric_trash"))
+    end
+
+    test "stays in place without a root", %{
+      stack_id: stack_id,
+      tmp_dir: base,
+      trash_dir: trash_dir
+    } do
+      dir = create_temp_dir(%{tmp_dir: base}, "shape")
+      refuse_renames_into(trash_dir, :exdev)
+
+      assert {:error, :exdev} = AsyncDeleter.delete(stack_id, dir)
+      assert File.dir?(dir)
+    end
+  end
+
+  # A volume mounted for the shapes under the storage directory: a rename into the stack's trash
+  # crosses filesystems. Into a trash that is missing it fails on the missing directory first.
+  defp refuse_renames_into(trash_dir, reason) do
+    Repatch.patch(AsyncDeleter, :do_rename, fn path, dir, attempts ->
+      cond do
+        dir != trash_dir ->
+          Repatch.real(Repatch.private(AsyncDeleter.do_rename(path, dir, attempts)))
+
+        File.dir?(dir) ->
+          {:error, reason}
+
+        true ->
+          {:error, :enoent}
+      end
+    end)
+  end
+
+  defp assert_dir_empty(dir, timeout \\ ExUnit.configuration()[:assert_receive_timeout]) do
     assert File.ls!(dir) == []
   rescue
     e in ExUnit.AssertionError ->

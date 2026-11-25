@@ -100,6 +100,10 @@ defmodule Electric.Connection.Manager do
       :pg_system_identifier,
       # PostgreSQL timeline ID
       :pg_timeline_id,
+      # History of the connected timeline and the journal Electric keeps, read to tell a
+      # promotion from a rewind when the timeline changed. Nil unless the replication client
+      # read the history on this connection.
+      :pg_timeline_history,
       # User setting that determines whether the table publishing is to be automatically
       # managed by the stack or whether it's the user's responsibility.
       :manual_table_publishing?,
@@ -112,6 +116,17 @@ defmodule Electric.Connection.Manager do
       :max_shapes,
       :persistent_kv,
       purge_all_shapes?: false,
+      # Set once the shape metadata was unloaded for a purge, at the refresh, after a write of the
+      # owed purge that failed, or as a purge starts, until the purge empties the catalog or a
+      # refresh loads it again: see `check_timeline/1`.
+      catalog_unloaded?: false,
+      # Set when a write of the owed purge failed: a retry whose check reads it as written writes
+      # it again before any purge step.
+      purge_marker_owed?: false,
+      # Set when a new slot was created over a timeline record, stored or unreadable, or the
+      # status monitor holds such a slot's purge, until the purge runs: a check that finds the
+      # record gone then owes the purge (see `check_opts/1`). A first start has none.
+      new_slot_purge_owed?: false,
       # Optional guard callback for the lock breaker. When set, the lock breaker
       # will only run if this callback returns true. Used by cloud-sync-service to
       # prevent non-owner instances from terminating backends during rolling deployments.
@@ -120,6 +135,7 @@ defmodule Electric.Connection.Manager do
       pool_pids: %{admin: nil, snapshot: nil},
       validated_connection_opts: %{replication: nil, pool: nil},
       drop_slot_requested: false,
+      drop_publication_on_stop?: false,
       connection_status_check_interval: nil,
       slot_unblock_notice_sent: false
     ]
@@ -129,6 +145,8 @@ defmodule Electric.Connection.Manager do
   alias Electric.Connection.Manager.ConnectionBackoff
   alias Electric.Connection.Manager.ConnectionResolver
   alias Electric.DbConnectionError
+  alias Electric.Postgres.ReplicationClient.SlotIncarnation
+  alias Electric.Replication.LogOffset
   alias Electric.StatusMonitor
 
   require Logger
@@ -226,6 +244,10 @@ defmodule Electric.Connection.Manager do
     GenServer.cast(manager, {:pg_system_identified, system_info})
   end
 
+  def pg_timeline_history_obtained(manager, history) do
+    GenServer.cast(manager, {:pg_timeline_history_obtained, history})
+  end
+
   def pg_info_obtained(manager, pg_info) do
     GenServer.cast(manager, {:pg_info_obtained, pg_info})
   end
@@ -302,6 +324,7 @@ defmodule Electric.Connection.Manager do
         tweaks: Keyword.fetch!(opts, :tweaks),
         persistent_kv: Keyword.fetch!(opts, :persistent_kv),
         manual_table_publishing?: Keyword.get(opts, :manual_table_publishing?, false),
+        drop_publication_on_stop?: Keyword.get(opts, :drop_publication_on_stop?, false),
         max_shapes: Keyword.fetch!(opts, :max_shapes),
         lock_breaker_guard: Keyword.get(opts, :lock_breaker_guard),
         connection_status_check_interval:
@@ -354,7 +377,10 @@ defmodule Electric.Connection.Manager do
       {:ok, replication_connection_opts, state} ->
         opts = [
           replication_opts:
-            Keyword.put(state.replication_opts, :connection_opts, replication_connection_opts),
+            Keyword.merge(state.replication_opts,
+              connection_opts: replication_connection_opts,
+              manual_table_publishing?: state.manual_table_publishing?
+            ),
           connection_manager: self(),
           stack_id: state.stack_id
         ]
@@ -449,43 +475,152 @@ defmodule Electric.Connection.Manager do
           current_step: :start_shapes_supervisor
         } = state
       ) do
+    # The slot's record survives a stack restart before the timeline marker is written.
+    slot_purge = SlotIncarnation.shape_purge(state.persistent_kv, state.stack_id)
+
+    new_slot_purge_owed? =
+      state.new_slot_purge_owed? or StatusMonitor.new_slot_purge_owed?(state.stack_id) or
+        slot_purge == :required
+
+    state = %{
+      state
+      | purge_all_shapes?:
+          state.purge_all_shapes? or new_slot_purge_owed? or not is_nil(slot_purge),
+        new_slot_purge_owed?: new_slot_purge_owed?
+    }
+
     # Checking the timeline continuity to see if we need to purge all shapes persisted so far
     # and reset any replication related persistent state
-    timeline_check =
-      Electric.Timeline.check(
-        {state.pg_system_identifier, state.pg_timeline_id},
-        state.timeline_opts
-      )
+    {timeline_check, state} = check_timeline(state)
+
+    # A check that could not store what it found purges nothing: with no purge owed on disk, a
+    # restart in the middle of one keeps what it left. It is retried after a pause like a step.
+    # A change it found stops the old timeline's shapes from being served meanwhile, and the
+    # retry checks again before it purges them or loads them back.
+    {timeline_check, stored} =
+      case timeline_check do
+        {:error, result, reason} -> {result, {:error, reason}}
+        result -> {result, :ok}
+      end
+
+    state =
+      cond do
+        stored == :ok ->
+          %{state | purge_marker_owed?: false}
+
+        timeline_check == :timeline_changed ->
+          stop_shapes_subsystem(state)
+          :ok = Electric.ShapeCache.ShapeStatus.unload(state.stack_id)
+          %{state | catalog_unloaded?: true, purge_marker_owed?: true}
+
+        true ->
+          state
+      end
 
     timeline_changed? = timeline_check == :timeline_changed
     initializing? = timeline_check == :no_previous_timeline
 
-    if timeline_changed? or (state.purge_all_shapes? and not initializing?) do
-      # Reset the Shape Subsystem:
+    # A first start keeps what the catalog holds, as upstream's does, and the check found it from
+    # its own read of the record: the retry of a write whose rename landed finds the record it
+    # wrote, unchanged, and must keep it too. A slot that owes a purge never gets here, as its
+    # check owes the purge of a missing record.
+    state = if initializing?, do: %{state | purge_all_shapes?: false}, else: state
 
-      # Stop the shapes supervisor if it's running before resetting storage
-      Electric.CoreSupervisor.stop_shapes_supervisor(stack_id: state.stack_id)
+    {purged, state} =
+      if stored == :ok and
+           (timeline_changed? or (state.purge_all_shapes? and not initializing?)) do
+        # Reset the Shape Subsystem:
 
-      # Clean up the on-disk storage from all shapes.
-      Electric.Shapes.Supervisor.reset_storage(shape_cache_opts: state.shape_cache_opts)
+        # Stop the shapes supervisor if it's running before resetting storage
+        :ok = close_shapes_for_purge(state)
+        Electric.CoreSupervisor.stop_shapes_supervisor(stack_id: state.stack_id)
 
-      # The ShapeStatusOwner process lives independently of connection or replication
-      # supervisor. Purge all shapes from it before starting the replication supervisor.
-      Electric.ShapeCache.ShapeStatus.reset(state.stack_id)
+        # The catalog reset clears the shape metadata first. A step that fails leaves the
+        # catalog's rows to purge again, and a retry that finds the record gone takes that for a
+        # purge owed, not for a first start.
+        state = %{state | catalog_unloaded?: true}
 
-      # Whenever we purge shapes - whether due to a timeline change or because the
-      # replication slot was (re)created (e.g. a temporary slot after restart) - the WAL
-      # continuity that the persisted replication metadata describes is gone. Reset those
-      # caches so we don't read stale relation tracking / inspector state on startup; they
-      # get repopulated from the fresh replication stream and live Postgres.
-      Electric.Replication.PersistentReplicationState.reset(
-        stack_id: state.stack_id,
-        persistent_kv: state.persistent_kv
-      )
+        # The ShapeStatusOwner process lives independently of connection or replication
+        # supervisor. Purge all shapes from it before starting the replication supervisor.
+        # It goes before the storage cleanup: a read-only request serves a shape it still holds,
+        # and a cleanup that fails leaves the files on disk until the purge is retried. A catalog
+        # whose reset fails no longer serves its shapes either, and the cleanup still runs: on a
+        # full disk, the space it frees is what the retry needs.
+        catalog_reset = Electric.ShapeCache.ShapeStatus.reset(state.stack_id)
 
-      Electric.Postgres.Inspector.reset(state.inspector)
+        # The broadcast watermark lives in the same surviving table and only ever
+        # advances; after a purge the positions it records may exceed the new timeline's
+        # WAL, so it must be discarded with the shapes whose fan-out it described.
+        Electric.LsnTracker.reset_last_broadcast_lsn(state.stack_id)
+        # What the drops of the watermark took away bounded the promotion check, which the
+        # record now owes a purge for: a later check measures another stream.
+        Electric.LsnTracker.forget_dropped_high_water(state.stack_id)
+
+        # Clean up the on-disk storage from all shapes.
+        with :ok <-
+               Electric.Shapes.Supervisor.reset_storage(shape_cache_opts: state.shape_cache_opts),
+             :ok <- catalog_reset,
+             # Whenever we purge shapes - whether due to a timeline change or because the
+             # replication slot was (re)created (e.g. a temporary slot after restart) - the WAL
+             # continuity that the persisted replication metadata describes is gone. Reset those
+             # caches so we don't read stale relation tracking / inspector state on startup; they
+             # get repopulated from the fresh replication stream and live Postgres.
+             :ok <- reset_replication_state(state),
+             :ok <- Electric.Postgres.Inspector.reset(state.inspector),
+             :ok <- clear_slot_purge(state) do
+          # The catalog holds no shape now, so a retry after a failed write below takes what its
+          # check finds: a write whose rename landed leaves nothing owed to purge again, for a new
+          # slot too.
+          :ok = StatusMonitor.owe_new_slot_purge(state.stack_id, false)
+
+          state = %{
+            state
+            | catalog_unloaded?: false,
+              purge_all_shapes?: false,
+              new_slot_purge_owed?: false
+          }
+
+          # Timeline.check left the purge owed in the stored record, so that a restart anywhere
+          # above, or the retry below, purges again. The shapes of the old timeline are gone now.
+          if timeline_changed? do
+            {Electric.Timeline.store_timeline(
+               {state.pg_system_identifier, state.pg_timeline_id},
+               state.timeline_opts
+             ), state}
+          else
+            {:ok, state}
+          end
+        else
+          error -> {error, state}
+        end
+      else
+        {stored, state}
+      end
+
+    # A step that reports a failure leaves the purge owed and the new timeline unstored: going on
+    # would store it over what the step left behind. The step is retried after a pause, where a
+    # restart of the manager would retry at once and use up its supervisors' restart budget.
+    case purged do
+      :ok ->
+        :ok = reopen_closed_shapes(state)
+        handle_continue({:start_shapes_supervisor, timeline_changed?}, state)
+
+      error ->
+        Logger.error(
+          "Failed to check the timeline or purge the shapes, retrying: #{inspect(error)}"
+        )
+
+        {:noreply, schedule_reconnection(:start_shapes_supervisor, state)}
     end
+  end
 
+  def handle_continue(
+        {:start_shapes_supervisor, timeline_changed?},
+        %State{
+          current_phase: :connection_setup,
+          current_step: :start_shapes_supervisor
+        } = state
+      ) do
     if timeline_changed? do
       dispatch_stack_event(
         {:warning,
@@ -508,10 +643,11 @@ defmodule Electric.Connection.Manager do
       tweaks: state.tweaks,
       manual_table_publishing?: state.manual_table_publishing?,
       persistent_kv: state.persistent_kv,
+      database_timeline: [state.pg_system_identifier, state.pg_timeline_id],
       max_shapes: state.max_shapes
     ]
 
-    case Electric.CoreSupervisor.start_shapes_supervisor(repl_sup_opts) do
+    case start_shapes_supervisor(repl_sup_opts, state) do
       {:ok, _pid} ->
         :ok
 
@@ -530,7 +666,9 @@ defmodule Electric.Connection.Manager do
     state = %{
       state
       | current_step: {:start_replication_client, :start_streaming},
-        purge_all_shapes?: false
+        purge_all_shapes?: false,
+        new_slot_purge_owed?: false,
+        catalog_unloaded?: false
     }
 
     {:noreply, state, {:continue, :start_streaming}}
@@ -784,12 +922,26 @@ defmodule Electric.Connection.Manager do
 
     # Refresh shape metadata now that the lock is acquired and storage is
     # entirely within this service's control
-    :ok = Electric.ShapeCache.ShapeStatusOwner.refresh(state.stack_id)
+    catalog_unloaded? =
+      case Electric.ShapeCache.ShapeStatusOwner.refresh(state.stack_id) do
+        :ok ->
+          state.catalog_unloaded?
+
+        # A shape subsystem still running from before this manager's restart reads the metadata:
+        # a relation tracker that folded it as it was cleared took the retained shapes' tables
+        # out of the publication. It is stopped first, and starts again from what the check loads
+        # or purges.
+        :purge_owed ->
+          stop_shapes_subsystem(state)
+          :ok = Electric.ShapeCache.ShapeStatus.unload(state.stack_id)
+          true
+      end
 
     state = %{
       state
       | replication_configuration_timer: tref,
-        current_step: {:start_replication_client, :configuring_connection}
+        current_step: {:start_replication_client, :configuring_connection},
+        catalog_unloaded?: catalog_unloaded?
     }
 
     {:noreply, state}
@@ -804,7 +956,27 @@ defmodule Electric.Connection.Manager do
       ) do
     # When the replication slot is created for the first time or recreated at any point, we
     # must invalidate all shapes to ensure transactional continuity and prevent missed changes.
-    {:noreply, %{state | purge_all_shapes?: true}}
+    #
+    # The slot record already carries the decision across a stack restart. Where the timeline
+    # is readable, record the purge there too. Otherwise the check decides from its own read:
+    # even a record that reads as missing here can be present by the check. A first-ever boot
+    # keeps the catalog when the check finds no previous timeline.
+    slot_owes_purge? = Electric.Timeline.load_timeline(state.timeline_opts) != nil
+    if slot_owes_purge?, do: :ok = StatusMonitor.owe_new_slot_purge(state.stack_id, true)
+
+    if slot_recreated_after_prior_timeline?(state) do
+      Electric.Timeline.store_irrecoverable_timeline(
+        state.pg_system_identifier,
+        state.timeline_opts
+      )
+    end
+
+    {:noreply,
+     %{
+       state
+       | purge_all_shapes?: true,
+         new_slot_purge_owed?: state.new_slot_purge_owed? or slot_owes_purge?
+     }}
   end
 
   def handle_cast(
@@ -888,8 +1060,13 @@ defmodule Electric.Connection.Manager do
      %{
        state
        | pg_system_identifier: info.system_identifier,
-         pg_timeline_id: info.timeline_id
+         pg_timeline_id: info.timeline_id,
+         pg_timeline_history: nil
      }}
+  end
+
+  def handle_cast({:pg_timeline_history_obtained, history}, state) do
+    {:noreply, %{state | pg_timeline_history: history}}
   end
 
   def handle_cast({:pg_info_obtained, info}, state) do
@@ -939,6 +1116,13 @@ defmodule Electric.Connection.Manager do
     with {snapshot_pool_pid, _} when is_pid(snapshot_pool_pid) <- snapshot_pool,
          do: shutdown_child(snapshot_pool_pid, :shutdown)
 
+    # The next holder of the lock validates the shape catalog as it finds it, and removes a shape
+    # whose snapshot-complete mark is still queued in this instance's write buffer. So the queued
+    # writes are drained while the lock is held, as far as the drain's window allows. On a stop,
+    # the shape subsystem has stopped by now; a shape cleanup task still running can queue a
+    # removal after the drain.
+    if holds_replication_lock?(state), do: drain_shape_catalog(state.stack_id)
+
     # drop publication before replication client so that we ensure anyone
     # acquiring the lock next will recreate the replication slot
     if state.drop_slot_requested, do: drop_publication(state)
@@ -960,11 +1144,59 @@ defmodule Electric.Connection.Manager do
 
     if state.drop_slot_requested, do: drop_slot(state)
 
+    # A generated publication belongs only to this stack. Stop replication before dropping it
+    # so a stack stopped during setup can't create it after the DROP.
+    if state.drop_publication_on_stop? and not state.drop_slot_requested and
+         reason in [:normal, :shutdown] do
+      drop_publication(state)
+    end
+
     # kill the admin pool last as it is used to perform cleanup operations
     with {admin_pool_pid, _} when is_pid(admin_pool_pid) <- admin_pool,
          do: shutdown_child(admin_pool_pid, :shutdown)
 
     {:stop, reason, state}
+  end
+
+  # The replication client takes the lock once it has connected, and holds it from the step after
+  # `:acquiring_lock` until it exits or Postgres ends its session. Until streaming starts its slot
+  # is inactive, and an instance waiting for the lock terminates the backend of such a holder (see
+  # `lock_breaker_query/3`): a drain then commits after the lock has gone, as it would without one.
+  # A client that went idle drained before it disconnected, and its pid stays in the state: the
+  # lock went with it, so a drain would only hold the stop up.
+  defp holds_replication_lock?(%State{replication_client_pid: pid}) when not is_pid(pid),
+    do: false
+
+  defp holds_replication_lock?(%State{current_step: {:start_replication_client, step}})
+       when step in [nil, :connecting, :acquiring_lock],
+       do: false
+
+  defp holds_replication_lock?(%State{replication_client_pid: pid}), do: Process.alive?(pid)
+
+  @doc """
+  Commits the shape catalog's queued writes before the replication lock goes. It logs what it
+  could not commit, and never raises: the lock's holder goes on releasing it.
+  """
+  def drain_shape_catalog(stack_id) do
+    case Electric.ShapeCache.ShapeStatus.ShapeDb.WriteBuffer.drain(stack_id) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "Releasing the replication lock with shape catalog writes still queued: " <>
+            inspect(reason)
+        )
+    end
+  catch
+    :exit, {:noproc, _} ->
+      :ok
+
+    kind, reason ->
+      Logger.warning(
+        "Releasing the replication lock without committing the queued shape catalog writes: " <>
+          Exception.format_banner(kind, reason)
+      )
   end
 
   defp shutdown_child(pid, reason, timeout \\ 5000)
@@ -1100,6 +1332,75 @@ defmodule Electric.Connection.Manager do
 
   defp pg_error_extra_info(_), do: ""
 
+  defp promotion_evidence(%State{pg_timeline_history: nil}), do: nil
+
+  defp promotion_evidence(%State{pg_timeline_history: %{} = timeline_history} = state) do
+    %{
+      history: timeline_history.history,
+      processed_lsn: fn -> processed_lsn(state.stack_id, timeline_history.journal_base_path) end
+    }
+  end
+
+  # The highest LSN Electric may have taken from the replication stream, wherever a trace of it
+  # survives: the shape logs hold what they keep across a restart, the journal everything
+  # dispatched to them, and the collector, the LSN tracker and the keepalive watermark what this
+  # boot took in memory, with what a replay or a journal tail took off that watermark.
+  @doc false
+  @spec processed_lsn(Electric.stack_id(), String.t() | nil) ::
+          {:ok, non_neg_integer()} | {:error, String.t()}
+  def processed_lsn(_stack_id, nil),
+    do:
+      {:error,
+       "keeping shapes across a promotion needs the transaction journal (ELECTRIC_ACK_AFTER_JOURNAL)"}
+
+  def processed_lsn(stack_id, base_path) do
+    with journal_high_water when is_integer(journal_high_water) <-
+           Electric.Replication.TxnJournal.high_water(base_path),
+         {:ok, collector_offset} <-
+           Electric.Replication.ShapeLogCollector.last_processed_offset(stack_id) do
+      {:ok,
+       [
+         Electric.ShapeCache.PureFileStorage.stored_high_water(base_path,
+           root_names: Electric.Replication.TxnJournal.base_path_names()
+         ),
+         journal_high_water,
+         collector_offset && collector_offset.tx_offset,
+         lsn_to_integer(Electric.LsnTracker.get_last_processed_lsn(stack_id)),
+         # Keepalive positions are exclusive: a commit record starting there was not taken.
+         # Read before what the drops took away: a drop records that before it takes the
+         # watermark, so one of the two reads finds it.
+         Electric.LsnTracker.get_last_broadcast_lsn(stack_id) - 1,
+         Electric.LsnTracker.dropped_high_water(stack_id)
+       ]
+       |> Enum.filter(&(is_integer(&1) and &1 >= 0))
+       |> Enum.max()}
+    else
+      # A run without the journal served clients transactions the shape logs had not kept yet.
+      nil ->
+        {:error,
+         "the transaction journal holds nothing yet, so it does not bound what clients read before it"}
+
+      {:error, reason} ->
+        {:error, "the shape log collector did not answer (#{inspect(reason)})"}
+    end
+  rescue
+    error ->
+      {:error,
+       "the shape logs or the transaction journal are unreadable (#{Exception.message(error)})"}
+  end
+
+  defp lsn_to_integer(nil), do: nil
+  defp lsn_to_integer(lsn), do: Electric.Postgres.Lsn.to_integer(lsn)
+
+  # A stored timeline means a slot existed on a previous boot, so recreating it now stranded the
+  # shapes built against the old one. A first-ever boot has no stored timeline (nil) and nothing
+  # to purge. An :unreadable one is left to the check, which writes the purge before it runs it if
+  # the record reads again by then (`owe_purge_for_new_slot/2`).
+  defp slot_recreated_after_prior_timeline?(%State{pg_system_identifier: nil}), do: false
+
+  defp slot_recreated_after_prior_timeline?(%State{timeline_opts: timeline_opts}),
+    do: match?({_, _}, Electric.Timeline.load_timeline(timeline_opts))
+
   defp drop_slot_and_restart(%DbConnectionError{drop_slot_and_restart?: true} = error, state) do
     Logger.warning(error.message)
 
@@ -1126,6 +1427,55 @@ defmodule Electric.Connection.Manager do
 
   defp drop_slot_and_restart(_, _), do: false
 
+  # A shape subsystem that outlived the replication client also outlived what that client held
+  # in memory. In journal mode the client acks the slot once a transaction is journaled, before
+  # the collector has it, so the transactions still queued for the collector died with the
+  # client and Postgres will not resend them. Only the collector's boot replay reads them back:
+  # the shape subsystem restarts on the storage it has, as after a crash, before the new client
+  # streams. With nothing journaled past the collector, the running subsystem is kept.
+  #
+  # A replay from the slot that a stop requested is taken by the subsystem that starts next
+  # (`Electric.Shapes.Supervisor.start_link/1`).
+  defp start_shapes_supervisor(repl_sup_opts, state) do
+    with {:error, {:already_started, _pid}} = already_started <-
+           Electric.CoreSupervisor.start_shapes_supervisor(repl_sup_opts) do
+      if journal_tail_undelivered?(state.stack_id) do
+        Logger.notice(
+          "Restarting the shape subsystem to replay the journaled transactions " <>
+            "the shape log collector had not processed when replication stopped"
+        )
+
+        Electric.CoreSupervisor.stop_shapes_supervisor(stack_id: state.stack_id)
+        Electric.CoreSupervisor.start_shapes_supervisor(repl_sup_opts)
+      else
+        already_started
+      end
+    end
+  end
+
+  # A journal that cannot be read, or a collector that does not answer, cannot show the tail was
+  # delivered. The restarted collector then reports a broken journal itself.
+  defp journal_tail_undelivered?(stack_id) do
+    with {Electric.ShapeCache.PureFileStorage, %{base_path: base_path}} <-
+           Electric.StackConfig.lookup(stack_id, Electric.ShapeCache.Storage),
+         {:ok, %LogOffset{} = journaled} <- last_journaled_commit(base_path) do
+      case Electric.Replication.ShapeLogCollector.last_processed_offset(stack_id) do
+        {:ok, %LogOffset{} = processed} -> LogOffset.compare(journaled, processed) == :gt
+        _nothing_or_no_answer -> true
+      end
+    else
+      {:error, :unreadable} -> true
+      _no_journaled_commit -> false
+    end
+  end
+
+  defp last_journaled_commit(base_path) do
+    gens = Electric.Replication.TxnJournal.list_generations(base_path)
+    {:ok, Electric.Replication.TxnJournal.last_commit_log_offset(base_path, gens)}
+  rescue
+    _error -> {:error, :unreadable}
+  end
+
   defp stop_if_fatal_error(error, state) do
     if error.retry_may_fix? do
       false
@@ -1151,6 +1501,120 @@ defmodule Electric.Connection.Manager do
     Task.start(Electric.Connection.Supervisor, :shutdown, [state.stack_id, error])
 
     {:noreply, state}
+  end
+
+  # A shape subsystem stopped while its shapes may be kept starts again as after a restart of the
+  # stack, from where the replication slot resumes: a writer stopped at its shutdown deadline can
+  # lose transactions the collector took, which Postgres resends from the slot.
+  defp stop_shapes_subsystem(%State{stack_id: stack_id} = state) do
+    :ok = close_shapes_for_purge(state)
+    :ok = Electric.LsnTracker.request_replay_from_slot(stack_id)
+    Electric.CoreSupervisor.stop_shapes_supervisor(stack_id: stack_id)
+  end
+
+  # The metadata a purge may remove is not served from the stop of the shape subsystem on: the
+  # stack went read-only as the collector stopped, and served the shapes it still had loaded.
+  # It opens again once a timeline check finds nothing owed, or the purge ends and stores the
+  # timeline. A refresh that loads the metadata does not open it: a manager that takes over
+  # refreshes before its check, and the record it reads may lack the purge the one before found
+  # owed and failed to write.
+  defp close_shapes_for_purge(%State{stack_id: stack_id}) do
+    Electric.StatusMonitor.close_shape_metadata(stack_id, "a purge of every shape is owed")
+  end
+
+  defp reopen_closed_shapes(%State{stack_id: stack_id}) do
+    case GenServer.whereis(Electric.ShapeCache.ShapeStatusOwner.name(stack_id)) do
+      pid when is_pid(pid) -> Electric.StatusMonitor.reopen_shape_metadata(stack_id, pid)
+      nil -> :ok
+    end
+  end
+
+  # The filesystem backend raises when it cannot create the directory or sync it after the
+  # rename, which restarted the manager at once instead of retrying the purge after a pause.
+  defp reset_replication_state(%State{} = state) do
+    Electric.Replication.PersistentReplicationState.reset(
+      stack_id: state.stack_id,
+      persistent_kv: state.persistent_kv
+    )
+  rescue
+    error in File.Error -> {:error, error}
+  end
+
+  # The timeline check, with what this manager knows beyond the record. Each decision is taken on
+  # the one read of the record the check makes: a read before it could fail where the check's own
+  # read did not, or the other way round.
+  defp check_timeline(%State{} = state) do
+    {state.pg_system_identifier, state.pg_timeline_id}
+    |> Electric.Timeline.check(check_opts(state), promotion_evidence(state))
+    |> owe_purge_for_new_slot(state)
+    |> reload_unloaded_catalog(state)
+  end
+
+  # A write of the owed purge that failed can have landed and not be durable, and the check took
+  # a marker it read as written. A record that went missing says nothing of the shapes the
+  # unloaded metadata left in the catalog, and the check stored the connected timeline over it,
+  # before any purge. Serving closed for a purge says the same of a manager that died before it
+  # purged: the close outlives it, and an owner of the metadata restarted since, as much as the
+  # manager that takes over, loaded the catalog again. A new slot created over a record, stored
+  # or unreadable, owes the purge of the shapes from before it, and a read that failed once can
+  # find no record by the check. A change closes serving before the check writes the purge it
+  # owes.
+  defp check_opts(%State{} = state) do
+    state.timeline_opts
+    |> Keyword.put(:before_owing_purge, fn -> :ok = close_shapes_for_purge(state) end)
+    # A first boot keeps its catalog. Clear the conditional purge before storing the first
+    # timeline, so a restart after that write does not mistake that boot for a replacement.
+    |> Keyword.put(:before_initializing, fn -> clear_slot_purge(state) end)
+    |> Keyword.put(:rewrite_owed_purge?, state.purge_marker_owed?)
+    |> Keyword.put(
+      :missing_owes_purge?,
+      state.catalog_unloaded? or state.new_slot_purge_owed? or
+        Electric.StatusMonitor.shape_metadata_closed?(state.stack_id)
+    )
+  end
+
+  defp clear_slot_purge(%State{} = state) do
+    SlotIncarnation.clear_shape_purge(state.persistent_kv, state.stack_id)
+  end
+
+  # A slot created over an earlier one's shapes owes their purge. The slot's cast writes it when
+  # it finds a stored timeline, but not over a record it could not read, which the check can then
+  # read as no change: the purge ran with nothing owed on disk, and a restart in its middle found
+  # the slot and the timeline it needs and kept catalog rows whose logs were gone.
+  #
+  # A slot created while the timeline read as missing owes the purge once the check finds it.
+  # The slot record carries that conditional obligation until the check or the purge clears it.
+  defp owe_purge_for_new_slot(result, %State{purge_all_shapes?: true} = state)
+       when result in [:ok, :timeline_continued] do
+    :ok = StatusMonitor.owe_new_slot_purge(state.stack_id, true)
+    store_purge_marker(state)
+  end
+
+  defp owe_purge_for_new_slot(result, _state), do: result
+
+  # Shape metadata unloaded for a record that could not be read, or for a write of the owed purge
+  # that failed, is loaded again once the check finds no purge owed: a read that failed once cost
+  # a purge of every shape, and a continued timeline the stream it kept. The owner reads the
+  # record again, and the purge is owed if it still cannot.
+  defp reload_unloaded_catalog(result, %State{catalog_unloaded?: true} = state)
+       when result in [:ok, :timeline_continued] do
+    case Electric.ShapeCache.ShapeStatusOwner.refresh(state.stack_id) do
+      :ok -> {result, %{state | catalog_unloaded?: false}}
+      :purge_owed -> {store_purge_marker(state), state}
+    end
+  end
+
+  defp reload_unloaded_catalog(result, state), do: {result, state}
+
+  # Written whatever the record holds: a marker whose rename landed and whose directory sync
+  # failed is not durable until a write of it succeeds. Serving closes first, as for the check's.
+  defp store_purge_marker(%State{} = state) do
+    :ok = close_shapes_for_purge(state)
+
+    case Electric.Timeline.store_timeline({state.pg_system_identifier, -1}, state.timeline_opts) do
+      :ok -> :timeline_changed
+      {:error, reason} -> {:error, :timeline_changed, reason}
+    end
   end
 
   defp schedule_reconnection(

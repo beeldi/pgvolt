@@ -26,11 +26,18 @@ defmodule Electric.AsyncDeleter do
     timer_ref: nil,
     cleanup_task: nil,
     pending: [],
-    in_progress: []
+    in_progress: [],
+    root_trash_dirs: MapSet.new()
   ]
 
   @trash_dir_base ".electric_trash"
   @default_cleanup_interval_ms 10_000
+
+  # The stack's trash sits on the storage directory's filesystem, and a rename does not cross
+  # filesystems: with a volume mounted for the shapes under the storage directory, every delete of
+  # a shape and the purge of the store failed with :exdev, or with :ebusy for a store root that is
+  # the mount point itself, and left their files in place.
+  @cross_filesystem [:exdev, :ebusy]
 
   def name(stack_id), do: Electric.ProcessRegistry.name(stack_id, __MODULE__)
 
@@ -45,9 +52,14 @@ defmodule Electric.AsyncDeleter do
   @doc """
   Deletes the given directory by first renaming it into the stack's trash directory
   then asynchronously removing the trash entry using rm -rf.
+
+  `root` is a directory on the path's own filesystem that holds the path, or is the path. A path
+  the stack's trash cannot take because it is on another filesystem goes to a trash in `root`
+  instead, which the cleanup empties too; a `root` deleted whole keeps its place and gives that
+  trash its entries.
   """
-  @spec delete(Electric.stack_id(), Path.t()) :: :ok | {:error, term()}
-  def delete(stack_id, path) when is_stack_id(stack_id) and is_binary(path) do
+  @spec delete(Electric.stack_id(), Path.t(), Path.t() | nil) :: :ok | {:error, term()}
+  def delete(stack_id, path, root \\ nil) when is_stack_id(stack_id) and is_binary(path) do
     trash_dir = trash_dir!(stack_id)
 
     case do_rename(path, trash_dir) do
@@ -56,14 +68,84 @@ defmodule Electric.AsyncDeleter do
         :ok
 
       {:error, :enoent} ->
-        Logger.debug("AsyncDeleter: path already gone #{path}")
-        :ok
+        # `rename` answers :enoent for a source that is already gone AND for a missing trash
+        # directory. Only the first means the work is done; answering :ok for the second turns
+        # every delete into a silent no-op while the volume it was meant to reclaim keeps filling.
+        if File.exists?(path) do
+          reclaim_into_recreated_trash(stack_id, path, trash_dir, root)
+        else
+          Logger.debug("AsyncDeleter: path already gone #{path}")
+          :ok
+        end
+
+      {:error, reason} when reason in @cross_filesystem and is_binary(root) ->
+        delete_into_root_trash(stack_id, path, root)
 
       {:error, reason} ->
         # If this is happening then there's something bad going on and our
         # storage is just accruing.
         Logger.error("AsyncDeleter: rename failed for #{path}: #{inspect(reason)}")
         {:error, reason}
+    end
+  end
+
+  defp reclaim_into_recreated_trash(stack_id, path, trash_dir, root) do
+    with :ok <- File.mkdir_p(trash_dir),
+         {:ok, _dest} <- do_rename(path, trash_dir) do
+      GenServer.cast(name(stack_id), {:schedule_cleanup, path})
+      :ok
+    else
+      {:error, reason} when reason in @cross_filesystem and is_binary(root) ->
+        delete_into_root_trash(stack_id, path, root)
+
+      {:error, reason} ->
+        Logger.error(
+          "AsyncDeleter: trash dir #{trash_dir} unusable, #{path} not reclaimed: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # The trash in `root` is on the path's own filesystem. What a restart left in it is emptied the
+  # next time a delete uses it.
+  defp delete_into_root_trash(stack_id, path, root) do
+    root_trash_dir = Path.join(root, @trash_dir_base)
+
+    result =
+      with :ok <- File.mkdir_p(root_trash_dir) do
+        if path == root,
+          do: move_entries(path, root_trash_dir),
+          else: with({:ok, _dest} <- do_rename(path, root_trash_dir), do: :ok)
+      end
+
+    case result do
+      :ok ->
+        GenServer.cast(name(stack_id), {:schedule_cleanup, path, root_trash_dir})
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "AsyncDeleter: rename into #{root_trash_dir} failed for #{path}: #{inspect(reason)}"
+        )
+
+        {:error, reason}
+    end
+  end
+
+  # A root that is a mount point cannot be moved, so what it holds is, one entry at a time. An
+  # entry gone meanwhile is deleted already.
+  defp move_entries(dir, root_trash_dir) do
+    with {:ok, names} <- File.ls(dir) do
+      names
+      |> Enum.reject(&(&1 == @trash_dir_base))
+      |> Enum.reduce_while(:ok, fn name, :ok ->
+        case do_rename(Path.join(dir, name), root_trash_dir) do
+          {:ok, _dest} -> {:cont, :ok}
+          {:error, :enoent} -> {:cont, :ok}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
     end
   end
 
@@ -75,16 +157,29 @@ defmodule Electric.AsyncDeleter do
     Logger.metadata(stack_id: stack_id)
     Electric.Telemetry.Sentry.set_tags_context(stack_id: stack_id)
 
-    trash_dir = trash_dir!(stack_id)
-    File.mkdir_p(trash_dir)
-
     state = %__MODULE__{
       stack_id: stack_id,
       interval_ms: Keyword.get(opts, :cleanup_interval_ms, @default_cleanup_interval_ms),
-      pending: File.ls!(trash_dir)
+      pending: trash_entries_to_reclaim(trash_dir!(stack_id))
     }
 
     {:ok, state, {:continue, :initial_cleanup}}
+  end
+
+  # This process is the one that empties the trash, so refusing to start when the trash is
+  # unreachable makes a full volume unrecoverable: the disk fills, we crash, nothing is reclaimed,
+  # the disk stays full, and the crash takes the whole stack's supervisor with it. Start idle and
+  # let the next delete recreate the directory. Raising on the listing also reported the failure as
+  # :enoent on a path we had just tried to create, hiding the ENOSPC that actually caused it.
+  defp trash_entries_to_reclaim(trash_dir) do
+    with :ok <- File.mkdir_p(trash_dir),
+         {:ok, entries} <- File.ls(trash_dir) do
+      entries
+    else
+      {:error, reason} ->
+        Logger.error("AsyncDeleter: trash dir #{trash_dir} unusable: #{inspect(reason)}")
+        []
+    end
   end
 
   @impl true
@@ -104,6 +199,11 @@ defmodule Electric.AsyncDeleter do
 
   @impl true
   def handle_cast({:schedule_cleanup, path}, state) do
+    {:noreply, %{state | pending: [path | state.pending]}, {:continue, :schedule_cleanup}}
+  end
+
+  def handle_cast({:schedule_cleanup, path, root_trash_dir}, state) do
+    state = %{state | root_trash_dirs: MapSet.put(state.root_trash_dirs, root_trash_dir)}
     {:noreply, %{state | pending: [path | state.pending]}, {:continue, :schedule_cleanup}}
   end
 
@@ -193,6 +293,7 @@ defmodule Electric.AsyncDeleter do
   defp do_cleanup(state) do
     start_time = System.monotonic_time(:millisecond)
     stack_id = state.stack_id
+    root_trash_dirs = state.root_trash_dirs
 
     task =
       Task.async(fn ->
@@ -208,6 +309,15 @@ defmodule Electric.AsyncDeleter do
         rescue
           e -> Logger.warning("AsyncDeleter: rm_rf failed: #{inspect(e)}")
         end
+
+        # A store root removed since holds nothing to clean.
+        Enum.each(root_trash_dirs, fn root_trash_dir ->
+          try do
+            if File.dir?(root_trash_dir), do: clean_dir!(root_trash_dir)
+          rescue
+            e -> Logger.warning("AsyncDeleter: rm_rf failed: #{inspect(e)}")
+          end
+        end)
       end)
 
     Process.unlink(task.pid)

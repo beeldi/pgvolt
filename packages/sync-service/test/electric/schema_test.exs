@@ -23,7 +23,7 @@ defmodule Electric.SchemaTest do
     },
     %{
       postgres_type: "SERIAL",
-      schema: %{type: "int4", not_null: true}
+      schema: %{type: "int4"}
     },
     %{
       postgres_type: "BIGINT",
@@ -518,7 +518,11 @@ defmodule Electric.SchemaTest do
 
       assert i_schema == %{type: "int4", pk_index: 0, not_null: true}
       assert name_schema == %{type: "varchar"}
-      assert value_schema == %{type: "bool", not_null: true}
+
+      # `value` is NOT NULL in the catalog and the schema does not say so: an ordinary migration can
+      # relax it, Postgres does not report that over replication, and a client that latched this
+      # schema at subscribe time would reject the first NULL row it was later served.
+      assert value_schema == %{type: "bool"}
     end
 
     test "returns the correct schema for a table with a composite primary key", %{db_conn: conn} do

@@ -135,6 +135,50 @@ defmodule Electric.Shapes.Consumer.TransactionConverterTest do
              )
   end
 
+  test "keeps a framed block mid-transaction and marks the trailing change last" do
+    txn = %Transaction{
+      xid: 14,
+      lsn: lsn(14),
+      last_log_offset: Electric.Replication.LogOffset.new(lsn(14), 1),
+      changes: [framed_block(), child_insert("2")]
+    }
+
+    assert {:ok,
+            [
+              %Effects.AppendChanges{
+                xid: 14,
+                changes: [
+                  %Changes.FramedBlock{count: 2},
+                  %Changes.NewRecord{record: %{"id" => "2"}, last?: true}
+                ]
+              }
+            ]} =
+             TransactionConverter.transaction_to_effects(
+               txn,
+               simple_shape(),
+               stack_id: "stack-id",
+               shape_handle: "shape-handle"
+             )
+  end
+
+  test "raises when a framed block is the transaction's final change" do
+    txn = %Transaction{
+      xid: 15,
+      lsn: lsn(15),
+      last_log_offset: Electric.Replication.LogOffset.new(lsn(15), 1),
+      changes: [child_insert("1"), framed_block()]
+    }
+
+    assert_raise RuntimeError, ~r/framed block was the final change/, fn ->
+      TransactionConverter.transaction_to_effects(
+        txn,
+        simple_shape(),
+        stack_id: "stack-id",
+        shape_handle: "shape-handle"
+      )
+    end
+  end
+
   defp lsn(value), do: Lsn.from_integer(value)
 
   defp simple_shape do
@@ -158,6 +202,19 @@ defmodule Electric.Shapes.Consumer.TransactionConverterTest do
     %Changes.NewRecord{
       relation: {"public", "child"},
       record: %{"id" => id, "parent_id" => "1", "name" => "child-#{id}"}
+    }
+  end
+
+  defp framed_block do
+    %Changes.FramedBlock{
+      frame: "",
+      frame_size: 0,
+      count: 2,
+      payload_size: 0,
+      ets_lines: [],
+      entries_meta: {},
+      first_offset: Electric.Replication.LogOffset.new(lsn(0), 0),
+      last_offset: Electric.Replication.LogOffset.new(lsn(0), 1)
     }
   end
 end

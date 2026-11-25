@@ -86,7 +86,7 @@ defmodule Electric.Connection.Manager.PoolTest do
     send(pool_pid, {:connected, c2, ref})
 
     # Should transition to ready and notify
-    assert_receive {:pool_ready_notified, ^pool_pid, @pool_role}, 500
+    assert_receive {:pool_ready_notified, ^pool_pid, @pool_role}
     assert pool_state(stack_id).status == :ready
   end
 

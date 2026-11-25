@@ -6,16 +6,19 @@ defmodule Electric.Replication.Eval.Expr do
   alias Electric.Replication.Eval.Parser
   alias Electric.Replication.Eval.Env
 
-  defstruct [:query, :eval, :used_refs, :returns]
+  defstruct [:query, :qualified_sql, :eval, :used_refs, :returns]
 
   @type used_refs :: %{required([String.t(), ...]) => Env.pg_type()}
 
   @type t() :: %__MODULE__{
           query: String.t(),
+          qualified_sql: String.t() | nil,
           eval: term(),
           used_refs: used_refs(),
           returns: Env.pg_type()
         }
+
+  def sql(%__MODULE__{query: query} = expr), do: Map.get(expr, :qualified_sql) || query
 
   @doc """
   Returns a flat list of all used refs used in the expression

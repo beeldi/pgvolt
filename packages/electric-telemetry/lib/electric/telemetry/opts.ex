@@ -21,6 +21,10 @@ defmodule ElectricTelemetry.Opts do
         keys: [
           system_metrics_poll_interval: [type: :integer, default: :timer.seconds(5)],
           stack_telemetry_init_delay: [type: :integer, default: :timer.seconds(30)],
+          # How often to walk the storage directory for the storage-used metric, in ms. Each
+          # walk visits every file, so with a large shape count it waits longer (see DiskUsage). 0
+          # turns the walk and the metric off.
+          disk_usage_scan_period: [type: :non_neg_integer, default: :timer.seconds(60)],
           top_process_limit: [
             type:
               {:or,

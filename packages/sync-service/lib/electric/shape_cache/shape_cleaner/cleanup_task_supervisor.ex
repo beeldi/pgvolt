@@ -46,16 +46,19 @@ defmodule Electric.ShapeCache.ShapeCleaner.CleanupTaskSupervisor do
     end
   end
 
-  def cleanup_async(stack_id, shape_handles) when is_list(shape_handles) do
+  def cleanup_async(stack_id, shape_handles, remove_from_publication? \\ true)
+      when is_list(shape_handles) do
     perform_async(stack_id, fn ->
       cleanup_callback = on_cleanup_callback(stack_id)
 
       set_task_metadata(stack_id)
 
-      tasks = [
-        async(stack_id, shape_handles, &notify_shape_rotation/2),
-        async(stack_id, shape_handles, &cleanup_publication_manager/2)
-      ]
+      tasks = [async(stack_id, shape_handles, &notify_shape_rotation/2)]
+
+      tasks =
+        if remove_from_publication?,
+          do: [async(stack_id, shape_handles, &cleanup_publication_manager/2) | tasks],
+          else: tasks
 
       try do
         Task.await_many(tasks, @cleanup_timeout)

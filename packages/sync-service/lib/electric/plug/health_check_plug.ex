@@ -14,8 +14,10 @@ defmodule Electric.Plug.HealthCheckPlug do
   # keeping the message name decoupled from the internal representation
   # of the status to ensure the API is stable
   defp check_service_status(%Conn{assigns: %{config: config}} = conn, _) do
+    stack_id = config[:stack_id]
+
     {status_code, status_text} =
-      case StatusMonitor.service_status(config[:stack_id]) do
+      case StatusMonitor.service_status(stack_id) do
         :active -> {200, "active"}
         :waiting -> {202, "waiting"}
         :starting -> {202, "starting"}
@@ -24,6 +26,14 @@ defmodule Electric.Plug.HealthCheckPlug do
         # transparently restore the connection subsystem before processing the request
         :sleeping -> {200, "active"}
       end
+
+    # `?require=read_only`, for a readiness probe: 200 as soon as existing shapes are served,
+    # which with a large shape count is minutes before the stack is active. The status text is kept.
+    status_code =
+      if status_code == 202 and conn.query_params["require"] == "read_only" and
+           StatusMonitor.serves_existing_shapes?(stack_id),
+         do: 200,
+         else: status_code
 
     conn |> assign(:status_text, status_text) |> assign(:status_code, status_code)
   end

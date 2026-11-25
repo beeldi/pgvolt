@@ -52,29 +52,29 @@
   ??ALTER PUBLICATION
   ??ALTER PUBLICATION
 
+  # The 2s publication refresh races this SELECT: it may drop the manually
+  # added table before or after the query lands. Either state is fine — the
+  # next request fails on ownership regardless of which side of the race ran.
   !SELECT * FROM pg_publication_tables;
-  ??electric_publication_integration | public     | items
-  ??(1 row)
+  ?electric_publication_integration \| public\s+\| items|\(0 rows\)
 
 [shell client]
-  # Electric still fails because it's trying to alter items' replica identity
-  # (it doesn't check whether it's already there)
+  # Electric still fails: with the table in the publication it cannot alter
+  # items' replica identity (it doesn't check whether it's already set), and
+  # with the refresh having already dropped it, it cannot re-add the table.
   [invoke shape_get_snapshot items]
   ??HTTP/1.1 503
   ??{"message":"Unable to create initial snapshot: must be owner of table items"}
 
 [shell electric]
-	??[notice] Configuring publication electric_publication_integration to drop [] tables, add [] tables, and configure replica identity for ["public.items"] tables
+  ?\[notice\] Configuring publication electric_publication_integration to drop \[\] tables, add \[("public.items")?\] tables
   ?\[warning\] Failed to configure publication for relation \{\d+, \{"public", "items"\}\}: %Postgrex.Error\{message: nil, postgres: %\{code: :insufficient_privilege,.*message: "must be owner of table items"
 
-## Wait for the publication to be refreshed and verify that the table is removed from it
-[shell electric]
-  ??[notice] Configuring publication electric_publication_integration to drop ["public.items"] tables, add [] tables
-  ??[debug] Processed all publication relation actions
-
-[shell psql]
-  !SELECT * FROM pg_publication_tables;
-  ??(0 rows)
+## Wait for the publication to be refreshed and verify that the table is removed
+## from it. Polled from a fresh shell: whether the refresh dropped the table
+## before or after the requests above, the publication must converge to empty.
+[shell publication_poll]
+  [invoke wait-for "docker exec -u postgres $pg_container_name psql --dbname electric -tAc 'SELECT count(*) FROM pg_publication_tables'" "^0$" 15 $PS1]
 
 [cleanup]
   [invoke teardown]

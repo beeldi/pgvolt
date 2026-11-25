@@ -80,6 +80,20 @@ defmodule Support.PgExpressionGenerator do
 
   defp membership_op_gen, do: with_negation(constant("IN"))
 
+  # `x <op> ANY (ARRAY[...])` is a separate grammar from `x IN (...)`, even though Postgres
+  # documents them as equivalent: `IN` is expanded into a chain of comparisons while the
+  # quantified form is applied element-wise over one array, so they exercise different code
+  # and only the first was generated here.
+  defp quantifier_gen, do: member_of(["ANY", "ALL"])
+
+  # The one comparison that is defined on NULL rather than propagating it, so it is the one
+  # place where two unknowns are equal.
+  defp distinct_op_gen, do: member_of(["IS DISTINCT FROM", "IS NOT DISTINCT FROM"])
+
+  # Postgres skips NULLs in these rather than propagating them, which is the opposite of every
+  # other function here.
+  defp null_skipping_function_gen, do: member_of(["coalesce", "greatest", "least"])
+
   defp is_null_op_gen, do: null_gen() |> map(&"IS #{&1}")
 
   defp predicate_op_gen,
@@ -125,6 +139,49 @@ defmodule Support.PgExpressionGenerator do
     )
   end
 
+  # At least one element must be non-NULL or Postgres cannot infer the array's element type and
+  # rejects the comparison outright, which would spend the run on a type error rather than on the
+  # NULL handling this is here to compare.
+  defp compose_quantified_op(type_gen, op_gen, opts \\ []) do
+    max_length = Access.get(opts, :max_length, 4)
+
+    bind(
+      {
+        type_gen,
+        op_gen,
+        quantifier_gen(),
+        list_of(type_gen, min_length: 1, max_length: max_length)
+        |> filter(&Enum.any?(&1, fn value -> value != "NULL" end))
+      },
+      fn {val, op, quantifier, values} ->
+        constant("#{val} #{op} #{quantifier} (ARRAY[#{Enum.join(values, ", ")}])")
+      end
+    )
+  end
+
+  defp compose_variadic_function_op(type_gen, op_gen, opts \\ []) do
+    max_arity = Access.get(opts, :max_arity, 4)
+
+    bind(
+      {op_gen, list_of(type_gen, min_length: 2, max_length: max_arity)},
+      fn {op, args} -> constant("#{op}(#{Enum.join(args, ", ")})") end
+    )
+  end
+
+  # Indices deliberately reach past both ends: Postgres answers an out-of-bounds subscript with
+  # NULL and an out-of-bounds slice with as much of the range as exists, neither of which is an
+  # error, and both of which are easy to get wrong.
+  defp compose_subscript_op(array_gen, index_gen) do
+    bind({array_gen, index_gen, index_gen}, fn {array, lower, upper} ->
+      one_of([
+        constant("(#{array})[#{lower}]"),
+        constant("(#{array})[#{lower}:#{upper}]")
+      ])
+    end)
+  end
+
+  defp subscript_index_gen, do: integer(0..6) |> map(&to_string/1)
+
   ## EXPRESSION GENERATORS
 
   defp expression_gen(type_gen, op_generators) do
@@ -142,6 +199,9 @@ defmodule Support.PgExpressionGenerator do
       {:predicate_op, op_gen} -> compose_predicate_op(type_gen, op_gen)
       {:range_op, op_gen} -> compose_range_op(type_gen, op_gen)
       {:membership_op, op_gen} -> compose_membership_op(type_gen, op_gen)
+      {:quantified_op, op_gen} -> compose_quantified_op(type_gen, op_gen)
+      {:variadic_function_op, op_gen} -> compose_variadic_function_op(type_gen, op_gen)
+      {:subscript_op, index_gen} -> compose_subscript_op(type_gen, index_gen)
       {:function_op, op_gen} -> compose_function_op(type_gen, op_gen)
     end)
     |> one_of()
@@ -165,21 +225,30 @@ defmodule Support.PgExpressionGenerator do
         {:unary_op, numeric_unary_op_gen()},
         {:comparison_op, comparison_op_gen()},
         {:range_op, range_comparison_op_gen()},
-        {:membership_op, membership_op_gen()}
+        {:membership_op, membership_op_gen()},
+        {:quantified_op, comparison_op_gen()},
+        {:comparison_op, distinct_op_gen()},
+        {:variadic_function_op, null_skipping_function_gen()}
       ]),
       expression_gen(int_gen() |> nullable_type_gen(), [
         {:combine_op, int_op_gen()},
         {:unary_op, int_unary_op_gen()},
         {:comparison_op, comparison_op_gen()},
         {:range_op, range_comparison_op_gen()},
-        {:membership_op, membership_op_gen()}
+        {:membership_op, membership_op_gen()},
+        {:quantified_op, comparison_op_gen()},
+        {:comparison_op, distinct_op_gen()},
+        {:variadic_function_op, null_skipping_function_gen()}
       ]),
       expression_gen(double_gen() |> nullable_type_gen(), [
         {:combine_op, numeric_op_gen()},
         {:unary_op, double_unary_op_gen()},
         {:comparison_op, comparison_op_gen()},
         {:range_op, range_comparison_op_gen()},
-        {:membership_op, membership_op_gen()}
+        {:membership_op, membership_op_gen()},
+        {:quantified_op, comparison_op_gen()},
+        {:comparison_op, distinct_op_gen()},
+        {:variadic_function_op, null_skipping_function_gen()}
       ])
     ])
   end
@@ -191,7 +260,10 @@ defmodule Support.PgExpressionGenerator do
       {:comparison_op, string_comparison_op_gen()},
       {:comparison_op, comparison_op_gen()},
       {:range_op, range_comparison_op_gen()},
-      {:membership_op, membership_op_gen()}
+      {:membership_op, membership_op_gen()},
+      {:quantified_op, comparison_op_gen()},
+      {:comparison_op, distinct_op_gen()},
+      {:variadic_function_op, null_skipping_function_gen()}
     ])
   end
 
@@ -234,8 +306,10 @@ defmodule Support.PgExpressionGenerator do
         expression_gen(array_type_gen, [
           {:combine_op, array_op_gen()},
           {:comparison_op, array_comparison_op_gen()},
+          {:comparison_op, distinct_op_gen()},
           {:function_op, array_function_op_gen()},
-          {:membership_op, membership_op_gen()}
+          {:membership_op, membership_op_gen()},
+          {:subscript_op, subscript_index_gen()}
         ]),
         bind({array_type_gen, nullable_type_gen(type_gen)}, fn {array, element} ->
           one_of([

@@ -17,6 +17,42 @@ defmodule Electric.SnapshotError do
     }
   end
 
+  def publication_admission_pending do
+    %SnapshotError{
+      type: :publication_admission_pending,
+      message: "Waiting for the table to be admitted to the publication"
+    }
+  end
+
+  def publication_admission_timeout do
+    %{
+      publication_admission_pending()
+      | message: "Snapshot timed out while waiting for a table lock"
+    }
+  end
+
+  def exited(reason) do
+    %SnapshotError{
+      type: exit_type(reason),
+      message: "Snapshot creation exited: #{inspect(reason)}",
+      original_error: reason
+    }
+  end
+
+  # A snapshot task that exits because the connection subsystem (or the shape
+  # subsystem) is shutting down or the pooled call raced a restart is a
+  # transient failure, not an invalid shape. Classifying it retryable keeps the
+  # shape in place for the next request instead of deleting it and triggering a
+  # full re-snapshot fan-out at the moment the connection recovers.
+  defp exit_type(:shutdown), do: :shutdown
+  defp exit_type(:normal), do: :shutdown
+  defp exit_type(:killed), do: :shutdown
+  defp exit_type(:noproc), do: :shutdown
+  defp exit_type({:shutdown, _}), do: :shutdown
+  defp exit_type({:noproc, _}), do: :shutdown
+  defp exit_type({:timeout, _}), do: :shutdown
+  defp exit_type(_), do: :unknown
+
   def slow_snapshot_query(ttf_ms) do
     %SnapshotError{
       type: :slow_snapshot_query,
@@ -107,4 +143,16 @@ defmodule Electric.SnapshotError do
       original_error: error
     }
   end
+
+  # Failures caused by the environment going away rather than by the shape being
+  # invalid. The consumer keeps the shape in place for these and retries on the
+  # next request instead of deleting it.
+  @retryable_types [
+    :queue_timeout,
+    :connection_not_available,
+    :publication_admission_pending,
+    :shutdown
+  ]
+
+  def retryable?(%SnapshotError{type: type}), do: type in @retryable_types
 end

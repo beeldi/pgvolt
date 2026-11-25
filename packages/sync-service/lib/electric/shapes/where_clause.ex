@@ -6,7 +6,7 @@ defmodule Electric.Shapes.WhereClause do
   @spec includes_record_result(
           Electric.Replication.Eval.Expr.t() | nil,
           map(),
-          ([String.t()], term() -> boolean())
+          ([String.t()], term() -> boolean() | nil)
         ) :: {:ok, boolean()} | :error
   def includes_record_result(where_clause, record, subquery_member? \\ fn _, _ -> false end)
   def includes_record_result(nil = _where_clause, _record, _), do: {:ok, true}
@@ -23,7 +23,7 @@ defmodule Electric.Shapes.WhereClause do
   end
 
   @spec includes_record?(Electric.Replication.Eval.Expr.t() | nil, map(), ([String.t()], term() ->
-                                                                             boolean())) ::
+                                                                             boolean() | nil)) ::
           boolean()
   def includes_record?(where_clause, record, subquery_member? \\ fn _, _ -> false end)
   def includes_record?(nil = _where_clause, _record, _), do: true
@@ -31,12 +31,25 @@ defmodule Electric.Shapes.WhereClause do
   def includes_record?(where_clause, record, subquery_member?)
       when is_function(subquery_member?, 2) do
     case includes_record_result(where_clause, record, subquery_member?) do
-      {:ok, included?} -> included?
-      :error -> false
+      {:ok, included?} ->
+        included?
+
+      # The row is excluded because its predicate could not be read, not because it failed to
+      # match. Routing already records the same condition through `Filter.mark_routing_inexact/0`;
+      # this side had no signal at all, so this class could drop casts with
+      # nothing but a warning to show for it.
+      :error ->
+        :telemetry.execute(
+          [:electric, :shape, :unevaluable_row_excluded],
+          %{count: 1},
+          %{refs: where_clause.used_refs}
+        )
+
+        false
     end
   end
 
-  @spec subquery_member_from_refs(map()) :: ([String.t()], term() -> boolean())
+  @spec subquery_member_from_refs(map()) :: ([String.t()], term() -> boolean() | nil)
   def subquery_member_from_refs(extra_refs) when is_map(extra_refs) do
     fn subquery_ref, typed_value ->
       typed_value
@@ -51,7 +64,7 @@ defmodule Electric.Shapes.WhereClause do
   shape currently contains a typed value for a canonical subquery ref.
   """
   @spec subquery_member_from_index(SubqueryIndex.t(), term()) ::
-          ([String.t()], term() -> boolean())
+          ([String.t()], term() -> boolean() | nil)
   def subquery_member_from_index(index, shape_handle) do
     fn subquery_ref, typed_value ->
       SubqueryIndex.membership_or_fallback?(index, shape_handle, subquery_ref, typed_value)

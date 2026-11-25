@@ -3,7 +3,7 @@
 # the configuration CI runs the test suite with).
 if Electric.telemetry_enabled?() do
   defmodule Electric.Plug.TraceContextPlugTest do
-    use ExUnit.Case, async: true
+    use ExUnit.Case, async: false
 
     alias Electric.Plug.TraceContextPlug
 
@@ -76,10 +76,47 @@ if Electric.telemetry_enabled?() do
       assert %{sample_rate_hint: 1} = TraceContextPlug.trace_context(conn)
     end
 
+    test "the largest signed 64-bit rate is accepted" do
+      conn =
+        call([
+          {"traceparent", traceparent("01")},
+          {"tracestate", "electric=rate:9223372036854775807"}
+        ])
+
+      assert %{sample_rate_hint: 9_223_372_036_854_775_807} =
+               TraceContextPlug.trace_context(conn)
+    end
+
+    test "applies the configured sample rates without dropping the remote parent" do
+      key = :otel_trusted_sample_rates
+      previous = Application.fetch_env(:electric, key)
+      Application.put_env(:electric, key, MapSet.new([10, 100]))
+
+      on_exit(fn ->
+        case previous do
+          {:ok, value} -> Application.put_env(:electric, key, value)
+          :error -> Application.delete_env(:electric, key)
+        end
+      end)
+
+      listed = call([{"traceparent", traceparent("01")}, {"tracestate", "electric=rate:100"}])
+      assert TraceContextPlug.sample_rate_attrs(listed, 200) == %{"SampleRate" => 100}
+      assert TraceContextPlug.sample_rate_attrs(listed, 503) == %{"SampleRate" => 1}
+
+      unlisted = call([{"traceparent", traceparent("01")}, {"tracestate", "electric=rate:20"}])
+      assert %{sample_rate_hint: nil} = TraceContextPlug.trace_context(unlisted)
+      assert TraceContextPlug.sample_rate_attrs(unlisted, 200) == %{}
+      assert TraceContextPlug.sample_rate_attrs(unlisted, 503) == %{}
+      assert :otel_tracer.current_span_ctx() != :undefined
+    end
+
     for tracestate <- [
           # rate < 1
           "electric=rate:0",
           "electric=rate:-5",
+          # more than an OpenTelemetry integer attribute holds
+          "electric=rate:9223372036854775808",
+          "electric=rate:1000000000000000000000000000000",
           # non-integer / trailing garbage
           "electric=rate:1.5",
           "electric=rate:20x",

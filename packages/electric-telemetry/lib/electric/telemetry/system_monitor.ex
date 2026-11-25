@@ -124,11 +124,14 @@ defmodule ElectricTelemetry.SystemMonitor do
   end
 
   def handle_info(:recheck_message_queues, state) do
-    if MapSet.size(state.long_message_queue_pids) == 0 do
+    live_pids = MapSet.filter(state.long_message_queue_pids, &Process.alive?/1)
+    state = %{state | long_message_queue_pids: live_pids}
+
+    if MapSet.size(live_pids) == 0 do
       :timer.cancel(state.long_message_queue_timer)
       {:noreply, %{state | long_message_queue_timer: nil}}
     else
-      Enum.each(state.long_message_queue_pids, fn pid ->
+      Enum.each(live_pids, fn pid ->
         log_long_message_queue_event(pid, proc_type(pid))
       end)
 

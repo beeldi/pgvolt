@@ -289,6 +289,78 @@ defmodule Electric.Shapes.PartitionsTest do
     end
   end
 
+  describe "a partition that stops being one" do
+    setup do
+      {:ok, partitions} =
+        Partitions.new(inspector: @inspector)
+        |> Partitions.add_shape("s1", Shape.new!("partitioned", inspector: @inspector))
+
+      insert = %TransactionFragment{
+        changes: [%NewRecord{relation: {"public", "partition_02"}, record: %{"id" => "2"}}]
+      }
+
+      relation = %Relation{
+        schema: "public",
+        table: "partition_02",
+        id: :erlang.phash2({"public", "partition_02"})
+      }
+
+      %{partitions: partitions, insert: insert, relation: relation}
+    end
+
+    # what the catalog reports for the name once the partition is detached, or dropped and
+    # recreated as a plain table
+    @plain_partition_02 StubInspector.new(%{
+                          {"public", "partition_02"} => %{
+                            relation: %{children: nil, parent: nil},
+                            columns: [%{name: "id", type: "int8", pk_position: 0}]
+                          }
+                        })
+
+    test "no longer sends its changes to the old root once it has no parent", ctx do
+      %{partitions: partitions, insert: insert} = ctx
+
+      assert {_, %TransactionFragment{changes: [_, _]}} =
+               Partitions.handle_txn_fragment(partitions, insert)
+
+      {:ok, partitions} =
+        Partitions.handle_relation(%{partitions | inspector: @plain_partition_02}, ctx.relation)
+
+      assert {_, ^insert} = Partitions.handle_txn_fragment(partitions, insert)
+    end
+
+    test "no longer sends its changes to the old root once it is gone", ctx do
+      %{partitions: partitions, insert: insert} = ctx
+
+      gone = {Electric.Shapes.PartitionsTest.ConstInspector, :table_not_found}
+
+      {:ok, partitions} =
+        Partitions.handle_relation(%{partitions | inspector: gone}, ctx.relation)
+
+      assert {_, ^insert} = Partitions.handle_txn_fragment(partitions, insert)
+    end
+
+    test "sends its changes to the root again once attached back, and cleans up after", ctx do
+      %{partitions: partitions, insert: insert} = ctx
+
+      {:ok, partitions} =
+        Partitions.handle_relation(%{partitions | inspector: @plain_partition_02}, ctx.relation)
+
+      {:ok, partitions} =
+        Partitions.handle_relation(%{partitions | inspector: @inspector}, ctx.relation)
+
+      root = %NewRecord{relation: {"public", "partitioned"}, record: %{"id" => "2"}}
+
+      assert {_, %TransactionFragment{changes: [_, ^root]}} =
+               Partitions.handle_txn_fragment(partitions, insert)
+
+      partitions = Partitions.remove_shape(partitions, "s1")
+
+      assert {0, %{}, %{}} ==
+               {partitions.active, partitions.partitions, partitions.partition_ownership}
+    end
+  end
+
   describe "introspection failures" do
     defmodule ConstInspector do
       def load_relation_info(_oid, response), do: response
@@ -312,6 +384,21 @@ defmodule Electric.Shapes.PartitionsTest do
     test "add_shape/3 returns unexpected introspection errors instead of raising" do
       shape = Shape.new!("partitioned", inspector: @inspector)
       partitions = Partitions.new(inspector: {ConstInspector, {:error, "boom"}})
+
+      assert {:error, "boom"} = Partitions.add_shape(partitions, "s1", shape)
+    end
+
+    test "preload_root_table/2 leaves what the introspection found to add_shape/3" do
+      shape = Shape.new!("partitioned", inspector: @inspector)
+
+      for response <- [:table_not_found, {:error, "boom"}, {:error, :connection_not_available}] do
+        partitions = Partitions.new(inspector: {ConstInspector, response})
+
+        assert :ok = Partitions.preload_root_table(partitions, shape.root_table_id)
+      end
+
+      partitions = Partitions.new(inspector: {ConstInspector, {:error, "boom"}})
+      :ok = Partitions.preload_root_table(partitions, shape.root_table_id)
 
       assert {:error, "boom"} = Partitions.add_shape(partitions, "s1", shape)
     end

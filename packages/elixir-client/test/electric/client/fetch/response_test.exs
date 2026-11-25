@@ -4,7 +4,7 @@ defmodule Electric.Client.Fetch.ResponseTest do
   alias Electric.Client.Fetch
 
   test "parses headers correctly" do
-    schema = %{id: %{type: "int8"}}
+    schema = %{"id" => %{type: "int8"}}
 
     headers = %{
       "electric-handle" => "1234987-2349827349",
@@ -26,8 +26,22 @@ defmodule Electric.Client.Fetch.ResponseTest do
            } = Fetch.Response.decode!(200, headers, [])
   end
 
+  test "keeps column names as strings and drops unknown column attributes" do
+    headers = %{
+      "electric-schema" =>
+        ~s|{"column_never_interned":{"type":"int4","dims":1,"attribute_never_interned":true}}|
+    }
+
+    assert %{schema: %{"column_never_interned" => column}} =
+             Fetch.Response.decode!(200, headers, [])
+
+    assert column == %{type: "int4", dims: 1}
+    assert_raise ArgumentError, fn -> String.to_existing_atom("column_never_interned") end
+    assert_raise ArgumentError, fn -> String.to_existing_atom("attribute_never_interned") end
+  end
+
   test "parses list headers correctly" do
-    schema = %{id: %{type: "int8"}}
+    schema = %{"id" => %{type: "int8"}}
 
     headers = %{
       "electric-handle" => ["1234987-2349827349"],

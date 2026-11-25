@@ -22,6 +22,7 @@ defmodule Electric.Replication.PublicationManagerManualTest do
   setup [
     :with_stack_id_from_test,
     :with_in_memory_storage,
+    :with_persistent_kv,
     :with_shape_status,
     :with_unique_db,
     :with_publication_name,
@@ -38,6 +39,7 @@ defmodule Electric.Replication.PublicationManagerManualTest do
         shape_cache: {__MODULE__, [self()]},
         publication_name: ctx.publication_name,
         pool: ctx.pool,
+        persistent_kv: ctx.persistent_kv,
         manual_table_publishing?: true
       })
 

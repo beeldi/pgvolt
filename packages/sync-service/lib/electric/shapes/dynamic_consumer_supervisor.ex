@@ -67,7 +67,10 @@ defmodule Electric.Shapes.DynamicConsumerSupervisor do
     # or fallback to the number of schedulers
     partitions = Keyword.get(opts, :partitions) || partition_count(max_processes)
 
-    Logger.info("Starting DynamicConsumerSupervisor with #{partitions} partitions")
+    Logger.info(
+      "Starting DynamicConsumerSupervisor with #{partitions} partitions" <>
+        partition_sizing_note(opts, max_processes, partitions)
+    )
 
     with {:ok, supervisor_pid} <-
            DynamicSupervisor.start_link(__MODULE__, %{stack_id: stack_id, partitions: partitions},
@@ -141,6 +144,23 @@ defmodule Electric.Shapes.DynamicConsumerSupervisor do
 
   # we don't always have a value for `max_processes`, in which case just
   # default to the number of schedulers
+  # The count is fixed for the life of the supervisor, so a store that outgrows it stays at this
+  # density. Saying which input chose it is what makes an under-sized stack diagnosable at boot.
+  defp partition_sizing_note(opts, _max_processes, partitions) do
+    cond do
+      not is_nil(Keyword.get(opts, :partitions)) ->
+        " (configured)"
+
+      is_nil(Keyword.get(opts, :max_shapes)) ->
+        ", sized from the scheduler count because no shape ceiling is configured; the target is " <>
+          "#{@target_per_partition} shapes per partition, so a store above " <>
+          "#{partitions * @target_per_partition} shapes runs denser than that"
+
+      true ->
+        " for a ceiling of #{Keyword.get(opts, :max_shapes)} shapes"
+    end
+  end
+
   defp partition_count(0) do
     System.schedulers_online()
   end

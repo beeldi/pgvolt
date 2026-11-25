@@ -33,7 +33,7 @@ defmodule Electric.Shapes.ConsumerTest do
       wait_until: 1
     ]
 
-  @receive_timeout 1_000
+  @receive_timeout ExUnit.configuration()[:assert_receive_timeout]
 
   @base_inspector StubInspector.new(
                     tables: [
@@ -108,12 +108,17 @@ defmodule Electric.Shapes.ConsumerTest do
   end
 
   # Block until `pid` is hibernating, then return its armed suspend-timer ref
-  # (or nil if none is armed).
-  defp await_hibernation(pid, timeout \\ 2_000) do
+  # (or nil if none is armed). A consumer hibernates without arming the timer while its
+  # snapshotter runs, and arms it at the hibernation after that process's exit wakes it, so
+  # only a hibernation with no snapshotter left counts.
+  defp await_hibernation(pid, timeout \\ ExUnit.configuration()[:assert_receive_timeout]) do
     poll_until(timeout, fn ->
       case Process.info(pid, :current_function) do
         {:current_function, {:gen_server, :loop_hibernate, _}} ->
-          {:ok, :sys.get_state(pid).suspend_timer}
+          case :sys.get_state(pid) do
+            %{snapshotter: nil, suspend_timer: timer} -> {:ok, timer}
+            _ -> :retry
+          end
 
         _ ->
           :retry
@@ -593,6 +598,112 @@ defmodule Electric.Shapes.ConsumerTest do
       assert_receive {:DOWN, ^ref1, :process, _, _}
       refute_receive {:DOWN, ^ref2, :process, _, _}
     end
+
+    # A request at offset `now` may hold an offset of a new shape whose snapshot never started,
+    # and a snapshot taken anew under its handle would not go on from it.
+    test "a retryable snapshot failure before a new shape's snapshot started deletes the shape",
+         ctx do
+      ref1 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle1))
+      ref2 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle2))
+      expect_shape_status(remove_shape: {fn _, @shape_handle3 -> :ok end, at_least: 1})
+      ref3 = start_consumer_failing_to_register(ctx, snapshot_started?: false)
+
+      assert_receive {:DOWN, ^ref3, :process, _, {:shutdown, :cleanup}}
+      assert_shape_cleanup(@shape_handle3)
+      refute_receive {:DOWN, ^ref1, :process, _, _}
+      refute_receive {:DOWN, ^ref2, :process, _, _}
+    end
+
+    test "a retryable failure on a restored shape with a complete snapshot suspends it", ctx do
+      # The storage marker is still set on a restored shape, and the snapshotter registers the
+      # shape with the publication before it looks at that marker. A transient failure there says
+      # nothing about the snapshot on disk, which is complete.
+      ref = start_consumer_failing_to_register(ctx, snapshot_started?: true)
+
+      assert_receive {:DOWN, ^ref, :process, _, {:shutdown, :suspend}}
+      refute_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, @shape_handle3}
+    end
+
+    test "a non-retryable snapshot failure still deletes the shape", ctx do
+      ref1 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle1))
+      ref2 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle2))
+
+      expect_shape_status(remove_shape: {fn _, @shape_handle1 -> :ok end, at_least: 1})
+
+      GenServer.cast(
+        Consumer.whereis(ctx.stack_id, @shape_handle1),
+        {:snapshot_failed, @shape_handle1, Electric.SnapshotError.exited(:some_unexpected_crash)}
+      )
+
+      assert_receive {:DOWN, ^ref1, :process, _, {:shutdown, :cleanup}}
+      assert_shape_cleanup(@shape_handle1)
+      refute_receive {:DOWN, ^ref2, :process, _, _}
+    end
+
+    test "a retryable snapshot failure after the snapshot has started still deletes the shape",
+         ctx do
+      ref1 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle1))
+      ref2 = Process.monitor(Consumer.whereis(ctx.stack_id, @shape_handle2))
+
+      # A started-but-incomplete snapshot must not be suspended (the lazy restart would read it
+      # as done and serve a snapshot that never completes). The shared setup has this consumer
+      # confirm its snapshot, so it has seen the snapshot start.
+
+      expect_shape_status(remove_shape: {fn _, @shape_handle1 -> :ok end, at_least: 1})
+
+      GenServer.cast(
+        Consumer.whereis(ctx.stack_id, @shape_handle1),
+        {:snapshot_failed, @shape_handle1, Electric.SnapshotError.exited(:shutdown)}
+      )
+
+      assert_receive {:DOWN, ^ref1, :process, _, {:shutdown, :cleanup}}
+      assert_shape_cleanup(@shape_handle1)
+      refute_receive {:DOWN, ^ref2, :process, _, _}
+    end
+  end
+
+  # A consumer hibernates when it goes idle, which is when it arms its suspension if it can.
+  # Since OTP 28 a hibernated gen_server waits in its own loop rather than in erlang:hibernate/3.
+  defp wait_until_hibernating(pid, timeout \\ ExUnit.configuration()[:assert_receive_timeout]) do
+    poll_until(timeout, fn ->
+      case Process.info(pid, :current_function) do
+        {:current_function, {:erlang, :hibernate, 3}} -> {:ok, :ok}
+        {:current_function, {:gen_server, :loop_hibernate, _}} -> {:ok, :ok}
+        _ -> :retry
+      end
+    end)
+  end
+
+  # Starts a consumer whose snapshotter fails to register the shape with the publication, as it
+  # does while the publication or connection subsystem restarts, and returns a monitor on it.
+  defp start_consumer_failing_to_register(ctx, snapshot_started?: snapshot_started?) do
+    if snapshot_started? do
+      storage =
+        Support.TestStorage.wrap(ctx.storage, %{
+          @shape_handle3 => [{:mark_snapshot_as_started, []}]
+        })
+
+      Electric.StackConfig.put(ctx.stack_id, Electric.ShapeCache.Storage, storage)
+    end
+
+    Repatch.patch(
+      Electric.Replication.PublicationManager,
+      :add_shape,
+      [mode: :shared],
+      fn _stack_id, @shape_handle3, _shape -> exit(:shutdown) end
+    )
+
+    Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer.Snapshotter)
+
+    {:ok, consumer} =
+      start_supervised(
+        {Shapes.Consumer, %{shape_handle: @shape_handle3, stack_id: ctx.stack_id}},
+        id: {Shapes.Consumer, @shape_handle3}
+      )
+
+    ref = Process.monitor(consumer)
+    Shapes.Consumer.initialize_shape(consumer, @shape3, %{action: :create})
+    ref
   end
 
   describe "transaction handling with real storage" do
@@ -618,6 +729,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
     setup(ctx) do
       delay_snapshot_creation? = Map.get(ctx, :delay_snapshot_creation?)
+      hold_started_snapshot? = Map.get(ctx, :hold_started_snapshot?)
       test_pid = self()
 
       patch_snapshotter(fn parent, shape_handle, _shape, %{snapshot_fun: snapshot_fun} ->
@@ -630,6 +742,16 @@ defmodule Electric.Shapes.ConsumerTest do
         pg_snapshot = ctx[:pg_snapshot] || {10, 11, [10]}
         GenServer.cast(parent, {:pg_snapshot_known, shape_handle, pg_snapshot})
         GenServer.cast(parent, {:snapshot_started, shape_handle})
+
+        if hold_started_snapshot? do
+          send(test_pid, {:writing_snapshot, self()})
+
+          receive do
+            {^test_pid, :finish} -> :ok
+            {^test_pid, :fail} -> raise "the snapshot failed"
+          end
+        end
+
         snapshot_fun.([])
       end)
 
@@ -660,6 +782,216 @@ defmodule Electric.Shapes.ConsumerTest do
         consumer_supervisor: consumer_supervisor,
         shape_cache: shape_cache
       }
+    end
+
+    # The snapshot is written by its own process, which outlives a suspension of its consumer, and
+    # its end has no record on disk until its syncs are done: a change that restored the consumer
+    # meanwhile reopened the writer on a snapshot it could not tell from an incomplete one.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true, hold_started_snapshot?: true
+    test "a consumer does not suspend while its snapshot is being written", ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:writing_snapshot, snapshotter}
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # The consumer has gone idle with the snapshot held, and ten suspension periods pass.
+      wait_until_hibernating(consumer_pid)
+      refute_receive {:DOWN, ^ref, :process, ^consumer_pid, _}, 100
+
+      # The end of the snapshot wakes the consumer, which then suspends.
+      snapshotter_ref = Process.monitor(snapshotter)
+      send(snapshotter, {self(), :finish})
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, :normal}
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+    end
+
+    # A suspension that came due while the snapshot was written was handled before a failure the
+    # snapshot reported after it, and the consumer suspended over a snapshot it had not ended.
+    @tag hibernate_after: 10
+    @tag suspend: true, hold_started_snapshot?: true
+    test "a snapshot that fails behind a due suspension is still cleaned up", ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:writing_snapshot, snapshotter}
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+      wait_until_hibernating(consumer_pid)
+
+      # The consumer is held while its suspension comes due and the snapshot fails after it.
+      :ok = :sys.suspend(consumer_pid)
+      send(consumer_pid, :suspend_timeout)
+      snapshotter_ref = Process.monitor(snapshotter)
+      send(snapshotter, {self(), :fail})
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, :normal}
+      :ok = :sys.resume(consumer_pid)
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :cleanup}}
+    end
+
+    # A consumer restored while the snapshotter that failed it still held its name could not start
+    # another one, and removed the shape.
+    @tag suspend: true
+    test "a consumer restored before its failed snapshotter has exited snapshots again", ctx do
+      test_pid = self()
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # The consumer suspends once its snapshot is written.
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      send(consumer_pid, {:configure_suspend, 5, 5, 10})
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      Repatch.patch(Shapes.Consumer.Snapshotter, :terminate, [mode: :shared], fn _reason, state ->
+        if state.shape_handle == shape_handle do
+          send(test_pid, {:snapshotter_exiting, self()})
+
+          receive do
+            {^test_pid, :exit} -> :ok
+          end
+        end
+
+        :ok
+      end)
+
+      # A request restores it, and its snapshotter exits with `:shutdown` once the publication has
+      # taken the shape, as it does when a subsystem it calls restarts. Past the admission, the
+      # exit is a snapshot failure whatever an admission that fails reports.
+      Repatch.patch(Storage, :snapshot_started?, [mode: :shared], fn storage ->
+        if Process.get(:"$process_label") == {:snapshotter, shape_handle} do
+          send(test_pid, {:checking_snapshot, self()})
+
+          receive do
+            {^test_pid, :fail} -> exit(:shutdown)
+          end
+        else
+          Repatch.real(Storage.snapshot_started?(storage))
+        end
+      end)
+
+      {:ok, consumer_pid} = ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:checking_snapshot, failed_snapshotter}
+      send(failed_snapshotter, {test_pid, :fail})
+      assert_receive {:snapshotter_exiting, ^failed_snapshotter}
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      # The next request restores the consumer while the failed snapshotter is still exiting.
+      # The catalog holds the first snapshot's start, so only the restored consumer tells whether
+      # its own snapshotter found the snapshot.
+      Repatch.restore(Storage, :snapshot_started?, 1, mode: :shared)
+      {:ok, consumer_pid} = ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+      ref = Process.monitor(consumer_pid)
+
+      assert :started = GenServer.call(consumer_pid, :await_snapshot_start)
+      assert_receive {:snapshotter_exiting, snapshotter}
+      assert Process.alive?(failed_snapshotter)
+
+      for pid <- [failed_snapshotter, snapshotter], do: send(pid, {test_pid, :exit})
+      refute_receive {:DOWN, ^ref, :process, ^consumer_pid, _}
+      assert ShapeCache.ShapeStatus.has_shape_handle?(ctx.stack_id, shape_handle)
+    end
+
+    # A held admission is retried by a snapshotter the consumer starts later, which writes the
+    # snapshot. The consumer waited for the exit of its first snapshotter only, and suspended while
+    # the retried one was writing.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true, hold_started_snapshot?: true
+    test "a consumer does not suspend while the snapshot of a retried admission is written",
+         ctx do
+      held = :atomics.new(1, [])
+
+      Repatch.patch(
+        Electric.Replication.PublicationManager,
+        :add_shape,
+        [mode: :shared],
+        fn _stack_id, _shape_handle, _shape ->
+          if :atomics.compare_exchange(held, 1, 0, 1) == :ok,
+            do: {:error, Electric.SnapshotError.publication_admission_pending()},
+            else: :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer.Snapshotter)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:writing_snapshot, snapshotter}, 5_000
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # Ten suspension periods pass with the retried snapshot held, and the consumer goes idle.
+      refute_receive {:DOWN, ^ref, :process, ^consumer_pid, _}, 100
+      wait_until_hibernating(consumer_pid)
+
+      snapshotter_ref = Process.monitor(snapshotter)
+      send(snapshotter, {self(), :finish})
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, :normal}
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+    end
+
+    # A restored shape whose snapshot started but whose snapshot position is not known suspends when
+    # its admission fails, as it does when its snapshot fails, and the snapshotter that reported the
+    # failure kept its name while it exited: the consumer restored meanwhile could not start its own.
+    @tag suspend: true
+    test "a consumer restored before the snapshotter of a failed admission has exited snapshots again",
+         ctx do
+      test_pid = self()
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      send(consumer_pid, {:configure_suspend, 5, 5, 10})
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      Repatch.patch(Shapes.Consumer.Snapshotter, :terminate, [mode: :shared], fn _reason, state ->
+        if state.shape_handle == shape_handle do
+          send(test_pid, {:snapshotter_exiting, self()})
+
+          receive do
+            {^test_pid, :exit} -> :ok
+          end
+        end
+
+        :ok
+      end)
+
+      failed = :atomics.new(1, [])
+
+      Repatch.patch(
+        Electric.Replication.PublicationManager,
+        :add_shape,
+        [mode: :shared],
+        fn _stack_id, ^shape_handle, _shape ->
+          if :atomics.compare_exchange(failed, 1, 0, 1) == :ok, do: exit(:shutdown), else: :ok
+        end
+      )
+
+      Repatch.patch(Storage, :fetch_pg_snapshot, [mode: :shared], fn _storage -> {:ok, nil} end)
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer.Snapshotter)
+
+      # A request restores the consumer and its admission fails, as it does when the publication
+      # subsystem restarts.
+      {:ok, consumer_pid} = ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:snapshotter_exiting, failed_snapshotter}
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      # The next request restores it while the failed snapshotter is still exiting.
+      Repatch.restore(Storage, :fetch_pg_snapshot, 1, mode: :shared)
+      {:ok, consumer_pid} = ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+      ref = Process.monitor(consumer_pid)
+
+      assert :started = GenServer.call(consumer_pid, :await_snapshot_start)
+      assert_receive {:snapshotter_exiting, snapshotter}
+      assert Process.alive?(failed_snapshotter)
+
+      for pid <- [failed_snapshotter, snapshotter], do: send(pid, {test_pid, :exit})
+      refute_receive {:DOWN, ^ref, :process, ^consumer_pid, _}
+      assert ShapeCache.ShapeStatus.has_shape_handle?(ctx.stack_id, shape_handle)
     end
 
     test "duplicate transaction handling is idempotent", ctx do
@@ -958,6 +1290,85 @@ defmodule Electric.Shapes.ConsumerTest do
       enable_storage_tracer_for(consumer_pid)
 
       Enum.each([f1, f2, f3], fn f ->
+        assert :ok =
+                 GenServer.call(
+                   Shapes.Consumer.name(ctx.stack_id, shape_handle),
+                   {:handle_event, f, Electric.Telemetry.OpenTelemetry.get_current_context()},
+                   :infinity
+                 )
+      end)
+
+      assert [] == Support.Trace.collect_traced_calls()
+      refute_receive {^ref, :new_changes, _}
+
+      assert ops ==
+               get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
+    end
+
+    test "skips a replayed transaction whose last change for the shape is in an earlier fragment",
+         ctx do
+      # The shape's offset after a transaction is its own last change in it, not the
+      # transaction's last offset. When that change sits in an early fragment of a large
+      # transaction, a replay ends that fragment at or below the offset and the later ones
+      # above it. Every fragment must still be skipped, and the consumer must not crash.
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape3, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      xid = 11
+      lsn = Lsn.from_integer(10)
+
+      fragments =
+        txn_fragments(xid, lsn, [
+          %{
+            has_begin?: true,
+            changes: [
+              %Changes.NewRecord{
+                relation: {"public", "test_table"},
+                record: %{"id" => "1"},
+                log_offset: LogOffset.new(lsn, 0)
+              }
+            ]
+          },
+          %{
+            changes: [
+              %Changes.NewRecord{
+                relation: {"public", "test_table"},
+                record: %{"id" => "2"},
+                log_offset: LogOffset.new(lsn, 2)
+              }
+            ]
+          },
+          %{
+            has_commit?: true,
+            changes: [
+              %Changes.NewRecord{
+                relation: {"public", "test_table"},
+                record: %{"id" => "3"},
+                log_offset: LogOffset.new(lsn, 4)
+              }
+            ]
+          }
+        ])
+
+      consumer_pid = Shapes.Consumer.whereis(ctx.stack_id, shape_handle)
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      Enum.each(fragments, &assert(:ok = ShapeLogCollector.handle_event(&1, ctx.stack_id)))
+
+      # only the first fragment's change matches `id = 1`
+      shape_offset = LogOffset.new(lsn, 0)
+      assert_receive {^ref, :new_changes, ^shape_offset}
+      assert {:ok, ^shape_offset} = Storage.fetch_latest_offset(shape_storage)
+
+      assert [_] =
+               ops =
+               get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
+
+      enable_storage_tracer_for(consumer_pid)
+
+      Enum.each(fragments, fn f ->
         assert :ok =
                  GenServer.call(
                    Shapes.Consumer.name(ctx.stack_id, shape_handle),
@@ -1478,13 +1889,13 @@ defmodule Electric.Shapes.ConsumerTest do
       ref = ctx.consumer_supervisor |> GenServer.whereis() |> Process.monitor()
       # Stop the consumer and the shape cache server to simulate a restart
       stop_supervised!(ctx.consumer_supervisor)
-      assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+      assert_receive {:DOWN, ^ref, :process, _pid, _reason}
 
       shape_cache_pid = ctx.stack_id |> ShapeCache.name() |> GenServer.whereis()
       assert is_pid(shape_cache_pid)
       ref = Process.monitor(shape_cache_pid)
       stop_supervised!(ctx.shape_cache)
-      assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+      assert_receive {:DOWN, ^ref, :process, _pid, _reason}
 
       stop_supervised!("shape_task_supervisor")
 
@@ -1523,7 +1934,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 10}, 1_000
+      assert_receive {:flush_boundary_updated, 10}
     end
 
     @tag pg_snapshot: {10, 15, [12]}
@@ -1557,8 +1968,705 @@ defmodule Electric.Shapes.ConsumerTest do
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
       assert :ok = ShapeLogCollector.handle_event(txn2, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
-      assert_receive {:flush_boundary_updated, 301}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
+      assert_receive {:flush_boundary_updated, 301}
+    end
+
+    # A removal whose catalog write a crash lost leaves the catalog with the shape and its storage
+    # without it, as does a crash that takes the directory before it is synced. A directory
+    # removed under the running stack leaves the snapshot cached over it as well.
+    for {loss, message} <- [
+          cleanup: "has a started snapshot in the catalog and none in storage",
+          directory_removed: "has lost its files while its snapshot is still cached"
+        ] do
+      @tag hibernate_after: 10, shape_suspend_after: 10
+      @tag suspend: true
+      test "a restored shape whose storage is gone (#{loss}) is removed, not rebuilt under its handle",
+           ctx do
+        register_as_replication_client(ctx.stack_id)
+        {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+        consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+        ref = Process.monitor(consumer_pid)
+        assert_receive {:snapshot, ^shape_handle, snapshotter}
+        snapshotter_ref = Process.monitor(snapshotter)
+        :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+        # Gone, so the restart below cannot fail on its name.
+        assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                       when reason in [:normal, :noproc]
+
+        assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+        case unquote(loss) do
+          :cleanup ->
+            :ok = Storage.cleanup!(ctx.storage, shape_handle)
+
+          :directory_removed ->
+            ctx.stack_id
+            |> Storage.opt_for_stack(:base_path)
+            |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+            |> File.rm_rf!()
+        end
+
+        # A transaction for the shape restores its consumer.
+        lsn = Lsn.from_integer(300)
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok =
+                     ShapeLogCollector.handle_event(
+                       complete_txn_fragment(2, lsn, [
+                         %Changes.NewRecord{
+                           relation: {"public", "test_table"},
+                           record: %{"id" => "21"},
+                           log_offset: LogOffset.new(lsn, 0)
+                         }
+                       ]),
+                       ctx.stack_id
+                     )
+
+            assert_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+          end)
+
+        assert log =~ unquote(message)
+      end
+    end
+
+    # A removal, an expiry say, that takes the row after a restore read it finds no consumer to
+    # stop and removes the files. The restore must not create the storage anew under the handle.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true
+    test "a shape removed while a restore starts its consumer is not created anew", ctx do
+      register_as_replication_client(ctx.stack_id)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:snapshot, ^shape_handle, snapshotter}
+      snapshotter_ref = Process.monitor(snapshotter)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # Gone, so the restart below cannot fail on its name.
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                     when reason in [:normal, :noproc]
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      shape_dir =
+        ctx.stack_id
+        |> Storage.opt_for_stack(:base_path)
+        |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+      assert File.dir?(shape_dir)
+      stack_id = ctx.stack_id
+      removed = :atomics.new(1, [])
+
+      Repatch.patch(
+        Electric.ShapeCache.ShapeStatus,
+        :fetch_shape_by_handle,
+        [mode: :shared],
+        fn ^stack_id, ^shape_handle = handle ->
+          read =
+            Repatch.real(Electric.ShapeCache.ShapeStatus.fetch_shape_by_handle(stack_id, handle))
+
+          if :atomics.compare_exchange(removed, 1, 0, 1) == :ok do
+            Electric.ShapeCache.ShapeCleaner.remove_shape(stack_id, handle)
+          end
+
+          read
+        end
+      )
+
+      Repatch.allow(self(), GenServer.whereis(ShapeCache.name(ctx.stack_id)))
+      test_pid = self()
+      held = :atomics.new(1, [])
+
+      # Held as it starts, before any check, until the test monitors it: a consumer that exited
+      # first left the monitor `:noproc`, which hid the reason it exited with.
+      Repatch.patch(Storage, :for_stack, [mode: :shared], fn stack ->
+        if Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} and
+             :atomics.compare_exchange(held, 1, 0, 1) == :ok do
+          send(test_pid, {:restoring, self()})
+          receive(do: (:go -> :ok))
+        end
+
+        Repatch.real(Storage.for_stack(stack))
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+
+      assert {:ok, restored_pid} = ShapeCache.start_consumer_for_handle(shape_handle, stack_id)
+      restored_ref = Process.monitor(restored_pid)
+      assert_receive {:restoring, ^restored_pid}
+      send(restored_pid, :go)
+
+      assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, {:shutdown, :cleanup}}
+
+      refute_receive {:snapshot, ^shape_handle, _snapshotter}
+      refute File.exists?(shape_dir)
+    end
+
+    # The stack restarts the owner of its table of shapes, and every consumer with it. A consumer
+    # restoring its shape for a change meanwhile can find the table gone, before its first look at
+    # it or between its two. That says nothing of the shape, whose row and files a crash's cleanup
+    # would remove, and the cleanup outlives the restart. Nor may the restore stop: the collector
+    # takes a stop for a teardown and lets the change be acknowledged, which the shape never wrote.
+    for {moment, between?, removed?} <- [
+          {"before its looks", false, false},
+          {"between its looks", true, false},
+          {"and the shape out of the catalog", false, true}
+        ] do
+      @tag hibernate_after: 10, shape_suspend_after: 10
+      @tag suspend: true
+      @tag with_pure_file_storage_opts: [flush_period: 1]
+      test "a restore for a change that finds the table of shapes gone #{moment}", ctx do
+        alias Electric.ShapeCache.ShapeStatus
+        alias Electric.ShapeCache.ShapeStatus.ShapeDb
+
+        register_as_replication_client(ctx.stack_id)
+        {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+        consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+        ref = Process.monitor(consumer_pid)
+        assert_receive {:snapshot, ^shape_handle, snapshotter}
+        snapshotter_ref = Process.monitor(snapshotter)
+        :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+        # Gone, so the restart below cannot fail on its name.
+        assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                       when reason in [:normal, :noproc]
+
+        assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+        # The restored consumer would suspend as soon as it has flushed the change, and its exit
+        # below would read as a removal.
+        Electric.StackConfig.put(ctx.stack_id, :shape_enable_suspend?, false)
+
+        shape_dir =
+          ctx.stack_id
+          |> Storage.opt_for_stack(:base_path)
+          |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+        assert File.dir?(shape_dir)
+        test_pid = self()
+        held = :atomics.new(1, [])
+
+        hold = fn ->
+          if Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} and
+               :atomics.compare_exchange(held, 1, 0, 1) == :ok do
+            send(test_pid, {:restoring, self()})
+            receive(do: (:go -> :ok))
+          end
+        end
+
+        if unquote(between?) do
+          Repatch.patch(ShapeStatus, :has_shape_handle?, [mode: :shared], fn stack, handle ->
+            found = Repatch.real(ShapeStatus.has_shape_handle?(stack, handle))
+            hold.()
+            found
+          end)
+        else
+          Repatch.patch(Storage, :for_stack, [mode: :shared], fn stack ->
+            hold.()
+            Repatch.real(Storage.for_stack(stack))
+          end)
+        end
+
+        Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+
+        lsn = Lsn.from_integer(300)
+
+        txn =
+          complete_txn_fragment(100, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "21"},
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ])
+
+        routing = Task.async(fn -> ShapeLogCollector.handle_event(txn, ctx.stack_id) end)
+        assert_receive {:restoring, restored_pid}
+        restored_ref = Process.monitor(restored_pid)
+        if unquote(removed?), do: :ok = ShapeDb.remove_shape(ctx.stack_id, shape_handle)
+        stop_supervised!(ctx.shape_status_owner)
+        refute ShapeStatus.available?(ctx.stack_id)
+
+        # The LSN tracker's table goes with the same owner, and the collector fails on it before it
+        # acknowledges the change. Kept here, so the collector goes on as it would with that table
+        # anywhere else.
+        :ok = Electric.LsnTracker.initialize(ctx.stack_id)
+        send(restored_pid, :go)
+        assert :ok = Task.await(routing)
+
+        if unquote(removed?) do
+          assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, {:shutdown, :cleanup}}
+        else
+          assert_receive {:flush_boundary_updated, 300}
+
+          assert [%{"key" => ~s'"public"."test_table"/"21"'}] =
+                   get_log_items_from_storage(
+                     LogOffset.last_before_real_offsets(),
+                     Storage.for_shape(shape_handle, ctx.storage)
+                   )
+
+          refute_received {:DOWN, ^restored_ref, :process, ^restored_pid, _reason}
+          refute_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+          assert ShapeDb.handle_exists?(ctx.stack_id, shape_handle)
+          assert File.dir?(shape_dir)
+        end
+      end
+    end
+
+    # A consumer told its snapshot started marks it in the stack's table of shapes, which goes with
+    # its owner while the stack restarts it, and every consumer with it. The mark then says nothing
+    # of the shape, whose row and files a crash's cleanup would remove, and the cleanup outlives
+    # the restart.
+    @tag delay_snapshot_creation?: true
+    test "a snapshot start told while the table of shapes is gone keeps the shape", ctx do
+      alias Electric.ShapeCache.ShapeStatus
+      alias Electric.ShapeCache.ShapeStatus.ShapeDb
+
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      assert_receive {:snapshot, ^shape_handle, snapshotter}
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      snapshotter_ref = Process.monitor(snapshotter)
+
+      shape_dir =
+        ctx.stack_id
+        |> Storage.opt_for_stack(:base_path)
+        |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+      stop_supervised!(ctx.shape_status_owner)
+      refute ShapeStatus.available?(ctx.stack_id)
+      send(snapshotter, {self(), :resume})
+
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                     when reason in [:normal, :noproc]
+
+      # The casts the snapshotter sent before it exited are handled by the time this call is.
+      assert %{} = :sys.get_state(consumer_pid)
+      refute_receive {:DOWN, ^ref, :process, ^consumer_pid, _reason}
+      refute_received {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert ShapeDb.handle_exists?(ctx.stack_id, shape_handle)
+      assert File.dir?(shape_dir)
+    end
+
+    # A refresh rebuilds the stack's table from SQLite, which the write buffer lags, and sweeps the
+    # rows the rebuild did not write, so a shape the catalog holds can miss its row there. The
+    # restore takes such a shape for removed only once the catalog says so: from the write buffer
+    # while it holds the shape, from SQLite once flushed. A walk of every shape can hold an
+    # exclusive-mode store's one connection past the read's deadline, and a read can meet another
+    # connection's lock: neither says anything of the shape. The read holds the routing of the
+    # change that restores the shape, so it waits for a connection one second at most, and a read
+    # that met a lock gives the connection back to the pool, which in exclusive mode is the only one.
+    # Nor does a catalog the stack is restarting say anything of the shape: its pool, or the
+    # registry that names it, is gone until it is back.
+    for {catalog, read} <- [
+          {"its write buffer", :buffer},
+          {"SQLite", :sqlite},
+          {"a store too busy to answer", :busy},
+          {"a store whose read meets another connection's lock", :locked},
+          {"a store whose pool is gone", :pool_gone},
+          {"a store whose pool registry is gone", :registry_gone}
+        ] do
+      @tag hibernate_after: 10, shape_suspend_after: 10
+      @tag suspend: true
+      # A rollback journal, the one exclusive mode uses, lets another connection's lock stop a read.
+      @tag shape_db_opts: if(read == :locked, do: [exclusive_mode: true], else: [])
+      test "a restored shape the stack's table misses is kept, the catalog read from #{catalog}",
+           ctx do
+        register_as_replication_client(ctx.stack_id)
+        {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+        consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+        ref = Process.monitor(consumer_pid)
+        assert_receive {:snapshot, ^shape_handle, snapshotter}
+        snapshotter_ref = Process.monitor(snapshotter)
+        :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+        # Gone, so the restart below cannot fail on its name.
+        assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                       when reason in [:normal, :noproc]
+
+        assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+        alias Electric.ShapeCache.ShapeStatus.ShapeDb
+
+        if unquote(read) == :buffer do
+          assert ShapeDb.WriteBuffer.has_handle?(ctx.stack_id, shape_handle) == true
+        else
+          :ok = ShapeDb.WriteBuffer.flush_sync(ctx.stack_id)
+          assert ShapeDb.WriteBuffer.has_handle?(ctx.stack_id, shape_handle) == :unknown
+        end
+
+        test_pid = self()
+        held = :atomics.new(1, [])
+        connection = ShapeDb.Connection.checkout!(ctx.stack_id, :connection, & &1)
+
+        # Held as it starts, before any check, until the test monitors it: a consumer that exited
+        # first left the monitor `:noproc`, which hid the reason it exited with.
+        Repatch.patch(Storage, :for_stack, [mode: :shared], fn stack ->
+          if Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} and
+               :atomics.compare_exchange(held, 1, 0, 1) == :ok do
+            send(test_pid, {:restoring, self()})
+            receive(do: (:go -> :ok))
+          end
+
+          Repatch.real(Storage.for_stack(stack))
+        end)
+
+        if unquote(read) in [:busy, :locked, :pool_gone, :registry_gone] do
+          {:ok, db_path} = ShapeDb.Connection.db_path(storage_dir: ctx.tmp_dir)
+
+          Repatch.patch(ShapeDb.Connection, :checkout!, [mode: :shared], fn stack,
+                                                                            label,
+                                                                            fun,
+                                                                            timeout ->
+            if label == :handle_exists? and
+                 Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} do
+              send(test_pid, {:catalog_read, self(), timeout})
+
+              case unquote(read) do
+                # The connection stays held until the read's deadline.
+                :busy ->
+                  Process.sleep(timeout)
+                  exit({:timeout, {NimblePool, :checkout, [label]}})
+
+                # Another instance sharing the storage holds the file for a commit.
+                :locked ->
+                  {:ok, holder} = ShapeDb.Sqlite3.open(db_path, [])
+                  :ok = ShapeDb.Connection.execute(holder, "BEGIN EXCLUSIVE")
+
+                  try do
+                    Repatch.real(ShapeDb.Connection.checkout!(stack, label, fun, timeout))
+                  after
+                    :ok = ShapeDb.Connection.execute(holder, "ROLLBACK")
+                    :ok = ShapeDb.Connection.close(holder)
+                  end
+
+                # What `NimblePool.checkout!/4` exits with when its pool is not registered, or
+                # stops during the checkout.
+                :pool_gone ->
+                  exit({:noproc, {NimblePool, :checkout, [label]}})
+
+                # What the pool registry's name lookup raises once its table is gone.
+                :registry_gone ->
+                  :ets.lookup_element(:"#{stack}:shape_db_registry_gone", :read, 2, nil)
+              end
+            else
+              Repatch.real(ShapeDb.Connection.checkout!(stack, label, fun, timeout))
+            end
+          end)
+        end
+
+        Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+
+        :ets.delete(:"shape_meta_table:#{ctx.stack_id}", shape_handle)
+        refute Electric.ShapeCache.ShapeStatus.has_shape_handle?(ctx.stack_id, shape_handle)
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:ok, restored_pid} =
+                     ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+            restored_ref = Process.monitor(restored_pid)
+            assert_receive {:restoring, ^restored_pid}
+            send(restored_pid, :go)
+
+            assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, {:shutdown, :suspend}}
+
+            if unquote(read) not in [:buffer, :sqlite] do
+              assert_received {:catalog_read, ^restored_pid, timeout}
+              assert timeout <= 1_000
+            end
+          end)
+
+        if unquote(read) not in [:buffer, :sqlite],
+          do: assert(log =~ "without confirming it in the catalog, which did not answer")
+
+        if unquote(read) == :locked do
+          assert ShapeDb.Connection.checkout!(ctx.stack_id, :connection, & &1) == connection
+          assert log =~ "ShapeDb handle_exists? failed: 5"
+        end
+
+        refute_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+        assert ShapeDb.handle_exists?(ctx.stack_id, shape_handle)
+
+        shape_dir =
+          ctx.stack_id
+          |> Storage.opt_for_stack(:base_path)
+          |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+        assert File.exists?(Path.join([shape_dir, "metadata", "last_snapshot_chunk.bin"]))
+      end
+    end
+
+    # A read can fail for another reason than a lock, an I/O error that SQLite recovers from say,
+    # and that says nothing of the shape either: a removal on it would delete a shape the catalog
+    # still holds, files and all, once SQLite recovered. Nor does it say anything of the file: the
+    # store's only connection, reopened, would rerun the boot's integrity check, which deletes the
+    # store when the same fault fails it.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true
+    @tag shape_db_opts: [exclusive_mode: true]
+    test "a restored shape the stack's table misses is kept on a catalog read that fails", ctx do
+      register_as_replication_client(ctx.stack_id)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:snapshot, ^shape_handle, snapshotter}
+      snapshotter_ref = Process.monitor(snapshotter)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                     when reason in [:normal, :noproc]
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+      alias Electric.ShapeCache.ShapeStatus.ShapeDb
+      :ok = ShapeDb.WriteBuffer.flush_sync(ctx.stack_id)
+      connection = ShapeDb.Connection.checkout!(ctx.stack_id, :connection, & &1)
+
+      # SQLITE_IOERR_READ, which says nothing of a lock, from the read's step on the pool's own
+      # connection: the checkout runs its function in the consumer.
+      Repatch.patch(ShapeDb.Connection, :checkout!, [mode: :shared], fn stack,
+                                                                        label,
+                                                                        fun,
+                                                                        timeout ->
+        if label == :handle_exists? and
+             Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} do
+          Process.put(:fault_step, true)
+
+          # Not `Repatch.real/1`, which leaves every call under it unpatched, the step too.
+          try do
+            Repatch.super(ShapeDb.Connection.checkout!(stack, label, fun, timeout))
+          after
+            Process.delete(:fault_step)
+          end
+        else
+          Repatch.real(ShapeDb.Connection.checkout!(stack, label, fun, timeout))
+        end
+      end)
+
+      Repatch.patch(ShapeDb.Sqlite3, :step, [mode: :shared], fn conn, stmt ->
+        if Process.get(:fault_step),
+          do: {:error, 266},
+          else: Repatch.real(ShapeDb.Sqlite3.step(conn, stmt))
+      end)
+
+      test_pid = self()
+      held = :atomics.new(1, [])
+
+      # Held as it starts, until the test monitors it, so the monitor sees the reason it exits with.
+      Repatch.patch(Storage, :for_stack, [mode: :shared], fn stack ->
+        if Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} and
+             :atomics.compare_exchange(held, 1, 0, 1) == :ok do
+          send(test_pid, {:restoring, self()})
+          receive(do: (:go -> :ok))
+        end
+
+        Repatch.real(Storage.for_stack(stack))
+      end)
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+      :ets.delete(:"shape_meta_table:#{ctx.stack_id}", shape_handle)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, restored_pid} =
+                   ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+          restored_ref = Process.monitor(restored_pid)
+          assert_receive {:restoring, ^restored_pid}
+          send(restored_pid, :go)
+
+          assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, {:shutdown, :suspend}}
+        end)
+
+      assert log =~
+               "Restoring shape #{shape_handle} without confirming it in the catalog, which " <>
+                 "did not answer: ShapeDb handle_exists? failed: 266"
+
+      assert ShapeDb.Connection.checkout!(ctx.stack_id, :connection, & &1) == connection
+      refute_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert ShapeDb.handle_exists?(ctx.stack_id, shape_handle)
+
+      shape_dir =
+        ctx.stack_id
+        |> Storage.opt_for_stack(:base_path)
+        |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+      assert File.exists?(Path.join([shape_dir, "metadata", "last_snapshot_chunk.bin"]))
+    end
+
+    # Two removals of one shape after the restore's check: the second finds the catalog row gone
+    # and asks the log collector to drop the shape, which takes the consumer out of the registry,
+    # so the first finds no consumer to stop and removes the files. The restore must not create the
+    # storage anew under the handle.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true
+    test "a restore two removals overtake after its check creates no storage", ctx do
+      register_as_replication_client(ctx.stack_id)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:snapshot, ^shape_handle, snapshotter}
+      snapshotter_ref = Process.monitor(snapshotter)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # Gone, so the restart below cannot fail on its name.
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                     when reason in [:normal, :noproc]
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      shape_dir =
+        ctx.stack_id
+        |> Storage.opt_for_stack(:base_path)
+        |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+      assert File.dir?(shape_dir)
+      stack_id = ctx.stack_id
+      raced = :atomics.new(1, [])
+
+      Repatch.patch(
+        Electric.ShapeCache.ShapeStatus,
+        :has_shape_handle?,
+        [mode: :shared],
+        fn stack, handle ->
+          held? = Repatch.real(Electric.ShapeCache.ShapeStatus.has_shape_handle?(stack, handle))
+
+          # The restored consumer's check, once it passed.
+          if held? and handle == shape_handle and
+               Process.get(:"$initial_call") == {Electric.Shapes.Consumer, :init, 1} and
+               :atomics.compare_exchange(raced, 1, 0, 1) == :ok do
+            Electric.Shapes.ConsumerRegistry.remove_consumer(handle, stack_id)
+
+            Task.async(fn -> Electric.ShapeCache.ShapeCleaner.remove_shape(stack_id, handle) end)
+            |> Task.await()
+          end
+
+          held?
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, restored_pid} =
+                   ShapeCache.start_consumer_for_handle(shape_handle, stack_id)
+
+          restored_ref = Process.monitor(restored_pid)
+
+          assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, reason}
+                         when reason != {:shutdown, :suspend}
+
+          refute_receive {:snapshot, ^shape_handle, _snapshotter}
+        end)
+
+      assert :atomics.get(raced, 1) == 1
+      refute File.exists?(shape_dir)
+      assert log =~ "has no storage to restore"
+    end
+
+    # A connection-subsystem restart fails the publication registration of every shape it
+    # restores. A restored shape reads its snapshot marker from disk, as after a restart, and its
+    # complete snapshot keeps it and its handle while its consumer tries the admission again.
+    @tag hibernate_after: 10, shape_suspend_after: 10
+    @tag suspend: true
+    test "a restored shape with a complete snapshot, its storage cache cold, keeps its handle through a retryable failure",
+         ctx do
+      register_as_replication_client(ctx.stack_id)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      assert_receive {:snapshot, ^shape_handle, snapshotter}
+      snapshotter_ref = Process.monitor(snapshotter)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      # Gone, so the restart below cannot fail on its name.
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, reason}
+                     when reason in [:normal, :noproc]
+
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
+
+      {Electric.ShapeCache.PureFileStorage, shape_opts} =
+        Storage.for_shape(shape_handle, ctx.storage)
+
+      :ets.delete(shape_opts.stack_ets, shape_handle)
+      test_pid = self()
+
+      # Held until the test monitors the restored consumer, which tries the admission again.
+      Repatch.patch(
+        Electric.Replication.PublicationManager,
+        :add_shape,
+        [mode: :shared],
+        fn _stack_id, ^shape_handle, _shape ->
+          send(test_pid, {:add_shape, self()})
+
+          receive do
+            :fail -> exit(:shutdown)
+            :admit -> :ok
+          end
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer.Snapshotter)
+
+      assert {:ok, restored_pid} =
+               ShapeCache.start_consumer_for_handle(shape_handle, ctx.stack_id)
+
+      restored_ref = Process.monitor(restored_pid)
+      assert_receive {:add_shape, snapshotter}
+      send(snapshotter, :fail)
+
+      assert_receive {:add_shape, retried_snapshotter}, 5_000
+      assert Process.alive?(restored_pid)
+      send(retried_snapshotter, :admit)
+
+      # Once admitted, the consumer goes idle and suspends.
+      assert_receive {:DOWN, ^restored_ref, :process, ^restored_pid, {:shutdown, :suspend}}
+      refute_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert Electric.ShapeCache.ShapeStatus.has_shape_handle?(ctx.stack_id, shape_handle)
+
+      shape_dir =
+        ctx.stack_id
+        |> Storage.opt_for_stack(:base_path)
+        |> Electric.ShapeCache.PureFileStorage.shape_data_dir(shape_handle)
+
+      assert File.exists?(Path.join([shape_dir, "metadata", "last_snapshot_chunk.bin"]))
+    end
+
+    # A request at offset `now` takes the shape's latest offset without waiting for the snapshot,
+    # so a client may hold an offset of a shape whose snapshot never started. A snapshot taken anew
+    # under the same handle would not go on from it.
+    test "a shape whose snapshot failed before it started is removed, not suspended", ctx do
+      register_as_replication_client(ctx.stack_id)
+      test_pid = self()
+      failed = :atomics.new(1, [])
+
+      Repatch.patch(
+        Electric.Replication.PublicationManager,
+        :add_shape,
+        [mode: :shared],
+        fn _stack_id, _shape_handle, _shape ->
+          if :atomics.compare_exchange(failed, 1, 0, 1) == :ok do
+            send(test_pid, {:add_shape, self()})
+            receive(do: (:fail -> exit(:shutdown)))
+          else
+            :ok
+          end
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Electric.Shapes.Consumer.Snapshotter)
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      assert_receive {:add_shape, snapshotter}
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Process.monitor(consumer_pid)
+      snapshotter_ref = Process.monitor(snapshotter)
+      send(snapshotter, :fail)
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :cleanup}}
+      assert_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert_receive {:DOWN, ^snapshotter_ref, :process, ^snapshotter, :normal}
     end
 
     @tag hibernate_after: 10, shape_suspend_after: 20
@@ -1587,10 +2695,10 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       # The consumer hibernates, then suspends shape_suspend_after later;
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}, 200
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
 
       refute Consumer.whereis(ctx.stack_id, shape_handle)
     end
@@ -1626,7 +2734,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       # A shape with dependencies hibernates but never arms a suspend timer
       # (consumer_can_suspend? is false), so it can never suspend. Observing a
@@ -1704,7 +2812,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(commit_fragment, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
 
@@ -1736,7 +2844,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       # Suspend is disabled (@tag suspend: false), so the consumer never suspends
       # on its own and stays alive.
@@ -1747,7 +2855,7 @@ defmodule Electric.Shapes.ConsumerTest do
       Shapes.ConsumerRegistry.enable_suspend(ctx.stack_id, 5, 5, 10)
 
       # Enabling suspend on the live consumer makes it suspend on the next cycle.
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}, 200
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
       refute Consumer.whereis(ctx.stack_id, shape_handle)
     end
 
@@ -1778,7 +2886,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
 
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       # The consumer hibernates first (for GC) and arms a suspend timer rather
       # than suspending directly. Observing an armed timer while hibernated
@@ -1787,7 +2895,7 @@ defmodule Electric.Shapes.ConsumerTest do
       assert Process.alive?(consumer_pid)
 
       # It then suspends once shape_suspend_after elapses.
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}, 300
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
 
       refute Consumer.whereis(ctx.stack_id, shape_handle)
     end
@@ -1819,7 +2927,7 @@ defmodule Electric.Shapes.ConsumerTest do
         ])
 
       assert :ok = ShapeLogCollector.handle_event(txn1, ctx.stack_id)
-      assert_receive {:flush_boundary_updated, 300}, 1_000
+      assert_receive {:flush_boundary_updated, 300}
 
       # Once hibernated, a suspend timer is armed.
       ref1 = await_hibernation(consumer_pid)
@@ -1836,7 +2944,7 @@ defmodule Electric.Shapes.ConsumerTest do
         ])
 
       assert :ok = ShapeLogCollector.handle_event(txn2, ctx.stack_id)
-      assert_receive {:flush_boundary_updated, 301}, 1_000
+      assert_receive {:flush_boundary_updated, 301}
 
       # After re-hibernating, a *fresh* timer is armed and the original one reads
       # as cancelled - proving the activity reset the suspend cycle rather than
@@ -1883,7 +2991,7 @@ defmodule Electric.Shapes.ConsumerTest do
       :sys.replace_state(consumer_pid, fn state -> %{state | txn_offset_mapping: []} end)
       send(consumer_pid, {:configure_suspend, 5, 5, 10})
 
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}, 500
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
     end
 
     @tag hibernate_after: 10, shape_suspend_after: 300
@@ -1915,7 +3023,7 @@ defmodule Electric.Shapes.ConsumerTest do
       :sys.replace_state(consumer_pid, fn state -> %{state | pending_flush_offset: nil} end)
       send(consumer_pid, {:configure_suspend, 5, 5, 10})
 
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}, 500
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, {:shutdown, :suspend}}
     end
 
     @tag with_pure_file_storage_opts: [compaction_period: 5, keep_complete_chunks: 133]
@@ -2021,6 +3129,100 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = Materializer.wait_until_ready(materializer_opts)
       assert Materializer.get_link_values(materializer_opts) == MapSet.new([1, 2])
+    end
+
+    test "a shape holding whole transactions is removed when one goes over the buffer limit",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      :sys.replace_state(consumer_pid, &%{&1 | write_unit: :txn, txn_buffer_max_changes: 2})
+      monitor = Process.monitor(consumer_pid)
+
+      xid = 11
+      lsn = Lsn.from_integer(10)
+
+      new_record = fn id, offset ->
+        %Changes.NewRecord{
+          relation: {"public", "test_table"},
+          record: %{"id" => id},
+          log_offset: offset
+        }
+      end
+
+      begin_fragment =
+        txn_fragment(
+          xid,
+          lsn,
+          [new_record.("1", LogOffset.new(lsn, 0)), new_record.("2", LogOffset.new(lsn, 2))],
+          has_begin?: true
+        )
+
+      assert :ok = ShapeLogCollector.handle_event(begin_fragment, ctx.stack_id)
+
+      # Two buffered changes are within the limit.
+      assert %{terminating?: false} = :sys.get_state(consumer_pid)
+
+      middle_fragment = txn_fragment(xid, lsn, [new_record.("3", LogOffset.new(lsn, 4))], [])
+
+      assert :ok = ShapeLogCollector.handle_event(middle_fragment, ctx.stack_id)
+
+      assert_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert_receive {:DOWN, ^monitor, :process, ^consumer_pid, _}
+
+      # The rest of the transaction still goes through.
+      commit_fragment =
+        txn_fragment(xid, lsn, [new_record.("4", LogOffset.new(lsn, 6))], has_commit?: true)
+
+      assert :ok = ShapeLogCollector.handle_event(commit_fragment, ctx.stack_id)
+    end
+
+    @tag delay_snapshot_creation?: true
+    test "a shape waiting for its snapshot is removed when its buffer goes over the limit",
+         ctx do
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+      assert_receive {:snapshot, ^shape_handle, _snapshotter_pid}
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      :sys.replace_state(consumer_pid, &%{&1 | txn_buffer_max_changes: 2})
+      monitor = Process.monitor(consumer_pid)
+
+      xid = 11
+      lsn = Lsn.from_integer(10)
+
+      new_record = fn id, offset ->
+        %Changes.NewRecord{
+          relation: {"public", "test_table"},
+          record: %{"id" => id},
+          log_offset: offset
+        }
+      end
+
+      begin_fragment =
+        txn_fragment(
+          xid,
+          lsn,
+          [new_record.("1", LogOffset.new(lsn, 0)), new_record.("2", LogOffset.new(lsn, 2))],
+          has_begin?: true
+        )
+
+      assert :ok = ShapeLogCollector.handle_event(begin_fragment, ctx.stack_id)
+
+      # An ordinary shape, still waiting for its snapshot, within the limit.
+      assert %{
+               write_unit: :txn_fragment,
+               buffering?: true,
+               buffered_changes: 2,
+               terminating?: false
+             } = :sys.get_state(consumer_pid)
+
+      middle_fragment = txn_fragment(xid, lsn, [new_record.("3", LogOffset.new(lsn, 4))], [])
+
+      assert :ok = ShapeLogCollector.handle_event(middle_fragment, ctx.stack_id)
+
+      assert_receive {Electric.ShapeCache.ShapeCleaner, :cleanup, ^shape_handle}
+      assert_receive {:DOWN, ^monitor, :process, ^consumer_pid, _}
     end
 
     @tag with_pure_file_storage_opts: [flush_period: 1]
@@ -2258,15 +3460,14 @@ defmodule Electric.Shapes.ConsumerTest do
       # Regression test for https://github.com/electric-sql/electric/issues/4063
       #
       # When a non-commit fragment has enough data to trigger a buffer-size
-      # flush (>= 64KB), the :flushed message is placed in the consumer's
-      # mailbox during processing. The consumer process ends up handling the :flushed message
-      # before receiving the commit fragment. But since the offset it sends to FlushTracker
-      # predates the commit fragment's offset, the FlushTracker keeps the shape in the
-      # "pending" state and there's no follow-up notification from the consumer that would
-      # unblock it.
+      # flush (>= 64KB), the flushed offset predates the commit fragment's offset. The
+      # FlushTracker used to keep the shape in the "pending" state forever, with no
+      # follow-up notification from the consumer to unblock it.
       #
-      # A high flush_period prevents timer-based flushes so the only flush
-      # comes from the buffer-size trigger, making the test deterministic.
+      # A buffer-size flush only writes; the datasync — and with it the :flushed
+      # notification — comes from the commit, which advances the durable boundary over
+      # everything the fragment wrote. The flush_period is set past the test's own
+      # timeouts so the commit is the only thing that can produce that notification.
 
       {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape1, stack_id)
       :started = ShapeCache.await_snapshot_start(shape_handle, stack_id)
@@ -2323,8 +3524,6 @@ defmodule Electric.Shapes.ConsumerTest do
           has_commit?: true
         )
 
-      # Send non-commit fragment. The large record triggers a buffer flush,
-      # placing {Storage, :flushed, offset} in the consumer's mailbox.
       Support.Trace.trace_shape_log_collector_calls(
         pid: Shapes.Consumer.whereis(stack_id, shape_handle),
         functions: [:notify_flushed]
@@ -2332,8 +3531,8 @@ defmodule Electric.Shapes.ConsumerTest do
 
       assert :ok = ShapeLogCollector.handle_event(non_commit_fragment, stack_id)
 
-      # With deferred flush notifications, the consumer does NOT call notify_flushed
-      # after the non-commit fragment. The :flushed message is saved for later.
+      # The buffer-size flush wrote the large record but did not sync it, so nothing
+      # notifies the collector mid-transaction.
       assert [] == Support.Trace.collect_traced_calls()
 
       # Send the commit fragment to finalize the transaction.
@@ -2342,22 +3541,22 @@ defmodule Electric.Shapes.ConsumerTest do
       # Consumer has processed the relevant change...
       assert_receive {^ref, :new_changes, ^relevant_change_offset}, @receive_timeout
 
-      # The deferred flush notification is sent after the commit with the
-      # aligned offset (the commit fragment's last_log_offset).
+      # ...and the commit's sync advances the flush boundary.
+      tx_offset = commit_fragment.last_log_offset.tx_offset
+      assert_receive {:flush_boundary_updated, ^tx_offset}, @receive_timeout
+
+      # The deferred flush notification carried the aligned offset (the commit fragment's
+      # last_log_offset), not the mid-transaction offset of the buffer-size flush.
       commit_last_log_offset = commit_fragment.last_log_offset
 
       assert [
                {ShapeLogCollector, :notify_flushed,
                 [^stack_id, ^shape_handle, ^commit_last_log_offset]}
              ] = Support.Trace.collect_traced_calls()
-
-      # Flush boundary advances correctly.
-      tx_offset = commit_fragment.last_log_offset.tx_offset
-      assert_receive {:flush_boundary_updated, ^tx_offset}, @receive_timeout
     end
 
     @tag with_pure_file_storage_opts: [flush_period: 1]
-    test "dead consumer doesn't block flush notifications from advancing as live consumers flush to storage",
+    test "dead consumer holds the flush boundary only until the stall check removes its shape",
          ctx do
       {shape_handle1, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
       {shape_handle2, _} = ShapeCache.get_or_create_shape_handle(@shape2, ctx.stack_id)
@@ -2401,7 +3600,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
       # Terminate the consumer for shape2. Using :shutdown as the exit reason
       # means ShapeCleaner.handle_writer_termination/3 does NOT remove the shape
-      # from ShapeLogCollector, so it stays in the FlushTracker indefinitely.
+      # or its registry entry: the shape stays valid, with a dead consumer.
       dead_consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle2)
       dead_ref = Process.monitor(dead_consumer_pid)
       Process.exit(dead_consumer_pid, :shutdown)
@@ -2426,9 +3625,6 @@ defmodule Electric.Shapes.ConsumerTest do
 
       log =
         ExUnit.CaptureLog.capture_log(fn ->
-          # By the time this call to handle_event() returns, the dead consumer will have been
-          # removed from FlushTracker's state, so it can advance its confirmed flushed offset to
-          # the last processed transaction.
           assert :ok = ShapeLogCollector.handle_event(txn2, ctx.stack_id)
         end)
 
@@ -2436,7 +3632,22 @@ defmodule Electric.Shapes.ConsumerTest do
                ~s'Consumer processes crashed or missing during broadcast: %{#{inspect(shape_handle2)} => :noproc}'
 
       assert_receive {^ref1, :new_changes, _}, @receive_timeout
+
+      # shape2 is still valid and never received txn2, so the boundary must not pass it yet.
+      refute_receive {:flush_boundary_updated, 20}
+
+      # The stall check removes the shape, and only then does the boundary move.
+      Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+      Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+      Process.sleep(50)
+
+      ctx.stack_id
+      |> ShapeLogCollector.name()
+      |> GenServer.whereis()
+      |> send(:check_stalled_flushes)
+
       assert_receive {:flush_boundary_updated, 20}, @receive_timeout
+      assert :error = Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle2)
 
       lsn3 = Lsn.from_integer(30)
 
@@ -2456,6 +3667,87 @@ defmodule Electric.Shapes.ConsumerTest do
       # shape1 has flushed all the way through lsn 30 so that's what we expect FlushTracker to
       # advance its confirmed offset to.
       assert_receive {:flush_boundary_updated, 30}, @receive_timeout
+    end
+
+    for busy_catalog? <- [false, true] do
+      @tag with_pure_file_storage_opts: [flush_period: 1]
+      test "a consumer that crashes on a commit loses its shape before the boundary passes it#{if busy_catalog?, do: ", the catalog busy past its deadline"}",
+           ctx do
+        {shape_handle1, _} = ShapeCache.get_or_create_shape_handle(@shape1, ctx.stack_id)
+        {shape_handle2, _} = ShapeCache.get_or_create_shape_handle(@shape2, ctx.stack_id)
+        ref1 = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle1)
+
+        :started = ShapeCache.await_snapshot_start(shape_handle1, ctx.stack_id)
+        :started = ShapeCache.await_snapshot_start(shape_handle2, ctx.stack_id)
+
+        register_as_replication_client(ctx.stack_id)
+
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+        crashing_consumer = Consumer.whereis(ctx.stack_id, shape_handle2)
+        crash_ref = Process.monitor(crashing_consumer)
+
+        # The real removal chain runs inside the collector here, not a stub: the consumer for
+        # shape2 raises while it writes the commit, and nothing else is patched.
+        Repatch.patch(ShapeCache.Storage, :append_to_log!, [mode: :shared], fn items, writer ->
+          if self() == crashing_consumer,
+            do: raise("write failed"),
+            else: Repatch.real(ShapeCache.Storage.append_to_log!(items, writer))
+        end)
+
+        Repatch.patch(ShapeCache.Storage, :append_fragment_to_log!, [mode: :shared], fn items,
+                                                                                        writer ->
+          if self() == crashing_consumer,
+            do: raise("write failed"),
+            else: Repatch.real(ShapeCache.Storage.append_fragment_to_log!(items, writer))
+        end)
+
+        Repatch.allow(self(), crashing_consumer)
+
+        if unquote(busy_catalog?) do
+          # The collector's first catalog write meets a connection held past its checkout
+          # deadline, as a storm of shape requests can hold it.
+          calls = :atomics.new(1, [])
+
+          Repatch.patch(ShapeCache.ShapeStatus, :remove_shape, [mode: :shared], fn stack_id,
+                                                                                   handle ->
+            if self() == collector and :atomics.add_get(calls, 1, 1) == 1,
+              do: exit({:timeout, {NimblePool, :checkout, [:shape_db]}}),
+              else: Repatch.real(ShapeCache.ShapeStatus.remove_shape(stack_id, handle))
+          end)
+
+          Repatch.allow(self(), collector)
+        end
+
+        lsn = Lsn.from_integer(10)
+
+        txn =
+          complete_txn_fragment(11, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "1"},
+              log_offset: LogOffset.new(lsn, 0)
+            },
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "1"},
+              log_offset: LogOffset.new(lsn, 2)
+            }
+          ])
+
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+        end)
+
+        assert_receive {:DOWN, ^crash_ref, :process, ^crashing_consumer, {%RuntimeError{}, _}},
+                       @receive_timeout
+
+        # Removed by the time the collector returned, and the collector survived doing it.
+        assert :error = Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle2)
+        assert collector == ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+
+        assert_receive {^ref1, :new_changes, _}, @receive_timeout
+        assert_receive {:flush_boundary_updated, 10}, @receive_timeout
+      end
     end
 
     test "UPDATE during pending move-in is converted to INSERT and query result skips duplicate key",
@@ -2741,6 +4033,63 @@ defmodule Electric.Shapes.ConsumerTest do
              ] = get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
     end
 
+    test "consumer closes an empty move-in with a snapshot-end", ctx do
+      parent = self()
+
+      Repatch.patch(
+        Electric.Shapes.Consumer.Effects,
+        :query_move_in_async,
+        [mode: :shared],
+        fn _task_sup, _consumer_state, _buffering_state, consumer_pid ->
+          send(parent, {:query_requested, consumer_pid})
+          :ok
+        end
+      )
+
+      Support.TestUtils.activate_mocks_for_descendant_procs(Consumer)
+
+      {shape_handle, _} =
+        ShapeCache.get_or_create_shape_handle(@shape_with_subquery, ctx.stack_id)
+
+      :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      {:ok, shape} = Electric.Shapes.fetch_shape_by_handle(ctx.stack_id, shape_handle)
+      [dep_handle] = shape.shape_dependencies_handles
+
+      consumer_pid = Consumer.whereis(ctx.stack_id, shape_handle)
+      ref = Shapes.Consumer.register_for_changes(ctx.stack_id, shape_handle)
+
+      assert :ok = LsnTracker.broadcast_last_seen_lsn(ctx.stack_id, 100)
+
+      send(
+        consumer_pid,
+        {:materializer_changes, dep_handle, %{move_in: [{1, "1"}], move_out: []}}
+      )
+
+      assert_receive {:query_requested, ^consumer_pid}
+
+      send(consumer_pid, {:pg_snapshot_known, {100, 300, []}})
+
+      shape_storage = Storage.for_shape(shape_handle, ctx.storage)
+
+      # The move-in query found no rows.
+      send_stored_move_in_complete(consumer_pid, shape_storage, [], Lsn.from_integer(100))
+
+      assert_receive {^ref, :new_changes, _offset}, @receive_timeout
+
+      assert [
+               %{"headers" => %{"event" => "move-in"}},
+               %{
+                 "headers" => %{
+                   "control" => "snapshot-end",
+                   "xmin" => "100",
+                   "xmax" => "300",
+                   "xip_list" => []
+                 }
+               }
+             ] = get_log_items_from_storage(LogOffset.last_before_real_offsets(), shape_storage)
+    end
+
     test "consumer startup seeds the stack-scoped subquery index", ctx do
       alias Electric.Shapes.Filter.Indexes.SubqueryIndex
 
@@ -2875,12 +4224,9 @@ defmodule Electric.Shapes.ConsumerTest do
       # Wait for consumer to shut down, flushing any other messages first
       assert_receive {:DOWN, ^ref, :process, ^consumer_pid, _reason}, 5000
 
-      # The ShapeLogCollector removes the shape from the filter asynchronously.
-      # Wait briefly for it to process.
-      Process.sleep(100)
-
-      # After cleanup, the shape's rows should be removed from the index
-      refute SubqueryIndex.has_positions?(index, shape_handle)
+      # The ShapeLogCollector removes the shape from the filter asynchronously, so after
+      # cleanup the shape's rows leave the index shortly after the consumer is gone.
+      assert wait_until(fn -> not SubqueryIndex.has_positions?(index, shape_handle) end)
     end
 
     test "dependency consumer survives a :noproc from its materializer without removing the shape",
@@ -3359,7 +4705,7 @@ defmodule Electric.Shapes.ConsumerTest do
 
     send(
       consumer_pid,
-      {:query_move_in_complete, snapshot_name, length(rows), row_bytes, lsn}
+      {:query_move_in_complete, snapshot_name, length(rows), row_bytes, lsn, nil}
     )
   end
 end

@@ -5,6 +5,7 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
   import Support.DbSetup
   import Support.DbStructureSetup
   alias Electric.PersistentKV
+  alias Electric.Postgres.Inspector
   alias Electric.Postgres.Inspector.EtsInspector
 
   describe "load_relation_oid/2" do
@@ -76,8 +77,14 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       opts: opts,
       items_oid: items_oid
     } do
-      Repatch.spy(Postgrex)
-      Repatch.allow(self(), opts[:server])
+      test_pid = self()
+
+      Repatch.patch(Postgrex, :transaction, [mode: :shared], fn conn, fun ->
+        send(test_pid, {:transaction, self()})
+        Repatch.real(Postgrex.transaction(conn, fun))
+      end)
+
+      Repatch.allow(test_pid, opts[:server])
 
       task1 = Task.async(fn -> EtsInspector.load_relation_info(items_oid, opts) end)
       task2 = Task.async(fn -> EtsInspector.load_relation_info(items_oid, opts) end)
@@ -92,7 +99,9 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       # Non-parallel call should return value from cache
       assert {:ok, ^info} = EtsInspector.load_relation_info(items_oid, opts)
 
-      assert Repatch.called?(Postgrex, :transaction, 2, by: opts[:server], exactly: 1)
+      server = GenServer.whereis(opts[:server])
+      assert_received {:transaction, ^server}
+      refute_received {:transaction, _}
     end
 
     test "returns a not found marker when the relation does not exist", %{opts: opts} do
@@ -228,6 +237,40 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       assert :ets.tab2list(pg_inspector_table) == []
     end
 
+    # A failed write left the old cache on disk for the next start to restore, and the caller,
+    # told the reset worked, went on as if it had.
+    @tag :tmp_dir
+    @tag :capture_log
+    test "reports a cleared cache it could not persist", %{tmp_dir: tmp_dir} = ctx do
+      stop_supervised!(EtsInspector)
+      kv = PersistentKV.Filesystem.new!(root: tmp_dir)
+      # A directory where the cache's file goes fails its write, whoever runs the test.
+      File.mkdir_p!(Path.join([tmp_dir, "#{ctx.stack_id}:ets_inspector_state", "taken"]))
+      %{inspector: {EtsInspector, opts}} = with_inspector(%{ctx | persistent_kv: kv})
+
+      assert {:error, _} = EtsInspector.reset(opts)
+    end
+
+    # The filesystem backend raises when the directory sync after the rename fails. The raise
+    # ended the inspector, and the caller's call with it, where the caller retries a failure.
+    @tag :tmp_dir
+    @tag :capture_log
+    test "reports a cleared cache whose directory sync fails, and goes on", ctx do
+      stop_supervised!(EtsInspector)
+      kv = PersistentKV.Filesystem.new!(root: ctx.tmp_dir)
+      %{inspector: {EtsInspector, opts}} = with_inspector(%{ctx | persistent_kv: kv})
+      server = GenServer.whereis(opts[:server])
+
+      Repatch.patch(Electric.Utils, :sync_dir!, [mode: :shared], fn dir ->
+        raise File.Error, reason: :eio, action: "sync directory", path: dir
+      end)
+
+      Repatch.allow(self(), server)
+
+      assert {:error, %File.Error{reason: :eio}} = EtsInspector.reset(opts)
+      assert GenServer.whereis(opts[:server]) == server
+    end
+
     test "does not restore the cleared cache on a restart", %{opts: opts, db_conn: conn} = ctx do
       assert {:ok, {_oid, _}} = EtsInspector.load_relation_oid({"public", "items"}, opts)
       assert :ok = EtsInspector.reset(opts)
@@ -261,8 +304,14 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       opts: opts,
       items_oid: items_oid
     } do
-      Repatch.spy(Postgrex)
-      Repatch.allow(self(), opts[:server])
+      test_pid = self()
+
+      Repatch.patch(Postgrex, :transaction, [mode: :shared], fn conn, fun ->
+        send(test_pid, {:transaction, self()})
+        Repatch.real(Postgrex.transaction(conn, fun))
+      end)
+
+      Repatch.allow(test_pid, opts[:server])
 
       task1 = Task.async(fn -> EtsInspector.load_column_info(items_oid, opts) end)
       task2 = Task.async(fn -> EtsInspector.load_column_info(items_oid, opts) end)
@@ -274,7 +323,9 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       # Non-parallel call should return value from cache
       assert {:ok, ^columns} = EtsInspector.load_column_info(items_oid, opts)
 
-      assert Repatch.called?(Postgrex, :transaction, 2, by: opts[:server], exactly: 1)
+      server = GenServer.whereis(opts[:server])
+      assert_received {:transaction, ^server}
+      refute_received {:transaction, _}
     end
 
     test "returns a not found marker when the relation does not exist", %{opts: opts} do
@@ -327,6 +378,32 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
                EtsInspector.load_column_info(oid, opts)
     end
 
+    # An array column's own kind is 'b' -- the enum is the element -- so the element's kind
+    # has to be carried separately or the enum-ness is lost on the way to the refs map.
+    @tag with_sql: [
+           ~s|CREATE TYPE bar_enum AS ENUM ('a', 'b', 'c');|,
+           ~s|CREATE TABLE "enum_array_table" (foo bar_enum[])|
+         ]
+    test "keeps an array element's enum kind", %{opts: opts} do
+      assert {:ok, {oid, _}} =
+               EtsInspector.load_relation_oid({"public", "enum_array_table"}, opts)
+
+      assert {:ok, [%{array_type: "bar_enum", array_element_kind: :enum} = column]} =
+               EtsInspector.load_column_info(oid, opts)
+
+      assert Inspector.columns_to_expr([column]) == %{["foo"] => {:array, {:enum, "bar_enum"}}}
+    end
+
+    @tag with_sql: [~s|CREATE TABLE "point_table" (p point)|]
+    test "does not read a geometric type's element type as an array", %{opts: opts} do
+      assert {:ok, {oid, _}} = EtsInspector.load_relation_oid({"public", "point_table"}, opts)
+
+      assert {:ok, [%{type: "point", array_type: nil} = column]} =
+               EtsInspector.load_column_info(oid, opts)
+
+      assert Inspector.columns_to_expr([column]) == %{["p"] => :point}
+    end
+
     @tag with_sql: [
            ~s|CREATE DOMAIN foo_domain AS text CHECK ( VALUE ~ 'test');|,
            ~s|CREATE TABLE "domain_table" (foo foo_domain)|
@@ -362,8 +439,14 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
     end
 
     test "concurrent calls load value exactly once", %{opts: opts} do
-      Repatch.spy(Postgrex)
-      Repatch.allow(self(), opts[:server])
+      test_pid = self()
+
+      Repatch.patch(Postgrex, :query, [mode: :shared], fn conn, statement, params ->
+        send(test_pid, {:query, self()})
+        Repatch.real(Postgrex.query(conn, statement, params))
+      end)
+
+      Repatch.allow(test_pid, opts[:server])
 
       task1 = Task.async(fn -> EtsInspector.load_supported_features(opts) end)
       task2 = Task.async(fn -> EtsInspector.load_supported_features(opts) end)
@@ -375,7 +458,9 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
       # Non-parallel call should return value from cache
       assert {:ok, ^features} = EtsInspector.load_supported_features(opts)
 
-      assert Repatch.called?(Postgrex, :query, 3, by: opts[:server], exactly: 1)
+      server = GenServer.whereis(opts[:server])
+      assert_received {:query, ^server}
+      refute_received {:query, _}
     end
   end
 
@@ -477,6 +562,33 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
 
       assert {:ok, [^oid_relation1, ^oid_relation2]} =
                EtsInspector.list_relations_with_stale_cache(opts)
+    end
+
+    test "doesn't return a relation cached before the column info carried the collation",
+         %{opts: opts} = ctx do
+      assert {:ok, {oid, _}} = EtsInspector.load_relation_oid({"public", "items"}, opts)
+      assert {:ok, columns} = EtsInspector.load_column_info(oid, opts)
+      assert Enum.all?(columns, &Map.has_key?(&1, :deterministic_collation))
+
+      opts = restart_with_cache_without_collation(ctx)
+
+      assert {:ok, []} = EtsInspector.list_relations_with_stale_cache(opts)
+      assert {:ok, ^columns} = EtsInspector.load_column_info(oid, opts)
+
+      stop_supervised!(EtsInspector)
+      %{inspector: {EtsInspector, opts}} = with_inspector(ctx)
+
+      assert {:ok, ^columns} = EtsInspector.load_column_info(oid, opts)
+    end
+
+    test "returns a relation cached before the column info carried the collation when a column is added",
+         %{opts: opts, db_conn: conn} = ctx do
+      assert {:ok, oid_relation} = EtsInspector.load_relation_oid({"public", "items"}, opts)
+
+      opts = restart_with_cache_without_collation(ctx)
+      Postgrex.query!(conn, "ALTER TABLE items ADD COLUMN new_column TEXT", [])
+
+      assert {:ok, [^oid_relation]} = EtsInspector.list_relations_with_stale_cache(opts)
     end
   end
 
@@ -646,6 +758,138 @@ defmodule Electric.Postgres.Inspector.EtsInspectorTest do
 
       assert :error = EtsInspector.list_relations_with_stale_cache(opts)
     end
+  end
+
+  describe "requests queued behind a lookup that leaves nothing in the cache" do
+    setup :with_shared_db
+    setup :in_transaction
+    setup :with_stack_id_from_test
+    setup [:with_persistent_kv, :with_inspector, :with_basic_tables, :with_sql_execute]
+    setup %{inspector: {EtsInspector, opts}}, do: %{opts: opts}
+
+    setup %{opts: opts} do
+      test_pid = self()
+      server = GenServer.whereis(opts[:server])
+
+      Repatch.patch(Postgrex, :transaction, [mode: :shared], fn conn, fun ->
+        send(test_pid, {:transaction, self()})
+
+        case Process.get(:fail_lookups) do
+          nil -> Repatch.real(Postgrex.transaction(conn, fun))
+          error -> error
+        end
+      end)
+
+      Repatch.allow(test_pid, server)
+
+      %{server: server}
+    end
+
+    # Holds the inspector while `count` requests queue up, then lets it work through them.
+    defp queue_requests(server, count, request) do
+      :ok = :sys.suspend(server)
+      tasks = for _ <- 1..count, do: Task.async(request)
+
+      Support.TestUtils.wait_until(fn ->
+        Process.info(server, :message_queue_len) == {:message_queue_len, count}
+      end)
+
+      :ok = :sys.resume(server)
+      Enum.map(tasks, &Task.await/1)
+    end
+
+    defp lookups_by(server) do
+      Stream.repeatedly(fn ->
+        receive do
+          {:transaction, ^server} -> :lookup
+        after
+          0 -> nil
+        end
+      end)
+      |> Enum.take_while(& &1)
+      |> length()
+    end
+
+    test "share its answer for a missing table", %{opts: opts, server: server} do
+      assert [:table_not_found, :table_not_found, :table_not_found, :table_not_found] =
+               queue_requests(server, 4, fn ->
+                 EtsInspector.load_relation_oid({"public", "nonexistent"}, opts)
+               end)
+
+      assert lookups_by(server) == 1
+    end
+
+    test "share its database error", %{opts: opts, server: server} do
+      :sys.replace_state(server, fn state ->
+        Process.put(:fail_lookups, {:error, :connection_not_available})
+        state
+      end)
+
+      results =
+        queue_requests(server, 4, fn -> EtsInspector.load_relation_info(1_234_567_890, opts) end)
+
+      assert results == List.duplicate({:error, :connection_not_available}, 4)
+      assert lookups_by(server) == 1
+    end
+
+    test "do not keep answers without bound while the queue never empties",
+         %{opts: opts, server: server} do
+      :sys.replace_state(server, fn state ->
+        Process.put(:fail_lookups, {:error, :connection_not_available})
+        state
+      end)
+
+      # 1,001 different missing relations, then the first one again. The inspector keeps at most
+      # 1,000 answers, so the first one's is gone by then and that request asks again. The first
+      # and the repeat are queued on their own, so they are first and last in the mailbox.
+      :ok = :sys.suspend(server)
+
+      tasks =
+        for oids <- [[1], Enum.to_list(2..1_001), [1]], reduce: [] do
+          tasks ->
+            tasks =
+              tasks ++
+                for oid <- oids,
+                    do: Task.async(fn -> EtsInspector.load_relation_info(oid, opts) end)
+
+            Support.TestUtils.wait_until(fn ->
+              Process.info(server, :message_queue_len) == {:message_queue_len, length(tasks)}
+            end)
+
+            tasks
+        end
+
+      :ok = :sys.resume(server)
+      Enum.each(tasks, &Task.await/1)
+
+      assert lookups_by(server) == 1_002
+    end
+
+    test "made after it ask the database again", %{opts: opts, server: server} do
+      assert :table_not_found = EtsInspector.load_relation_oid({"public", "nonexistent"}, opts)
+      assert :table_not_found = EtsInspector.load_relation_oid({"public", "nonexistent"}, opts)
+
+      assert lookups_by(server) == 2
+    end
+  end
+
+  defp restart_with_cache_without_collation(%{persistent_kv: kv, stack_id: stack_id} = ctx) do
+    stop_supervised!(EtsInspector)
+    key = "#{stack_id}:ets_inspector_state"
+    {:ok, [version: 1, data: data]} = PersistentKV.get(kv, key)
+
+    data =
+      Enum.map(data, fn
+        {{:oid_info, _} = info_key, info, columns} ->
+          {info_key, info, Enum.map(columns, &Map.delete(&1, :deterministic_collation))}
+
+        entry ->
+          entry
+      end)
+
+    :ok = PersistentKV.set(kv, key, version: 1, data: data)
+    %{inspector: {EtsInspector, opts}} = with_inspector(ctx)
+    opts
   end
 
   defp with_items_oid(%{db_conn: conn}) do

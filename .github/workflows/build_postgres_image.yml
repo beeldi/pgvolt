@@ -1,51 +1,105 @@
-name: Postgres image for CI
+name: Images for CI
 
 on:
-  # Run daily at 00:00 UTC. This allows the image to pick up updates from upstream and avoid
-  # going stale.
-  schedule:
-    - cron: '0 0 * * 0'
-  # Allow manual triggering
   workflow_dispatch:
+
+# Every workflow reads these copies. Only the repository that owns the packages can push them, so
+# run this workflow there; the packages are public, so other repositories and forks pull them.
+env:
+  MIRROR: ghcr.io/beeldi/electric
 
 jobs:
   build_image:
     name: 'Build postgres:${{ matrix.postgres_version }}-alpine-logical'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
 
     permissions:
       packages: write
 
     strategy:
       matrix:
-        # The same versions are used by elixir_tests.yml
-        postgres_version: [14, 15, 17, 18]
+        # The same versions are used by sync_service_tests.yml and elixir_client_tests.yml
+        postgres_version: [18]
 
     steps:
       - name: Set image ref
         id: vars
         run: |
-          echo "IMAGE=ghcr.io/${{ github.repository }}/postgres" >> $GITHUB_ENV
+          echo "IMAGE=$MIRROR/postgres" >> $GITHUB_ENV
 
-      - name: Login to GHCR (private)
-        uses: docker/login-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: useblacksmith/setup-docker-builder@v1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       - name: Prepare the Dockerfile
         run: |
           echo '
-            FROM postgres:${{ matrix.postgres_version }}-alpine
-            CMD ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=40", "-c", "max_connections=200"]
+            FROM mirror.gcr.io/postgres:${{ matrix.postgres_version }}-alpine
+            LABEL org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            CMD ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=200", "-c", "max_wal_senders=200", "-c", "max_connections=400"]
           ' > Dockerfile
 
       - name: Build and push
-        uses: useblacksmith/build-push-action@v2
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+          DOCKER_BUILD_SUMMARY: 'false'
         with:
           context: .
           push: true
+          provenance: false
+          sbom: false
           tags: '${{ env.IMAGE }}:${{ matrix.postgres_version }}-alpine-logical'
+
+  # Docker Hub rate-limits anonymous pulls per runner IP, which can fail every job of a CI run.
+  # CI pulls these copies from GHCR instead, under their Docker Hub path, so a job swaps
+  # only the registry. They are read from mirror.gcr.io, Google's cache of Docker Hub, which serves
+  # the same digests. Run this workflow again after changing any reference below.
+  mirror_image:
+    name: 'Mirror ${{ matrix.image }}'
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - postgres:18-alpine
+          - bitnamilegacy/pgbouncer:latest
+          - nginx:latest
+          - otel/opentelemetry-collector-contrib:latest
+          - moby/buildkit:buildx-stable-1
+          # Keep these two in step with packages/sync-service/Dockerfile.
+          - hexpm/elixir:1.20.5-erlang-29.1.3-debian-bookworm-20261123-slim@sha256:feeeefac76e848dd8cc8b003ebfadf00225db2a4bbe195a3f6442b8a807b308a
+          - debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Copies the manifest list as is, so a pinned digest resolves on GHCR too. GHCR answers 429
+      # past 2000 uploads a minute, which an image with many platforms reaches; a retry resumes the
+      # copy, since the blobs already uploaded are skipped.
+      - name: Copy to GHCR
+        env:
+          SOURCE: ${{ matrix.image }}
+        run: |
+          for attempt in 1 2 3 4; do
+            docker buildx imagetools create --tag "$MIRROR/${SOURCE%@*}" "mirror.gcr.io/$SOURCE" && break
+            [ "$attempt" = 4 ] && exit 1
+            sleep 60
+          done
+          docker buildx imagetools inspect "$MIRROR/$SOURCE"

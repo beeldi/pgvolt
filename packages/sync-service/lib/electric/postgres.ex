@@ -33,13 +33,22 @@ defmodule Electric.Postgres do
   """
   def supported_types_only_in_functions, do: ~w|interval|a
 
-  @display_settings [
-    "SET bytea_output = 'hex'",
-    "SET DateStyle = 'ISO, DMY'",
-    "SET TimeZone = 'UTC'",
-    "SET extra_float_digits = 1",
-    "SET IntervalStyle = 'iso_8601'"
+  @display_setting_values [
+    {"bytea_output", "hex"},
+    {"DateStyle", "ISO, DMY"},
+    {"TimeZone", "UTC"},
+    {"extra_float_digits", "1"},
+    {"IntervalStyle", "iso_8601"},
+    {"standard_conforming_strings", "on"}
   ]
+
+  @display_settings Enum.map(@display_setting_values, fn {name, value} ->
+                      "SET #{name} = '#{value}'"
+                    end)
+
+  @display_settings_select_list Enum.map_join(@display_setting_values, ", ", fn {name, value} ->
+                                  "set_config('#{name}', '#{value}', false)"
+                                end)
 
   @doc """
   Configuration settings that affect formatting of values of certain types.
@@ -60,7 +69,20 @@ defmodule Electric.Postgres do
     * `extra_float_digits` - determines whether floating-point values are rounded or are encoded precisely.
 
     * `IntervalStyle`      - determines how Postgres interprets and formats interval values.
+
+    * `standard_conforming_strings` - determines whether a backslash inside a plain string literal
+                             is an escape character. A shape's own where clause is embedded in the
+                             queries Electric generates, and it was parsed as a standard string, so
+                             a session that reads backslashes as escapes gives it a second meaning.
   """
   @spec display_settings :: [String.t()]
   def display_settings, do: @display_settings
+
+  @doc """
+  The same settings as `display_settings/0`, as `set_config(name, value, false)` calls for the
+  select list of a query that runs anyway. They take effect for the session like `SET` does,
+  without a round trip each.
+  """
+  @spec display_settings_select_list :: String.t()
+  def display_settings_select_list, do: @display_settings_select_list
 end

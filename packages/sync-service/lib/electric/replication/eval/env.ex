@@ -162,9 +162,8 @@ defmodule Electric.Replication.Eval.Env do
     :error
   end
 
-  def parse_const(%__MODULE__{funcs: funcs}, value, {:array, subtype}) do
-    with {:ok, overloads} <- Map.fetch(funcs, {to_string(subtype), 1}),
-         %{implementation: impl} <- Enum.find(overloads, &(&1.args == [:text])) do
+  def parse_const(%__MODULE__{} = env, value, {:array, subtype}) do
+    with {:ok, impl} <- text_input_function(env, subtype) do
       try do
         case impl do
           {module, fun} -> {:ok, PgInterop.Array.parse(value, &apply(module, fun, [&1]))}
@@ -173,14 +172,11 @@ defmodule Electric.Replication.Eval.Env do
       rescue
         _ -> :error
       end
-    else
-      _ -> :error
     end
   end
 
-  def parse_const(%__MODULE__{funcs: funcs}, value, type) do
-    with {:ok, overloads} <- Map.fetch(funcs, {to_string(type), 1}),
-         %{implementation: impl} <- Enum.find(overloads, &(&1.args == [:text])) do
+  def parse_const(%__MODULE__{} = env, value, type) do
+    with {:ok, impl} <- text_input_function(env, type) do
       try do
         case impl do
           {module, fun} -> {:ok, apply(module, fun, [value])}
@@ -189,31 +185,56 @@ defmodule Electric.Replication.Eval.Env do
       rescue
         _ -> :error
       end
+    end
+  end
+
+  @doc """
+  Whether a value of this type arriving in the replication stream can be parsed at all.
+
+  A type with no text input function fails `parse_const/3` for every non-null value, and the
+  callers disagree about what that means: routing treats the error as a match while the
+  consumer-side evaluation treats it as a non-match, so every live change to such a row is
+  silently dropped from the shape while its snapshot still holds the row. Shape validation
+  refuses a filter over such a column rather than accept one that can only lose data.
+  """
+  @spec castable_type?(t(), term()) :: boolean()
+  def castable_type?(%__MODULE__{}, type) when type in @text_types, do: true
+  def castable_type?(%__MODULE__{}, {:array, subtype}) when subtype in @text_types, do: true
+  def castable_type?(%__MODULE__{allow_enums: allow_enums}, {:enum, _}), do: allow_enums
+
+  def castable_type?(%__MODULE__{allow_enums: allow_enums}, {:array, {:enum, _}}),
+    do: allow_enums
+
+  def castable_type?(%__MODULE__{} = env, {:array, subtype}),
+    do: match?({:ok, _}, text_input_function(env, subtype))
+
+  def castable_type?(%__MODULE__{} = env, type),
+    do: match?({:ok, _}, text_input_function(env, type))
+
+  @doc """
+  The references of a filtered row whose type this environment cannot parse.
+
+  Shared by where-clause validation, which refuses such a filter outright, and by restore, which
+  can only report one, so the two can never drift on what counts as uncastable.
+  """
+  @spec uncastable_refs(%{[String.t()] => term()} | [{[String.t()], term()}], t()) ::
+          [{[String.t()], term()}]
+  def uncastable_refs(used_refs, %__MODULE__{} = env) do
+    Enum.filter(used_refs, fn {path, type} ->
+      match?([_], path) and not castable_type?(env, type)
+    end)
+  end
+
+  # Shared by parse_const/3 and castable_type?/2 so the two can never disagree about which
+  # types this environment can cast.
+  defp text_input_function(%__MODULE__{funcs: funcs}, type) do
+    with {:ok, overloads} <- Map.fetch(funcs, {to_string(type), 1}),
+         %{implementation: impl} <- Enum.find(overloads, &(&1.args == [:text])) do
+      {:ok, impl}
     else
       _ -> :error
     end
   end
-
-  def const_to_pg_string(%__MODULE__{}, value, type) when type in @text_types, do: value
-  def const_to_pg_string(%__MODULE__{}, value, {:enum, _}), do: value
-
-  def const_to_pg_string(%__MODULE__{} = env, value, {:array, type}) do
-    "ARRAY[#{array_section_to_string(env, value, type)}]"
-  end
-
-  def const_to_pg_string(%__MODULE__{funcs: funcs}, value, type) do
-    [%{implementation: impl}] = Map.fetch!(funcs, {to_string(type) <> "out", 1})
-
-    case impl do
-      {module, fun} -> apply(module, fun, [value])
-      fun -> apply(fun, [value])
-    end
-  end
-
-  defp array_section_to_string(env, value, type) when is_list(value),
-    do: "[#{Enum.map(value, &array_section_to_string(env, &1, type))}]"
-
-  defp array_section_to_string(env, value, type), do: const_to_pg_string(env, value, type)
 
   @doc """
   Check if one type is implicitly castable to another type in this environment.
@@ -275,7 +296,11 @@ defmodule Electric.Replication.Eval.Env do
           find_cast_in_function(env, to_type)
 
         {from_type, :text} ->
-          find_cast_out_function(env, from_type)
+          # A type's `out` function is its wire rendering, which is not always its `::text` cast:
+          # `boolout` writes `t`/`f` while `true::text` is `true`. A registered explicit cast wins.
+          with :error <- find_explicit_cast(env, from_type, :text) do
+            find_cast_out_function(env, from_type)
+          end
 
         {from_type, to_type} ->
           find_explicit_cast(env, from_type, to_type)

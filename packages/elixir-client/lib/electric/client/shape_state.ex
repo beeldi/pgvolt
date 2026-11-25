@@ -41,6 +41,7 @@ defmodule Electric.Client.ShapeState do
     :value_mapper_fun,
     :next_cursor,
     :stale_cache_buster,
+    :self_healed_handle,
     offset: Offset.before_all(),
     up_to_date?: false,
     tag_to_keys: %{},
@@ -65,6 +66,7 @@ defmodule Electric.Client.ShapeState do
           stale_cache_buster: String.t() | nil,
           stale_cache_retry_count: non_neg_integer(),
           self_heal_attempted?: boolean(),
+          self_healed_handle: Client.shape_handle() | nil,
           recent_requests: [{integer(), Offset.t()}],
           fast_loop_consecutive_count: non_neg_integer()
         }
@@ -105,10 +107,13 @@ defmodule Electric.Client.ShapeState do
   end
 
   @doc """
-  Reset polling state for a new shape handle, preserving schema and value mapper.
+  Reset polling state for a new shape handle.
 
-  Used when a 409 (must-refetch) response is received — the shape handle changes
-  but the schema remains the same.
+  Used when a 409 (must-refetch) response is received. The replacement shape may
+  carry a different schema — column types can change across a reset — so the
+  schema and its value mapper are cleared and re-derived from the next response
+  rather than retained. Keeping them would decode the new shape's rows with the
+  old schema's parser.
   """
   @spec reset(t(), Client.shape_handle()) :: t()
   def reset(%__MODULE__{} = state, shape_handle) do
@@ -116,6 +121,8 @@ defmodule Electric.Client.ShapeState do
       state
       | offset: Offset.before_all(),
         shape_handle: shape_handle,
+        schema: nil,
+        value_mapper_fun: nil,
         up_to_date?: false,
         next_cursor: nil,
         tag_to_keys: %{},
@@ -167,7 +174,8 @@ defmodule Electric.Client.ShapeState do
       state
       | stale_cache_buster: nil,
         stale_cache_retry_count: 0,
-        self_heal_attempted?: false
+        self_heal_attempted?: false,
+        self_healed_handle: nil
     }
   end
 

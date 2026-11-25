@@ -11,6 +11,17 @@ defmodule Electric.Replication.Eval.EnvTest do
       %{env: env, uuid: uuid, uuid_bytes: uuid_bytes}
     end
 
+    # `PgInterop.Array.parse/2` signals a malformed literal by raising, and every caller of
+    # `parse_const/3` treats a return of `:error` as "this predicate cannot be evaluated". The
+    # rescue between the two is what keeps a malformed literal a refused clause instead of a
+    # crashed router, and nothing exercised it.
+    for literal <- [~S|{a,b|, ~S|{a,,b}|, ~S|{a"b}|, ~S|{{1},{2,3}}|, ~S|NULL|] do
+      test "refuses the malformed array literal #{inspect(literal)}", %{env: env} do
+        # Assert
+        assert :error = Env.parse_const(env, unquote(literal), {:array, :text})
+      end
+    end
+
     test "parses uuid values as compact 16-byte binaries", %{
       env: env,
       uuid: uuid,
@@ -37,113 +48,68 @@ defmodule Electric.Replication.Eval.EnvTest do
     end
   end
 
-  describe "const_to_pg_string/3" do
-    setup do
-      uuid = "550e8400-e29b-41d4-a716-446655440000"
-      {:ok, uuid_bytes} = Ecto.UUID.dump(uuid)
-      %{env: Env.new(), uuid: uuid, uuid_bytes: uuid_bytes}
+  describe "uncastable_refs/2" do
+    setup do: %{env: Env.new()}
+
+    test "names a column whose type has no text input function", %{env: env} do
+      # Act
+      uncastable = Env.uncastable_refs(%{["location"] => :point, ["host"] => :inet}, env)
+
+      # Assert
+      assert Enum.sort(uncastable) == [{["host"], :inet}, {["location"], :point}]
     end
 
-    test "converts text type values as-is", %{env: env} do
-      assert Env.const_to_pg_string(env, "hello", :text) == "hello"
-      assert Env.const_to_pg_string(env, "world", :varchar) == "world"
-      assert Env.const_to_pg_string(env, "test", :name) == "test"
-      assert Env.const_to_pg_string(env, "char", :bpchar) == "char"
+    test "judges an enum by whether this environment admits one", %{env: env} do
+      # Assert: the default environment cannot parse an enum, and consumer-side evaluation runs on
+      # exactly that environment, so a filter over one drops every live change it is asked about.
+      assert Env.uncastable_refs(%{["status"] => {:enum, "job_status"}}, env) ==
+               [{["status"], {:enum, "job_status"}}]
+
+      assert Env.uncastable_refs(
+               %{["status"] => {:enum, "job_status"}},
+               %{env | allow_enums: true}
+             ) == []
     end
 
-    test "converts text with special characters as-is", %{env: env} do
-      assert Env.const_to_pg_string(env, "hello'world", :text) == "hello'world"
-      assert Env.const_to_pg_string(env, "line\nbreak", :text) == "line\nbreak"
+    test "passes the types a firm filter is built from", %{env: env} do
+      # Assert
+      assert Env.uncastable_refs(
+               %{
+                 ["firmExternalKey"] => :varchar,
+                 ["deletedAt"] => :timestamp,
+                 ["id"] => :text,
+                 ["payload"] => :jsonb
+               },
+               env
+             ) == []
     end
 
-    test "converts enum type values as-is", %{env: env} do
-      assert Env.const_to_pg_string(env, "active", {:enum, :status}) == "active"
-      assert Env.const_to_pg_string(env, "pending", {:enum, "my_enum"}) == "pending"
+    test "ignores refs that are not columns of the filtered row", %{env: env} do
+      # Assert: longer paths belong to subquery dependencies, which are resolved elsewhere.
+      assert Env.uncastable_refs(%{["sq0", "location"] => :point}, env) == []
     end
 
-    test "converts integer types using out functions", %{env: env} do
-      assert Env.const_to_pg_string(env, 42, :int2) == "42"
-      assert Env.const_to_pg_string(env, 100, :int4) == "100"
+    test "agrees with parse_const about every type it judges", %{env: env} do
+      # Arrange
+      samples = [
+        {:text, "x"},
+        {:int4, "1"},
+        {:bool, "true"},
+        {:uuid, "550e8400-e29b-41d4-a716-446655440000"},
+        {:jsonb, ~s|{"a":1}|},
+        {:point, "(1,2)"},
+        {:inet, "127.0.0.1"},
+        {:oid, "16384"}
+      ]
 
-      assert Env.const_to_pg_string(env, 9_223_372_036_854_775_807, :int8) ==
-               "9223372036854775807"
-    end
+      # Assert: the two share their type lookup precisely so they can never disagree about which
+      # types this environment can cast.
+      Enum.each(samples, fn {type, sample} ->
+        reported? = Env.uncastable_refs([{["c"], type}], env) != []
+        parses? = match?({:ok, _}, Env.parse_const(env, sample, type))
 
-    test "converts float types using out functions", %{env: env} do
-      result = Env.const_to_pg_string(env, 3.14, :float4)
-      assert String.starts_with?(result, "3.14")
-
-      result = Env.const_to_pg_string(env, 2.718281828, :float8)
-      assert String.starts_with?(result, "2.718")
-    end
-
-    test "converts boolean type using out function", %{env: env} do
-      assert Env.const_to_pg_string(env, true, :bool) == "t"
-      assert Env.const_to_pg_string(env, false, :bool) == "f"
-    end
-
-    test "converts date type using out function", %{env: env} do
-      date = ~D[2025-01-15]
-      assert Env.const_to_pg_string(env, date, :date) == "2025-01-15"
-    end
-
-    test "converts time type using out function", %{env: env} do
-      time = ~T[14:30:00]
-      assert Env.const_to_pg_string(env, time, :time) == "14:30:00"
-    end
-
-    test "converts timestamp type using out function", %{env: env} do
-      timestamp = ~N[2025-01-15 14:30:00]
-      assert Env.const_to_pg_string(env, timestamp, :timestamp) == "2025-01-15T14:30:00"
-    end
-
-    test "converts compact uuid values back to canonical text", %{
-      env: env,
-      uuid: uuid,
-      uuid_bytes: uuid_bytes
-    } do
-      assert Env.const_to_pg_string(env, uuid_bytes, :uuid) == uuid
-    end
-
-    test "converts simple arrays of integers", %{env: env} do
-      result = Env.const_to_pg_string(env, [1, 2, 3], {:array, :int4})
-      assert result == "ARRAY[[123]]"
-    end
-
-    test "converts simple arrays of text", %{env: env} do
-      result = Env.const_to_pg_string(env, ["a", "b", "c"], {:array, :text})
-      assert result == "ARRAY[[abc]]"
-    end
-
-    test "converts simple arrays of booleans", %{env: env} do
-      result = Env.const_to_pg_string(env, [true, false, true], {:array, :bool})
-      assert result == "ARRAY[[tft]]"
-    end
-
-    test "converts arrays of enums", %{env: env} do
-      result = Env.const_to_pg_string(env, ["active", "pending"], {:array, {:enum, :status}})
-      assert result == "ARRAY[[activepending]]"
-    end
-
-    test "converts empty arrays", %{env: env} do
-      result = Env.const_to_pg_string(env, [], {:array, :int4})
-      assert result == "ARRAY[[]]"
-    end
-
-    test "converts single element arrays", %{env: env} do
-      result = Env.const_to_pg_string(env, [42], {:array, :int4})
-      assert result == "ARRAY[[42]]"
-    end
-
-    test "converts nested arrays", %{env: env} do
-      result = Env.const_to_pg_string(env, [[1, 2], [3, 4]], {:array, :int4})
-      # The outer list gets wrapped, and each inner list also gets wrapped
-      assert result == "ARRAY[[[12][34]]]"
-    end
-
-    test "converts numeric type", %{env: env} do
-      result = Env.const_to_pg_string(env, 123.456, :numeric)
-      assert String.starts_with?(result, "123.456")
+        assert parses? == not reported?, "disagreed on #{inspect(type)}"
+      end)
     end
   end
 end

@@ -4,6 +4,57 @@ defmodule Electric.LogItemsTest do
   alias Electric.Replication.LogOffset
   alias Electric.Replication.Changes
 
+  describe "encode_changes/4" do
+    setup do
+      shape = %Electric.Shapes.Shape{
+        root_table: {"public", "test"},
+        root_table_id: 1,
+        root_pk: ["pk"],
+        source_positions: :full_xid
+      }
+
+      change = %Changes.UpdatedRecord{
+        old_key: "old_key",
+        key: "new_key",
+        old_record: %{"pk" => "1"},
+        record: %{"pk" => "2"},
+        log_offset: LogOffset.first(),
+        relation: shape.root_table
+      }
+
+      [shape: shape, change: change]
+    end
+
+    test "encodes both sides of a key change with full provenance and exact size", context do
+      {lines, size} = LogItems.encode_changes([context.change], 100, 4_294_967_396, context.shape)
+
+      assert [{_, "old_key", :delete, deleted}, {_, "new_key", :insert, inserted}] = lines
+      assert size == byte_size(deleted) + byte_size(inserted)
+
+      for json <- [deleted, inserted] do
+        assert %{"headers" => %{"txids" => [100], "txids8" => ["4294967396"]}} =
+                 Jason.decode!(json)
+      end
+    end
+
+    test "requires full provenance before encoding a full-mode shape", context do
+      assert_raise ArgumentError, ~r/full transaction provenance/, fn ->
+        LogItems.encode_changes([context.change], 100, nil, context.shape)
+      end
+    end
+
+    test "keeps legacy rows unchanged, including shapes restored without a mode", context do
+      legacy = Map.delete(context.shape, :source_positions)
+      {lines, _size} = LogItems.encode_changes([context.change], 100, nil, legacy)
+
+      for {_, _, _, json} <- lines do
+        refute Map.has_key?(Jason.decode!(json)["headers"], "txids8")
+      end
+
+      assert LogItems.encode_changes([], 100, nil, legacy) == {[], 0}
+    end
+  end
+
   describe "from_change/3" do
     test "stores an entire `NewRecord` value" do
       record = %Changes.NewRecord{

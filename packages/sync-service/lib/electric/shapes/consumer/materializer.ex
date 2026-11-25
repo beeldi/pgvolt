@@ -16,6 +16,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
   alias Electric.Replication.LogOffset
   alias Electric.Replication.Eval
   alias Electric.Shapes.Shape
+  alias PgInterop.Sublink
 
   import Electric.Replication.LogOffset
   import Electric, only: [is_stack_id: 1, is_shape_handle: 1]
@@ -38,11 +39,12 @@ defmodule Electric.Shapes.Consumer.Materializer do
   def whereis(stack_id, shape_handle), do: GenServer.whereis(name(stack_id, shape_handle))
 
   @spec new_changes(map(), list(Changes.change()) | {LogOffset.t(), LogOffset.t()}, keyword()) ::
-          :ok
+          :ok | {:error, :duplicate_key}
   def new_changes(state, changes, opts \\ []) do
     commit? = Keyword.get(opts, :commit, true)
     xid = Keyword.get(opts, :xid)
-    GenServer.call(name(state), {:new_changes, changes, xid, commit?}, :infinity)
+    full_xid = Keyword.get(opts, :full_xid)
+    GenServer.call(name(state), {:new_changes, changes, xid, full_xid, commit?}, :infinity)
   end
 
   def wait_until_ready(state) do
@@ -72,7 +74,11 @@ defmodule Electric.Shapes.Consumer.Materializer do
   Checks the shared ETS cache first (written after each committed transaction);
   falls back to a synchronous GenServer call if the cache has no entry yet.
   """
-  def get_link_values(%{stack_id: stack_id, shape_handle: shape_handle} = opts) do
+  def get_link_values(opts) do
+    opts |> get_link_view() |> Sublink.keys()
+  end
+
+  def get_link_view(%{stack_id: stack_id, shape_handle: shape_handle} = opts) do
     table = link_values_table_name(stack_id)
 
     case :ets.lookup(table, shape_handle) do
@@ -136,6 +142,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
         index: %{},
         tag_indices: %{},
         value_counts: %{},
+        preserve_numeric_keys?: composite_numeric?(opts.materialized_type),
         pending_events: %{},
         offset: LogOffset.before_all(),
         subscribed_offset: nil,
@@ -145,6 +152,11 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
     {:ok, state, {:continue, :start_materializer}}
   end
+
+  defp composite_numeric?({:array, {:row, types}}),
+    do: Enum.any?(types, &(&1 in [:numeric, {:array, :numeric}]))
+
+  defp composite_numeric?(_), do: false
 
   def handle_continue(:start_materializer, state) do
     %{stack_id: stack_id, shape_handle: shape_handle} = state
@@ -165,6 +177,12 @@ defmodule Electric.Shapes.Consumer.Materializer do
           {:noreply, %{state | subscribed_offset: subscribed_offset},
            {:continue, {:read_stream, shape_storage}}}
 
+        # The consumer keeps the shape and retries the admission of its table, a writer still in
+        # flight on it say, and answers each wait with each try that fails. The shapes that depend
+        # on this one wait on.
+        {:error, %Electric.SnapshotError{type: :publication_admission_pending}} ->
+          {:noreply, state, {:continue, :start_materializer}}
+
         {:error, _reason} ->
           {:stop, :shutdown, state}
       end
@@ -180,6 +198,8 @@ defmodule Electric.Shapes.Consumer.Materializer do
     state = read_history_up_to_subscribed(state, storage)
     write_link_values(state)
     {:noreply, state}
+  catch
+    :duplicate_key -> {:stop, duplicate_key_stop(state), state}
   end
 
   @doc """
@@ -211,7 +231,9 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
       true ->
         stream = Storage.get_log_stream(state.offset, state.subscribed_offset, storage)
-        {state, _} = stream |> decode_json_stream() |> apply_changes(state)
+
+        {state, _} =
+          stream |> decode_json_stream() |> Stream.map(&elem(&1, 0)) |> apply_changes(state)
 
         # If the read just covered the main log (because either the
         # current offset is already past the snapshot or the next chunk
@@ -258,34 +280,40 @@ defmodule Electric.Shapes.Consumer.Materializer do
     end
   end
 
-  def handle_call(:get_link_values, _from, %{value_counts: value_counts} = state) do
-    {:reply, link_values_from_counts(value_counts), state}
+  def handle_call(:get_link_values, _from, state) do
+    {:reply, link_view(state), state}
   end
 
   def handle_call(:wait_until_ready, _from, state) do
     {:reply, :ok, state}
   end
 
-  def handle_call({:new_changes, {range_start, range_end}, xid, commit?}, _from, state) do
+  def handle_call({:new_changes, {range_start, range_end}, xid, full_xid, commit?}, _from, state) do
     stack_storage = Storage.for_stack(state.stack_id)
     storage = Storage.for_shape(state.shape_handle, stack_storage)
 
     state =
       Storage.get_log_stream(range_start, range_end, storage)
       |> decode_json_stream()
-      |> apply_and_accumulate_events(xid, state)
+      |> apply_and_accumulate_events(xid, full_xid, state)
       |> maybe_flush_pending_events(commit?)
 
     {:reply, :ok, state}
+  catch
+    :duplicate_key -> {:stop, duplicate_key_stop(state), {:error, :duplicate_key}, state}
   end
 
-  def handle_call({:new_changes, changes, xid, commit?}, _from, state) when is_list(changes) do
+  def handle_call({:new_changes, changes, xid, full_xid, commit?}, _from, state)
+      when is_list(changes) do
     state =
       changes
-      |> apply_and_accumulate_events(xid, state)
+      |> Stream.map(fn change -> {change, Map.get(change, :headers, %{})} end)
+      |> apply_and_accumulate_events(xid, full_xid, state)
       |> maybe_flush_pending_events(commit?)
 
     {:reply, :ok, state}
+  catch
+    :duplicate_key -> {:stop, duplicate_key_stop(state), {:error, :duplicate_key}, state}
   end
 
   def handle_call(:subscribe, {pid, _ref} = _from, state) do
@@ -319,6 +347,21 @@ defmodule Electric.Shapes.Consumer.Materializer do
     {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
   end
 
+  # Under a deferrable primary key, one transaction can give a row a key another row still holds,
+  # and the log's delete of either one carries only the key, so the view can no longer tell which
+  # value leaves. A tagged shutdown makes the source shape's consumer and every shape over this
+  # view clean themselves up, and their clients refetch a new snapshot. The source consumer gets
+  # `{:error, :duplicate_key}` back, so it wakes no client to read the changes it handed over. The
+  # key is row data, so the warning does not name it.
+  defp duplicate_key_stop(state) do
+    Logger.warning(
+      "Materializer for #{state.shape_handle} received a key it already holds; " <>
+        "invalidating the shapes over it"
+    )
+
+    {:shutdown, :duplicate_key}
+  end
+
   @spec link_values_table_name(Electric.stack_id()) :: atom()
   def link_values_table_name(stack_id) do
     :"Electric.Materializer.LinkValues:#{stack_id}"
@@ -342,18 +385,19 @@ defmodule Electric.Shapes.Consumer.Materializer do
       :ok
   end
 
-  defp link_values_from_counts(value_counts) do
+  defp link_view(%{value_counts: value_counts, preserve_numeric_keys?: true}) do
+    originals = Map.new(value_counts, fn {value, {_, original}} -> {value, original} end)
+    Sublink.composite_view(MapSet.new(Map.keys(value_counts)), originals)
+  end
+
+  defp link_view(%{value_counts: value_counts}) do
     MapSet.new(Map.keys(value_counts))
   end
 
-  defp write_link_values(%{
-         stack_id: stack_id,
-         shape_handle: shape_handle,
-         value_counts: value_counts
-       }) do
+  defp write_link_values(%{stack_id: stack_id, shape_handle: shape_handle} = state) do
     :ets.insert(
       link_values_table_name(stack_id),
-      {shape_handle, link_values_from_counts(value_counts)}
+      {shape_handle, link_view(state)}
     )
   rescue
     ArgumentError ->
@@ -371,55 +415,56 @@ defmodule Electric.Shapes.Consumer.Materializer do
     |> Stream.filter(fn decoded ->
       Map.has_key?(decoded, "key") || Map.has_key?(decoded["headers"], "event")
     end)
-    |> Stream.map(fn
-      %{
-        "key" => key,
-        "value" => value,
-        "headers" => %{"operation" => operation} = headers
-      } ->
-        case operation do
-          "insert" ->
-            %Changes.NewRecord{
-              key: key,
-              record: value,
-              move_tags: Map.get(headers, "tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-
-          "update" ->
-            %Changes.UpdatedRecord{
-              key: key,
-              record: value,
-              move_tags: Map.get(headers, "tags", []),
-              removed_move_tags: Map.get(headers, "removed_tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-
-          "delete" ->
-            %Changes.DeletedRecord{
-              key: key,
-              old_record: value,
-              move_tags: Map.get(headers, "tags", []),
-              active_conditions: Map.get(headers, "active_conditions", [])
-            }
-        end
-
-      %{"headers" => %{"event" => "move-out", "patterns" => patterns} = headers} ->
-        patterns =
-          Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
-            %{pos: pos, value: value}
-          end)
-
-        %{headers: %{event: "move-out", patterns: patterns, txids: Map.get(headers, "txids", [])}}
-
-      %{"headers" => %{"event" => "move-in", "patterns" => patterns} = headers} ->
-        patterns =
-          Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
-            %{pos: pos, value: value}
-          end)
-
-        %{headers: %{event: "move-in", patterns: patterns, txids: Map.get(headers, "txids", [])}}
+    |> Stream.map(fn decoded ->
+      {decode_change(decoded),
+       %{
+         txids: Map.get(decoded["headers"], "txids", []),
+         txids8: Map.get(decoded["headers"], "txids8", []) |> Enum.map(&String.to_integer/1)
+       }}
     end)
+  end
+
+  defp decode_change(%{
+         "key" => key,
+         "value" => value,
+         "headers" => %{"operation" => operation} = headers
+       }) do
+    case operation do
+      "insert" ->
+        %Changes.NewRecord{
+          key: key,
+          record: value,
+          move_tags: Map.get(headers, "tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+
+      "update" ->
+        %Changes.UpdatedRecord{
+          key: key,
+          record: value,
+          move_tags: Map.get(headers, "tags", []),
+          removed_move_tags: Map.get(headers, "removed_tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+
+      "delete" ->
+        %Changes.DeletedRecord{
+          key: key,
+          old_record: value,
+          move_tags: Map.get(headers, "tags", []),
+          active_conditions: Map.get(headers, "active_conditions", [])
+        }
+    end
+  end
+
+  defp decode_change(%{"headers" => %{"event" => event, "patterns" => patterns} = headers})
+       when event in ["move-in", "move-out"] do
+    patterns =
+      Enum.map(patterns, fn %{"pos" => pos, "value" => value} ->
+        %{pos: pos, value: value}
+      end)
+
+    %{headers: %{event: event, patterns: patterns, txids: Map.get(headers, "txids", [])}}
   end
 
   defp cast!(record, %{columns: columns, materialized_type: {:array, {:row, types}}}) do
@@ -428,7 +473,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
     {:ok, values} =
       Enum.zip(original_strings, types)
       |> Utils.map_while_ok(fn {const, type} ->
-        Eval.Env.parse_const(Eval.Env.new(), const, type)
+        Eval.SublinkKey.parse(const, type)
       end)
 
     {List.to_tuple(values), List.to_tuple(original_strings)}
@@ -436,31 +481,29 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
   defp cast!(record, %{columns: [column], materialized_type: {:array, type}}) do
     original_string = Map.fetch!(record, column)
-    {:ok, value} = Eval.Env.parse_const(Eval.Env.new(), original_string, type)
+    {:ok, value} = Eval.SublinkKey.parse(original_string, type)
     {value, original_string}
   end
 
-  defp value_to_string(value, %{materialized_type: {:array, {:row, type}}}) do
-    value
-    |> Tuple.to_list()
-    |> Enum.zip_with(type, &Eval.Env.const_to_pg_string(Eval.Env.new(), &1, &2))
-    |> List.to_tuple()
-  end
+  defp apply_and_accumulate_events(changes, xid, full_xid, state) do
+    {state, events, txids, txids8} =
+      Enum.reduce(changes, {state, %{}, xid_set(xid), xid_set(full_xid)}, fn
+        {change, headers}, {state, events, txids, txids8} ->
+          {state, new_events} = apply_changes([change], state)
 
-  defp value_to_string(value, %{materialized_type: {:array, type}}) do
-    Eval.Env.const_to_pg_string(Eval.Env.new(), value, type)
-  end
+          {state, merge_events(events, new_events),
+           MapSet.union(txids, MapSet.new(Map.get(headers, :txids, []))),
+           MapSet.union(txids8, MapSet.new(Map.get(headers, :txids8, [])))}
+      end)
 
-  defp apply_and_accumulate_events(changes, xid, state) do
-    {state, events} = apply_changes(changes, state)
-    events = with_txids(events, xid)
+    events = with_txids(events, txids, txids8)
     %{state | pending_events: merge_events(state.pending_events, events)}
   end
 
-  defp with_txids(events, _xid) when events == %{}, do: events
+  defp with_txids(events, _txids, _txids8) when events == %{}, do: events
 
-  defp with_txids(events, xid) do
-    Map.put(events, :txids, xid_set(xid))
+  defp with_txids(events, txids, txids8) do
+    events |> Map.put(:txids, txids) |> Map.put(:txids8, txids8)
   end
 
   defp xid_set(nil), do: MapSet.new()
@@ -486,7 +529,9 @@ defmodule Electric.Shapes.Consumer.Materializer do
   defp maybe_flush_pending_events(state, _commit?), do: state
 
   defp finalize_txids(events) do
-    Map.update(events, :txids, [], &Enum.sort(&1))
+    events
+    |> Map.update(:txids, [], &Enum.sort(&1))
+    |> Map.update(:txids8, [], &Enum.sort(&1))
   end
 
   defp merge_events(pending, new) when pending == %{}, do: new
@@ -497,7 +542,9 @@ defmodule Electric.Shapes.Consumer.Materializer do
       move_in: Map.get(new, :move_in, []) ++ Map.get(pending, :move_in, []),
       move_out: Map.get(new, :move_out, []) ++ Map.get(pending, :move_out, []),
       txids:
-        MapSet.union(Map.get(pending, :txids, MapSet.new()), Map.get(new, :txids, MapSet.new()))
+        MapSet.union(Map.get(pending, :txids, MapSet.new()), Map.get(new, :txids, MapSet.new())),
+      txids8:
+        MapSet.union(Map.get(pending, :txids8, MapSet.new()), Map.get(new, :txids8, MapSet.new()))
     }
   end
 
@@ -514,8 +561,13 @@ defmodule Electric.Shapes.Consumer.Materializer do
     outs = events |> Map.get(:move_out, []) |> Enum.sort_by(fn {v, _} -> v end)
 
     case cancel_sorted_pairs(ins, outs, %{move_in: [], move_out: []}) do
-      empty when empty == %{} -> empty
-      result -> Map.put(result, :txids, Map.get(events, :txids, MapSet.new()))
+      empty when empty == %{} ->
+        empty
+
+      result ->
+        result
+        |> Map.put(:txids, Map.get(events, :txids, MapSet.new()))
+        |> Map.put(:txids8, Map.get(events, :txids8, MapSet.new()))
     end
   end
 
@@ -534,10 +586,11 @@ defmodule Electric.Shapes.Consumer.Materializer do
     do: %{acc | move_in: ins ++ acc.move_in, move_out: outs ++ acc.move_out}
 
   defp apply_changes(changes, state) do
-    {{index, tag_indices}, {value_counts, events}} =
+    {{index, tag_indices}, {value_counts, _, events}} =
       Enum.reduce(
         changes,
-        {{state.index, state.tag_indices}, {state.value_counts, []}},
+        {{state.index, state.tag_indices},
+         {state.value_counts, state.preserve_numeric_keys?, []}},
         fn
           %Changes.NewRecord{
             key: key,
@@ -547,12 +600,13 @@ defmodule Electric.Shapes.Consumer.Materializer do
           },
           {{index, tag_indices}, counts_and_events} ->
             {value, original_string} = cast!(record, state)
-            if is_map_key(index, key), do: raise("Key #{key} already exists")
+            if is_map_key(index, key), do: throw(:duplicate_key)
             included? = evaluate_inclusion(move_tags, ac)
 
             index =
               Map.put(index, key, %{
                 value: value,
+                original_string: original_string,
                 tags: move_tags,
                 active_conditions: ac,
                 included?: included?
@@ -584,6 +638,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
             has_tag_updates = removed_move_tags != []
             pk_changed = old_key != key
             has_ac_update = ac != [] and is_map_key(index, old_key)
+            if pk_changed and is_map_key(index, key), do: throw(:duplicate_key)
 
             if columns_present or has_tag_updates or has_ac_update or pk_changed do
               old_entry = Map.fetch!(index, old_key)
@@ -614,6 +669,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
                   |> Map.delete(old_key)
                   |> Map.put(key, %{
                     value: value,
+                    original_string: original_string,
                     tags: new_tags,
                     active_conditions: new_ac,
                     included?: new_included?
@@ -623,16 +679,12 @@ defmodule Electric.Shapes.Consumer.Materializer do
                   old_entry.included? and new_included? and old_value != value ->
                     {{index, tag_indices},
                      counts_and_events
-                     |> decrement_value(old_value, value_to_string(old_value, state))
+                     |> decrement_value(old_value, old_entry.original_string)
                      |> increment_value(value, original_string)}
 
                   old_entry.included? and not new_included? ->
                     {{index, tag_indices},
-                     decrement_value(
-                       counts_and_events,
-                       old_value,
-                       value_to_string(old_value, state)
-                     )}
+                     decrement_value(counts_and_events, old_value, old_entry.original_string)}
 
                   not old_entry.included? and new_included? ->
                     {{index, tag_indices},
@@ -660,7 +712,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
                      decrement_value(
                        counts_and_events,
                        old_entry.value,
-                       value_to_string(old_entry.value, state)
+                       old_entry.original_string
                      )}
 
                   not old_entry.included? and new_included? ->
@@ -668,7 +720,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
                      increment_value(
                        counts_and_events,
                        old_entry.value,
-                       value_to_string(old_entry.value, state)
+                       old_entry.original_string
                      )}
 
                   true ->
@@ -687,11 +739,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
 
             if entry.included? do
               {{index, tag_indices},
-               decrement_value(
-                 counts_and_events,
-                 entry.value,
-                 value_to_string(entry.value, state)
-               )}
+               decrement_value(counts_and_events, entry.value, entry.original_string)}
             else
               {{index, tag_indices}, counts_and_events}
             end
@@ -709,14 +757,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
                 fn {key, matched_positions}, acc ->
                   entry = Map.fetch!(index, key)
 
-                  process_move_event(
-                    entry,
-                    key,
-                    matched_positions,
-                    new_condition,
-                    acc,
-                    state
-                  )
+                  process_move_event(entry, key, matched_positions, new_condition, acc)
                 end
               )
 
@@ -729,24 +770,34 @@ defmodule Electric.Shapes.Consumer.Materializer do
     {%{state | index: index, value_counts: value_counts, tag_indices: tag_indices}, events}
   end
 
-  defp increment_value({value_counts, events}, value, original_string) do
-    case Map.fetch(value_counts, value) do
-      {:ok, count} ->
-        {Map.put(value_counts, value, count + 1), events}
+  defp increment_value({value_counts, preserve?, events}, value, original_string) do
+    case Map.get(value_counts, value) do
+      {count, original} ->
+        {Map.put(value_counts, value, {count + 1, original}), preserve?, events}
 
-      :error ->
-        {Map.put(value_counts, value, 1), [{:move_in, {value, original_string}} | events]}
+      nil ->
+        count = if preserve?, do: {1, original_string}, else: 1
+
+        {Map.put(value_counts, value, count), preserve?,
+         [{:move_in, {value, original_string}} | events]}
+
+      count ->
+        {Map.put(value_counts, value, count + 1), preserve?, events}
     end
   end
 
-  defp decrement_value({value_counts, events}, value, original_string) do
+  defp decrement_value({value_counts, preserve?, events}, value, original_string) do
     # If we're decrementing, it must have been added before
     case Map.fetch!(value_counts, value) do
-      1 ->
-        {Map.delete(value_counts, value), [{:move_out, {value, original_string}} | events]}
+      count when count == 1 or elem(count, 0) == 1 ->
+        {Map.delete(value_counts, value), preserve?,
+         [{:move_out, {value, original_string}} | events]}
+
+      {count, original} ->
+        {Map.put(value_counts, value, {count - 1, original}), preserve?, events}
 
       count ->
-        {Map.put(value_counts, value, count - 1), events}
+        {Map.put(value_counts, value, count - 1), preserve?, events}
     end
   end
 
@@ -812,13 +863,13 @@ defmodule Electric.Shapes.Consumer.Materializer do
     end)
   end
 
-  defp process_move_event(entry, key, matched_positions, new_condition, {{idx, ti}, ce}, state) do
+  defp process_move_event(entry, key, matched_positions, new_condition, {{idx, ti}, ce}) do
     case entry.active_conditions do
       [] when new_condition == false ->
         # No DNF, move-out: remove row entirely (backward compat)
         ti = remove_row_from_tag_indices(ti, key, entry.tags)
         idx = Map.delete(idx, key)
-        {{idx, ti}, decrement_value(ce, entry.value, value_to_string(entry.value, state))}
+        {{idx, ti}, decrement_value(ce, entry.value, entry.original_string)}
 
       [] ->
         # No DNF, move-in: no-op
@@ -836,7 +887,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
             # move-in query or NewRecord with fresh tags and ac.
             ti = remove_row_from_tag_indices(ti, key, entry.tags)
             idx = Map.delete(idx, key)
-            {{idx, ti}, decrement_value(ce, entry.value, value_to_string(entry.value, state))}
+            {{idx, ti}, decrement_value(ce, entry.value, entry.original_string)}
 
           not entry.included? and new_included? ->
             idx =
@@ -846,7 +897,7 @@ defmodule Electric.Shapes.Consumer.Materializer do
                   included?: new_included?
               })
 
-            {{idx, ti}, increment_value(ce, entry.value, value_to_string(entry.value, state))}
+            {{idx, ti}, increment_value(ce, entry.value, entry.original_string)}
 
           true ->
             idx =

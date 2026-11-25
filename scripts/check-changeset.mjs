@@ -1,5 +1,6 @@
 import { execSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import { matchesGlob } from 'node:path'
 import { glob } from 'glob'
 import parseChangeset from '@changesets/parse'
 
@@ -21,7 +22,7 @@ const allChanged = gitDiff(base, `--diff-filter=ACMR`)
 const addedFiles = new Set(gitDiff(base, `--diff-filter=A`))
 
 const config = JSON.parse(readFileSync(`.changeset/config.json`, `utf8`))
-const ignorePatterns = (config.ignore || []).map(globToRegex)
+const ignorePatterns = config.ignore || []
 
 const packageMap = new Map()
 for (const pkgPath of await glob(`packages/*/package.json`)) {
@@ -34,7 +35,8 @@ const affected = new Set()
 for (const file of allChanged) {
   for (const [dir, name] of packageMap) {
     if (file.startsWith(dir)) {
-      if (!ignorePatterns.some((re) => re.test(name))) affected.add(name)
+      if (!ignorePatterns.some((pattern) => matchesGlob(name, pattern)))
+        affected.add(name)
       break
     }
   }
@@ -90,9 +92,4 @@ function gitDiff(base, filter) {
     .split(`\n`)
     .map((s) => s.trim())
     .filter(Boolean)
-}
-
-function globToRegex(g) {
-  const escaped = g.replace(/[.+^${}()|[\]\\]/g, `\\$&`).replace(/\*/g, `.*`)
-  return new RegExp(`^${escaped}$`)
 }

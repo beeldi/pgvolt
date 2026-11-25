@@ -36,9 +36,32 @@ defmodule Electric.Replication.LogOffsetTest do
     assert to_charlist(LogOffset.before_all()) == ~c"-1"
   end
 
+  test "from_string rejects a signed offset part, which the server never renders" do
+    # Act / Assert
+    assert {:error, "has invalid format"} = LogOffset.from_string("+0_0")
+    assert {:error, "has invalid format"} = LogOffset.from_string("0_+0")
+    assert {:error, "has invalid format"} = LogOffset.from_string("+5_+6")
+    assert {:error, "has invalid format"} = LogOffset.from_string("+0_inf")
+
+    # the unsigned forms, and the one negative form the offset space keeps, still parse
+    assert {:ok, _} = LogOffset.from_string("0_0")
+    assert {:ok, _} = LogOffset.from_string("5_6")
+    assert {:ok, _} = LogOffset.from_string("0_inf")
+    assert {:ok, _} = LogOffset.from_string("-1_0")
+    assert {:ok, _} = LogOffset.from_string("-1")
+  end
+
   test "from_string rejects invalid negative offset parts without raising" do
+    # Act / Assert
     assert {:error, "has invalid format"} = LogOffset.from_string("0_-1")
     assert {:error, "has invalid format"} = LogOffset.from_string("-2_0")
     assert {:error, "has invalid format"} = LogOffset.from_string("-1_inf")
+  end
+
+  test "from_string rejects every other form the client-facing matrix probes" do
+    # Act / Assert
+    for offset <- ["0__0", "0x10_0", "1e3_0", " 0_0", "0_0 ", "", "now_0", "0_", "_0", "0"] do
+      assert {:error, "has invalid format"} = LogOffset.from_string(offset)
+    end
   end
 end

@@ -86,6 +86,44 @@ defmodule Electric.Replication.Eval.ParserTest do
       assert %Ref{path: ["foo"], type: :text} = result
     end
 
+    test "should refuse a reference whose type cannot be parsed from the replication stream" do
+      assert {:error, message} =
+               Parser.parse_and_validate_expression(~S|"ip" IS NOT NULL|,
+                 refs: %{["ip"] => :inet}
+               )
+
+      assert message =~ ~s|Cannot filter on "ip" of type inet|
+      assert message =~ "cannot parse values of that type"
+    end
+
+    test "should refuse an array reference whose element type cannot be parsed" do
+      assert {:error, message} =
+               Parser.parse_and_validate_expression(~S|"ips" IS NOT NULL|,
+                 refs: %{["ips"] => {:array, :inet}}
+               )
+
+      assert message =~ ~s|Cannot filter on "ips" of type inet[]|
+    end
+
+    # varchar has no input function of its own — it is parsed by being left alone — so a check
+    # that only looked for one would reject the most common column type there is.
+    test "should accept a text-like reference that has no input function" do
+      assert {:ok, %Expr{}} =
+               Parser.parse_and_validate_expression(~S|"name" IS NOT NULL|,
+                 refs: %{["name"] => :varchar}
+               )
+    end
+
+    test "should accept references whose types the environment can parse" do
+      for type <- [:int8, :bool, :timestamptz, :uuid, :jsonb, :bytea] do
+        assert {:ok, %Expr{}} =
+                 Parser.parse_and_validate_expression(~S|"col" IS NOT NULL|,
+                   refs: %{["col"] => type}
+                 ),
+               "expected a #{type} reference to be accepted"
+      end
+    end
+
     test "should correctly parse a boolean function" do
       assert {:ok, %Expr{eval: result}} =
                Parser.parse_and_validate_expression(~S|"test" OR true|,
@@ -776,6 +814,97 @@ defmodule Electric.Replication.Eval.ParserTest do
     end
   end
 
+  describe "parse_and_validate_expression/3 nesting depth" do
+    # Each `NOT` is one level, and the column reference under them two: itself and its name.
+    defp nots(count), do: String.duplicate("NOT ", count) <> "test"
+
+    test "a clause nested 100 levels deep is accepted" do
+      assert {:ok, %Expr{}} =
+               Parser.parse_and_validate_expression(nots(98), refs: %{["test"] => :bool})
+    end
+
+    test "a clause nested deeper is refused before it is turned back into SQL" do
+      assert {:error, "the where clause nests deeper than 100 levels"} =
+               Parser.parse_and_validate_expression(nots(99), refs: %{["test"] => :bool})
+    end
+
+    test "the body of a subquery counts towards the depth" do
+      subquery = "SELECT val FROM tester WHERE " <> nots(99)
+
+      assert {:error, "the where clause nests deeper than 100 levels"} =
+               Parser.parse_and_validate_expression(
+                 "test IN (#{subquery})",
+                 refs: %{["test"] => :int4, ["$sublink", "0"] => {:array, :int4}},
+                 sublink_queries: %{0 => subquery}
+               )
+    end
+  end
+
+  describe "parse_and_validate_expression/3 numeric literals" do
+    # pg_query's ival field is 32-bit, so Postgres hands over every literal wider than int4 as
+    # FCONST text — verbatim, including the forms String.to_float/1 refuses.
+    @typed_literals [
+      {"2147483647", :int4, 2_147_483_647},
+      {"-2147483648", :int4, -2_147_483_648},
+      {"-9223372036854775808", :int8, -9_223_372_036_854_775_808},
+      {"-.5", :numeric, -0.5},
+      {"-1e10", :numeric, -1.0e10},
+      {"2147483648", :int8, 2_147_483_648},
+      {"9223372036854775807", :int8, 9_223_372_036_854_775_807},
+      {"0x7FFFFFFFFFFFFFFF", :int8, 9_223_372_036_854_775_807},
+      {"0o777", :int4, 511},
+      {"1_000", :int4, 1000},
+      {"1.5", :numeric, 1.5},
+      {"1e10", :numeric, 1.0e10},
+      {"1E10", :numeric, 1.0e10},
+      {"1e-3", :numeric, 1.0e-3},
+      {"1e+3", :numeric, 1.0e3},
+      {"1.5e10", :numeric, 1.5e10},
+      {".5", :numeric, 0.5},
+      {"1.", :numeric, 1.0},
+      {"1.e5", :numeric, 1.0e5},
+      {"1_000.5", :numeric, 1000.5},
+      {"1_0e1_0", :numeric, 1.0e11},
+      {"9223372036854775808", :numeric, 9.223372036854776e18},
+      {"99999999999999999999", :numeric, 1.0e20},
+      {"0xFFFFFFFFFFFFFFFFFF", :numeric, 4.722366482869645e21}
+    ]
+
+    for {literal, type, value} <- @typed_literals do
+      test "parses #{literal} as #{type}" do
+        assert {:ok, %Expr{eval: result}} =
+                 Parser.parse_and_validate_expression(unquote(literal))
+
+        assert %Const{type: unquote(type), value: unquote(value)} = result
+      end
+    end
+
+    # Postgres carries these exactly; numeric is float8-backed here, so refusing is the only
+    # answer that does not silently return a different number than the database would.
+    for literal <- ["1e400", "0.1e1000", "1e-1e5"] do
+      test "refuses #{literal} instead of raising" do
+        assert {:error, message} = Parser.parse_and_validate_expression(unquote(literal))
+        assert message =~ "numeric literal"
+      end
+    end
+
+    test "refuses an integer literal too wide to become a float8 instead of raising" do
+      literal = "0x" <> String.duplicate("F", 500)
+
+      assert {:error, message} = Parser.parse_and_validate_expression(literal)
+      assert message =~ "out of range"
+    end
+
+    test "a bigint literal reaches the comparison it was written for" do
+      assert {:ok, %Expr{eval: result}} =
+               Parser.parse_and_validate_expression(~S|id = 2147483648|,
+                 refs: %{["id"] => :int8}
+               )
+
+      assert %Func{args: [%Ref{}, %Const{type: :int8, value: 2_147_483_648}]} = result
+    end
+  end
+
   describe "parse_and_validate_expression/3 default env" do
     test "can compare integers" do
       assert {:ok, _} =
@@ -853,6 +982,74 @@ defmodule Electric.Replication.Eval.ParserTest do
                  refs: refs,
                  env: env
                )
+    end
+
+    test "keeps content operators over jsonb and bytea refs unavailable" do
+      # json/jsonb/bytea refs evaluate as raw Postgres text on the consumer side
+      # (their input functions are no-ops): only null tests are sound on that
+      # representation. Equality and content operators over the raw text would
+      # diverge from Postgres — jsonb key order and whitespace are normalized by
+      # PG but not here — so no overload may become selectable for them without
+      # normalizing the representation first.
+      refs = %{["meta"] => :jsonb, ["doc"] => :json, ["payload"] => :bytea}
+
+      assert {:error, _} = Parser.parse_and_validate_expression(~S|meta = '{}'|, refs: refs)
+      assert {:error, _} = Parser.parse_and_validate_expression(~S|meta = meta|, refs: refs)
+      assert {:error, _} = Parser.parse_and_validate_expression(~S|doc = '{}'|, refs: refs)
+
+      assert {:error, _} =
+               Parser.parse_and_validate_expression(~S|meta -> 'a' IS NOT NULL|, refs: refs)
+
+      assert {:error, _} =
+               Parser.parse_and_validate_expression(~S|meta ->> 'a' = 'b'|, refs: refs)
+
+      assert {:error, _} =
+               Parser.parse_and_validate_expression(~S|meta @> '{"a": 1}'|, refs: refs)
+
+      assert {:error, _} = Parser.parse_and_validate_expression(~S|meta::text = '{}'|, refs: refs)
+
+      assert {:error, _} =
+               Parser.parse_and_validate_expression(~S|payload = payload|, refs: refs)
+
+      # Null tests are the supported surface.
+      assert {:ok, _} = Parser.parse_and_validate_expression(~S|meta IS NOT NULL|, refs: refs)
+      assert {:ok, _} = Parser.parse_and_validate_expression(~S|doc IS NULL|, refs: refs)
+      assert {:ok, _} = Parser.parse_and_validate_expression(~S|payload IS NULL|, refs: refs)
+    end
+
+    test "keeps comparisons over arrays of jsonb and bytea unavailable" do
+      # The array operators take any element type, and would compare the raw text of each
+      # element: `\x4A` against the `\x4a` Postgres sends, or `{"b": 1, "a": 2}` against the
+      # `{"a": 2, "b": 1}` it stores.
+      refs = %{
+        ["metas"] => {:array, :jsonb},
+        ["docs"] => {:array, :json},
+        ["payloads"] => {:array, :bytea}
+      }
+
+      for where <- [
+            ~S|payloads = '{"\\x4A"}'|,
+            ~S|payloads <> payloads|,
+            ~S|payloads @> '{"\\x4A"}'|,
+            ~S|payloads <@ payloads|,
+            ~S|payloads && payloads|,
+            ~S|payloads IS DISTINCT FROM payloads|,
+            ~S|payloads IN ('{"\\x4A"}', '{"\\x4B"}')|,
+            ~S|metas = '{"{\"a\": 1}"}'|,
+            ~S|docs @> docs|,
+            "payloads || payloads = payloads"
+          ] do
+        assert {:error, message} = Parser.parse_and_validate_expression(where, refs: refs),
+               where
+
+        assert message =~ "Cannot compare values of type"
+      end
+
+      assert {:ok, _} = Parser.parse_and_validate_expression(~S|payloads IS NULL|, refs: refs)
+      assert {:ok, _} = Parser.parse_and_validate_expression(~S|metas IS NOT NULL|, refs: refs)
+
+      assert {:ok, _} =
+               Parser.parse_and_validate_expression(~S|array_ndims(docs) = 1|, refs: refs)
     end
   end
 
@@ -1092,6 +1289,66 @@ defmodule Electric.Replication.Eval.ParserTest do
     test "outer `::T[]` cast on a non-foldable ARRAY constructor reports an array return type" do
       assert {:ok, %Expr{returns: {:array, :uuid}}} =
                Parser.parse_and_validate_expression(~S|ARRAY[v]::uuid[]|, refs: %{["v"] => :text})
+    end
+  end
+
+  describe "parse_and_validate_expression/3 type modifiers" do
+    # Postgres applies the modifier: `'abc'::varchar(2)` is `ab`, and `timestamp(0)` rounds to
+    # the second.
+    for {expr, refs} <- [
+          {~S|"n"::varchar(2) = 'ab'|, %{["n"] => :text}},
+          {~S|CAST("n" AS varchar(2)) = 'ab'|, %{["n"] => :text}},
+          {~S|"t"::timestamp(0) = '2024-01-02 03:04:06'|, %{["t"] => :timestamp}},
+          {~S|"t"::timestamp(0) IN ('2024-01-02 03:04:06', '2024-01-02 03:04:07')|,
+           %{["t"] => :timestamp}},
+          {~S|"t" = '2024-01-02 03:04:05.6'::timestamp(0)|, %{["t"] => :timestamp}},
+          {~S|"i" = interval '1 day 2 hours' day|, %{["i"] => :interval}}
+        ] do
+      test "refuses #{expr}" do
+        assert {:error, message} =
+                 Parser.parse_and_validate_expression(unquote(expr),
+                   refs: unquote(Macro.escape(refs))
+                 )
+
+        assert message =~ "type modifiers are not supported in a cast"
+      end
+    end
+
+    test "keeps a cast without one" do
+      assert {:ok, %Expr{}} =
+               Parser.parse_and_validate_expression(~S|"t"::timestamp = '2024-01-02 03:04:06'|,
+                 refs: %{["t"] => :timestamp}
+               )
+    end
+
+    # Postgres holds a time or a timestamp at a precision of 6, so that modifier changes no value.
+    for {expr, refs} <- [
+          {~S|"t"::timestamp(6) = '2024-01-02 03:04:05.6'|, %{["t"] => :timestamp}},
+          {~S|CAST("t" AS timestamptz(6)) = '2024-01-02 03:04:05.6+00'|,
+           %{["t"] => :timestamptz}},
+          {~S|"t"::time(6) = '03:04:05.6'|, %{["t"] => :time}},
+          {~S|"t" = '2024-01-02 03:04:05.6'::timestamp(6)|, %{["t"] => :timestamp}}
+        ] do
+      test "keeps #{expr}" do
+        assert {:ok, %Expr{}} =
+                 Parser.parse_and_validate_expression(unquote(expr),
+                   refs: unquote(Macro.escape(refs))
+                 )
+      end
+    end
+
+    for {expr, refs} <- [
+          {~S|"t"::timestamp(5) = '2024-01-02 03:04:05.6'|, %{["t"] => :timestamp}},
+          {~S|"n"::varchar(6) = 'ab'|, %{["n"] => :text}}
+        ] do
+      test "still refuses #{expr}" do
+        assert {:error, message} =
+                 Parser.parse_and_validate_expression(unquote(expr),
+                   refs: unquote(Macro.escape(refs))
+                 )
+
+        assert message =~ "type modifiers are not supported in a cast"
+      end
     end
   end
 end

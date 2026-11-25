@@ -1,12 +1,16 @@
 defmodule Electric.Shapes.Querying do
+  alias Electric.Replication.Eval
+  alias Electric.Replication.Eval.Expr
   alias Electric.Replication.Eval.Parser.Func
   alias Electric.Replication.Eval.SqlGenerator
+  alias Electric.Replication.PostgresInterop.Casting
   alias Electric.ShapeCache.LogChunker
   alias Electric.Shapes.DnfPlan
   alias Electric.Shapes.Shape
   alias Electric.Shapes.SubqueryTags
   alias Electric.Telemetry.OpenTelemetry
   alias Electric.Utils
+  alias PgInterop.Sublink
 
   @value_prefix SubqueryTags.value_prefix()
   @null_sentinel SubqueryTags.null_sentinel()
@@ -39,6 +43,98 @@ defmodule Electric.Shapes.Querying do
     |> Stream.flat_map(& &1.rows)
   end
 
+  # A nullable key can change NOT IN for tags besides the right-hand key that
+  # moved, and a numeric key matches rows that hold its value at another scale.
+  # Query the affected tags per position at the same boundary as the log
+  # splice, including rows visible through another disjunct.
+  def move_patterns(
+        conn,
+        stack_id,
+        shape_handle,
+        shape,
+        plan,
+        dep_index,
+        before,
+        after_move,
+        kind
+      ) do
+    table = Utils.relation_to_sql(shape.root_table)
+    refs = shape.where.used_refs
+
+    patterns =
+      for pos <- Map.fetch!(plan.dependency_positions, dep_index),
+          info = Map.fetch!(plan.positions, pos),
+          {old_views, new_views} = moved_views(info, kind, before, after_move),
+          {old_sql, old_params, next} = position_to_sql(info, old_views, refs, 1),
+          {new_sql, new_params, _} = position_to_sql(info, new_views, refs, next),
+          tag_sql =
+            tag_slot_sql(info, stack_id, shape_handle, Shape.composite_tag_encoding(shape)),
+          sql = move_patterns_sql(kind, info, table, tag_sql, old_sql, new_sql),
+          row <- Postgrex.query!(conn, sql, old_params ++ new_params).rows do
+        case row do
+          [tag] -> %{pos: pos, value: tag}
+          [tag, was_active?] -> {was_active?, %{pos: pos, value: tag}}
+        end
+      end
+
+    if kind == :replace do
+      by_direction = Enum.group_by(patterns, &elem(&1, 0), &elem(&1, 1))
+      %{move_out: Map.get(by_direction, true, []), move_in: Map.get(by_direction, false, [])}
+    else
+      patterns
+    end
+  end
+
+  # Only a row keyed by a moved value changes an `IN`, so the side that holds the moved values
+  # binds just them: with an index on the key, Postgres reads their rows, not the whole shape.
+  defp moved_views(%{negated?: false, subquery_ref: ref}, :move_out, before, after_move),
+    do: {Map.put(before, ref, moved_view(before, after_move, ref)), after_move}
+
+  defp moved_views(%{negated?: false, subquery_ref: ref}, :move_in, before, after_move),
+    do: {before, Map.put(after_move, ref, moved_view(after_move, before, ref))}
+
+  defp moved_views(_info, _kind, before, after_move), do: {before, after_move}
+
+  defp moved_view(views, other_views, ref) do
+    view = Map.get(views, ref, MapSet.new())
+    other = other_views |> Map.get(ref, MapSet.new()) |> Sublink.keys()
+
+    case view do
+      %Sublink{} -> Enum.reduce(other, view, &Sublink.delete(&2, &1))
+      %MapSet{} -> MapSet.difference(view, other)
+    end
+  end
+
+  # A negated position holds while its `IN` is false, a positive one while it is true.
+  defp move_patterns_sql(:replace, info, table, tag_sql, old_sql, new_sql) do
+    active = if info.negated?, do: "IS FALSE", else: "IS TRUE"
+
+    """
+    SELECT DISTINCT #{tag_sql}, (#{old_sql}) #{active} FROM #{table}
+    WHERE ((#{old_sql}) #{active}) <> ((#{new_sql}) #{active})
+    """
+  end
+
+  defp move_patterns_sql(kind, info, table, tag_sql, old_sql, new_sql) do
+    {old_test, new_test} =
+      if kind == :move_in,
+        do: {inactive_sql(info, old_sql), active_sql(info, new_sql)},
+        else: {active_sql(info, old_sql), inactive_sql(info, new_sql)}
+
+    """
+    SELECT DISTINCT #{tag_sql} FROM #{table}
+    WHERE #{old_test} AND #{new_test}
+    """
+  end
+
+  # A WHERE keeps only the rows its condition makes true, so a bare `IN` selects the rows
+  # `IS TRUE` would, and Postgres can read them from an index on the key.
+  defp active_sql(%{negated?: true}, sql), do: "(#{sql}) IS FALSE"
+  defp active_sql(_info, sql), do: "(#{sql})"
+
+  defp inactive_sql(%{negated?: true}, sql), do: "(#{sql}) IS NOT FALSE"
+  defp inactive_sql(_info, sql), do: "(#{sql}) IS NOT TRUE"
+
   def query_subset(conn, stack_id, shape_handle, shape, subset, headers \\ []) do
     # When querying a subset, we select same columns as the base shape
     table = Utils.relation_to_sql(shape.root_table)
@@ -55,7 +151,7 @@ defmodule Electric.Shapes.Querying do
           " WHERE " <> where
 
         {%{query: base_where}, %{query: where}} ->
-          " WHERE " <> base_where <> " AND (" <> where <> ")"
+          " WHERE (" <> base_where <> ") AND (" <> where <> ")"
       end
 
     order_by = if order_by = subset.order_by, do: " ORDER BY " <> order_by, else: ""
@@ -132,7 +228,7 @@ defmodule Electric.Shapes.Querying do
       table = Utils.relation_to_sql(root_table)
 
       where =
-        if not is_nil(shape.where), do: " WHERE " <> shape.where.query, else: ""
+        if not is_nil(shape.where), do: " WHERE " <> Expr.sql(shape.where), else: ""
 
       metadata = metadata_sql(shape, stack_id, shape_handle)
       {json_like_select, params} = json_like_select(shape, [], stack_id, shape_handle, metadata)
@@ -165,22 +261,16 @@ defmodule Electric.Shapes.Querying do
 
   # Converts a tag structure to something PG select can fill, but returns a list of separate strings for each tag
   # - it's up to the caller to interpolate them into the query correctly
-  defp make_tags(%Shape{tag_structure: tag_structure}, stack_id, shape_handle) do
+  defp make_tags(%Shape{tag_structure: tag_structure} = shape, stack_id, shape_handle) do
+    encoding = Shape.composite_tag_encoding(shape)
+
     Enum.map(tag_structure, fn pattern ->
       Enum.map(pattern, fn
         column_name when is_binary(column_name) ->
-          col = pg_cast_column_to_text(column_name)
-          namespaced = pg_namespace_value_sql(col)
-          ~s[md5('#{stack_id}#{shape_handle}' || #{namespaced})]
+          tag_hash_sql([column_name], stack_id, shape_handle, encoding)
 
-        {:hash_together, columns} ->
-          column_parts =
-            Enum.map(columns, fn col_name ->
-              col = pg_cast_column_to_text(col_name)
-              ~s['#{col_name}:' || #{pg_namespace_value_sql(col)}]
-            end)
-
-          ~s[md5('#{stack_id}#{shape_handle}' || #{Enum.join(column_parts, " || ")})]
+        {:hash_together, _columns} = tag_columns ->
+          tag_hash_sql(tag_columns, stack_id, shape_handle, encoding)
       end)
       |> Enum.join("|| '/' ||")
     end)
@@ -189,7 +279,10 @@ defmodule Electric.Shapes.Querying do
   defp json_like_select(
          %Shape{
            root_table: root_table,
-           selected_columns: columns
+           selected_columns: columns,
+           locale: locale,
+           localized_columns: localized_columns,
+           localized_backing_columns: backing_columns
          } = shape,
          additional_headers,
          _stack_id,
@@ -197,7 +290,7 @@ defmodule Electric.Shapes.Querying do
          metadata
        ) do
     key_part = build_key_part(shape)
-    value_part = build_value_part(columns)
+    value_part = build_value_part(columns, locale, localized_columns, backing_columns)
     headers_part = build_headers_part(root_table, additional_headers, metadata)
 
     # We're building a JSON string that looks like this:
@@ -259,14 +352,20 @@ defmodule Electric.Shapes.Querying do
     |> Enum.join(~s[ || '/' || ])
   end
 
-  defp build_value_part(columns) do
-    column_parts = Enum.map(columns, &build_column_part/1)
+  defp build_value_part(columns, locale, localized_columns, backing_columns) do
+    # A whole-table shape selects the backing columns too. Emitting them here would show every language in
+    # the snapshot and one language afterwards, since the live path drops them.
+    column_parts =
+      columns
+      |> Enum.reject(&(&1 in backing_columns))
+      |> Enum.map(&build_column_part(&1, locale, localized_columns))
+
     ~s['"value":{' || #{Enum.join(column_parts, " || ',' || ")} || '}']
   end
 
-  defp build_column_part(column) do
+  defp build_column_part(column, locale, localized_columns) do
     escaped_name = escape_sql_json_interpolation(column)
-    escaped_value = escape_column_value(column)
+    escaped_value = escape_column_value(column, locale, localized_columns)
 
     # Since `||` returns NULL if any of the arguments is NULL, we need to use `coalesce` to handle NULL values
     ~s['"#{escaped_name}":' || #{pg_coalesce_json_string(escaped_value)}]
@@ -282,21 +381,38 @@ defmodule Electric.Shapes.Querying do
     relation |> Utils.relation_to_sql(true) |> String.replace(~S|'|, ~S|''|)
   end
 
-  defp escape_column_value(column) do
+  defp escape_column_value(column, locale, localized_columns) do
     column
-    |> pg_cast_column_to_text()
+    |> pg_cast_column_to_text(locale, localized_columns)
     |> pg_escape_string_for_json()
     |> pg_coalesce_json_string()
   end
 
-  defp pg_cast_column_to_text(column) do
-    escaped = Utils.escape_quotes(column)
-    col = ~s["#{escaped}"]
+  # Key parts and comparison expressions read the stored column, never a projection: a shape must route and
+  # compare on the same value whatever language its reader asked for.
+  defp pg_cast_column_to_text(column), do: pg_cast_column_to_text(column, nil, [])
+
+  defp pg_cast_column_to_text(column, locale, localized_columns) do
+    col = pg_column_reference(column, column in localized_columns, locale)
     # In PostgreSQL, casting bpchar (char(n)) to text strips trailing spaces.
     # Use concat() for bpchar columns to preserve the space padding, since
     # concat() converts its argument to text without trimming.
     ~s[CASE WHEN #{col} IS NULL THEN NULL::text WHEN pg_typeof(#{col}) = 'character'::regtype THEN concat(#{col}, '') ELSE #{col}::text END]
   end
+
+  # Postgres holds the projection: a stored generated column per language, filled at write time. Reading it
+  # under the column's own name is what lets the reader keep its schema — Electric selects columns, it cannot
+  # alias them, so the rename has to happen here.
+  # Takes the raw column name and escapes once: escaping the base and then the combined identifier would
+  # double every quote a column name contains, and PostgreSQL would resolve a different column.
+  @doc false
+  def pg_column_reference(column, false, _locale), do: ~s["#{Utils.escape_quotes(column)}"]
+
+  def pg_column_reference(column, true, locale),
+    do: ~s["#{Utils.escape_quotes(locale_column_name(column, locale))}"]
+
+  @doc false
+  def locale_column_name(column, locale), do: "#{column}_#{locale}"
 
   defp pg_escape_string_for_json(str), do: ~s[to_json(#{str})::text]
   defp pg_coalesce_json_string(str), do: ~s[coalesce(#{str} , 'null')]
@@ -304,7 +420,7 @@ defmodule Electric.Shapes.Querying do
   defp metadata_sql(shape, stack_id, shape_handle, opts \\ []) do
     case dnf_plan_for_metadata(shape, opts) do
       %DnfPlan{} = plan ->
-        tags_sqls = tags_sql(plan, stack_id, shape_handle)
+        tags_sqls = tags_sql(plan, stack_id, shape_handle, Shape.composite_tag_encoding(shape))
 
         {active_conditions_sqls, params} =
           case Keyword.get(opts, :views) do
@@ -384,7 +500,7 @@ defmodule Electric.Shapes.Querying do
     where =
       case join_sql(" OR ", [impacted_before_sql, unaffected_sql]) do
         nil -> candidate_sql
-        excl -> "(#{candidate_sql}) AND NOT (#{excl})"
+        excl -> "(#{candidate_sql}) AND (#{excl}) IS NOT TRUE"
       end
 
     {where, candidate_params ++ impacted_before_params ++ unaffected_params}
@@ -396,7 +512,7 @@ defmodule Electric.Shapes.Querying do
       base_sql = info.sql
 
       if info.negated? do
-        "(NOT COALESCE((#{base_sql})::boolean, false))::boolean"
+        "COALESCE(NOT (#{base_sql})::boolean, false)"
       else
         "COALESCE((#{base_sql})::boolean, false)"
       end
@@ -415,7 +531,7 @@ defmodule Electric.Shapes.Querying do
 
         sql =
           if info.negated? do
-            "(NOT COALESCE((#{base_sql})::boolean, false))::boolean"
+            "COALESCE(NOT (#{base_sql})::boolean, false)"
           else
             "COALESCE((#{base_sql})::boolean, false)"
           end
@@ -426,14 +542,14 @@ defmodule Electric.Shapes.Querying do
     {Enum.reverse(sqls), params, next_param_idx}
   end
 
-  def tags_sql(plan, stack_id, shape_handle) do
+  def tags_sql(plan, stack_id, shape_handle, encoding \\ :length_prefixed) do
     Enum.map(plan.disjuncts, fn conj ->
       positions_in_disjunct = MapSet.new(conj, &elem(&1, 0))
 
       slot_sqls =
         Enum.map(0..(plan.position_count - 1), fn pos ->
           if MapSet.member?(positions_in_disjunct, pos) do
-            tag_slot_sql(plan.positions[pos], stack_id, shape_handle)
+            tag_slot_sql(plan.positions[pos], stack_id, shape_handle, encoding)
           else
             "''"
           end
@@ -503,72 +619,185 @@ defmodule Electric.Shapes.Querying do
        ) do
     lhs_sql = lhs_sql_from_ast(info.ast)
     ref_type = Map.get(used_refs, info.subquery_ref)
-    values = Map.get(views, info.subquery_ref, MapSet.new()) |> MapSet.to_list()
+
+    view = Map.get(views, info.subquery_ref, MapSet.new())
+    values = view |> Sublink.keys() |> MapSet.to_list()
 
     case ref_type do
       {:array, {:row, col_types}} ->
-        casts = Enum.map(col_types, &Electric.Replication.Eval.type_to_pg_cast/1)
-
-        params =
+        columns =
           case values do
             [] ->
-              Enum.map(casts, fn _ -> [] end)
+              Enum.map(col_types, fn _ -> [] end)
 
             _ ->
-              values
+              view
+              |> composite_query_values(values, col_types)
               |> Utils.unzip_any()
               |> Tuple.to_list()
-              |> Enum.zip(col_types)
-              |> Enum.map(fn {col_vals, col_type} ->
-                Enum.map(col_vals, &value_to_postgrex(&1, col_type))
-              end)
           end
 
-        sql =
-          casts
-          |> Enum.with_index(pidx)
-          |> Enum.map_join(", ", fn {col, index} -> "$#{index}::#{col}[]" end)
-          |> then(&"#{lhs_sql} IN (SELECT * FROM unnest(#{&1}))")
+        {sql, params} = composite_membership_source(col_types, columns, pidx)
+        {"#{lhs_sql} IN (#{sql})", params, pidx + length(col_types)}
 
-        {sql, params, pidx + length(casts)}
+      # `= ANY` over an array of arrays compares the column with their elements, so an array key
+      # binds as text, one element per key, as an array field of a composite key does.
+      {:array, {:array, _} = element_type} ->
+        {sql, params} = composite_membership_source([element_type], [values], pidx)
+        {"#{lhs_sql} IN (#{sql})", params, pidx + 1}
 
       {:array, element_type} ->
-        type_cast = Electric.Replication.Eval.type_to_pg_cast(element_type)
-        sql = "#{lhs_sql} = ANY ($#{pidx}::#{type_cast}[])"
-        {sql, [Enum.map(values, &value_to_postgrex(&1, element_type))], pidx + 1}
+        type_cast = Eval.type_to_pg_cast(element_type)
+
+        if Enum.any?(values, &text_key?/1) do
+          sql = "#{lhs_sql} = ANY ($#{pidx}::text[]::#{type_cast}[])"
+          {sql, [Enum.map(values, &key_text(&1, element_type))], pidx + 1}
+        else
+          sql = "#{lhs_sql} = ANY ($#{pidx}::#{type_cast}[])"
+          {sql, [Enum.map(values, &value_to_postgrex(&1, element_type))], pidx + 1}
+        end
     end
   end
 
+  # A key Postgres sent in a form the evaluator does not parse is its text (see `SublinkKey`), so a
+  # list of keys holding one binds as text, each key written as Postgres reads it.
+  defp text_key?(value), do: match?(%Eval.SublinkKey.Text{}, value)
+
+  defp key_text(%Eval.SublinkKey.Text{text: text}, _type), do: text
+  defp key_text(value, type), do: array_element_text(value, type)
+
+  # The evaluator's numeric representation is a float. Use the original
+  # Postgres text for SQL comparisons so the bind retains the exact key.
+  # Postgres bounds that text, so Decimal's default 34-digit parse limit
+  # would only refuse values Postgres stores.
+  @numeric_parse_limits [max_digits: :infinity, max_exponent: :infinity]
+
+  defp composite_query_values(%Sublink{originals: originals}, values, types)
+       when is_map(originals) do
+    numeric_positions = for {:numeric, idx} <- Enum.with_index(types), do: idx
+    numeric_array_positions = for {{:array, :numeric}, idx} <- Enum.with_index(types), do: idx
+
+    Enum.map(values, fn value ->
+      original = Map.fetch!(originals, value)
+
+      value =
+        Enum.reduce(numeric_positions, value, fn idx, value ->
+          decimal = if text = elem(original, idx), do: Decimal.new(text, @numeric_parse_limits)
+          put_elem(value, idx, decimal)
+        end)
+
+      # An array field binds as text already, so it takes the array literal Postgres sent.
+      Enum.reduce(numeric_array_positions, value, fn idx, value ->
+        put_elem(value, idx, elem(original, idx) && {:array_text, elem(original, idx)})
+      end)
+    end)
+  end
+
+  defp composite_query_values(_, values, _), do: values
+
+  defp composite_membership_source(types, columns, pidx) do
+    {binds, fields} =
+      types
+      |> Enum.zip(columns)
+      |> Enum.with_index(pidx)
+      |> Enum.map(fn {{type, values}, index} -> composite_column(type, values, index) end)
+      |> Enum.unzip()
+
+    {select, params} = Enum.unzip(fields)
+    source = "unnest(#{Enum.join(binds, ", ")})"
+
+    column_names = Enum.map(pidx..(pidx + length(types) - 1)//1, &"key_#{&1}")
+
+    if select != column_names do
+      column_names = Enum.join(column_names, ", ")
+      {"SELECT #{Enum.join(select, ", ")} FROM #{source} AS rhs(#{column_names})", params}
+    else
+      {"SELECT * FROM #{source}", params}
+    end
+  end
+
+  # unnest flattens all array dimensions. Bind each array-valued field as one
+  # text element and cast it after unnesting to keep the fields of a row intact.
+  defp composite_column({:array, element_type} = type, values, index) do
+    params = Enum.map(values, &array_parameter(&1, element_type))
+    {"$#{index}::text[]", {"key_#{index}::#{Eval.type_to_pg_cast(type)}", params}}
+  end
+
+  defp composite_column(type, values, index) do
+    if Enum.any?(values, &text_key?/1) do
+      params = Enum.map(values, &key_text(&1, type))
+      {"$#{index}::text[]", {"key_#{index}::#{Eval.type_to_pg_cast(type)}", params}}
+    else
+      params = Enum.map(values, &value_to_postgrex(&1, type))
+      {"$#{index}::#{Eval.type_to_pg_cast(type)}[]", {"key_#{index}", params}}
+    end
+  end
+
+  defp array_parameter(nil, _type), do: nil
+  defp array_parameter({:array_text, text}, _type), do: text
+
+  defp array_parameter(%PgInterop.Array.Bounded{elements: elements} = array, type),
+    do: PgInterop.Array.bounds_prefix(array) <> array_parameter(elements, type)
+
+  defp array_parameter([head | _] = values, type) when is_list(head) do
+    "{" <> Enum.map_join(values, ",", &array_parameter(&1, type)) <> "}"
+  end
+
+  defp array_parameter(values, type) do
+    values |> Enum.map(&array_element_text(&1, type)) |> PgInterop.Array.serialize()
+  end
+
+  defp array_element_text(nil, _type), do: nil
+  defp array_element_text(%Eval.SublinkKey.Text{text: text}, _type), do: text
+  defp array_element_text(value, :uuid), do: Casting.uuid_to_string(value)
+  defp array_element_text(value, :interval), do: PgInterop.Interval.format(value)
+  defp array_element_text(value, _type), do: to_string(value)
+
   defp value_to_postgrex(value, type) do
-    Electric.Replication.Eval.value_to_postgrex(value, type)
+    Eval.value_to_postgrex(value, type)
   end
 
   defp lhs_sql_from_ast(%Func{name: "sublink_membership_check", args: [testexpr, _]}) do
     SqlGenerator.to_sql(testexpr)
   end
 
-  defp tag_slot_sql(%{subquery?: true, tag_columns: [col]}, stack_id, shape_handle) do
+  defp tag_slot_sql(
+         %{subquery?: true, tag_columns: tag_columns},
+         stack_id,
+         shape_handle,
+         encoding
+       ) do
+    tag_hash_sql(tag_columns, stack_id, shape_handle, encoding)
+  end
+
+  defp tag_slot_sql(%{subquery?: false}, _stack_id, _shape_handle, _encoding) do
+    "'1'"
+  end
+
+  defp tag_hash_sql([col], stack_id, shape_handle, _encoding) do
     col_sql = pg_cast_column_to_text(col)
     namespaced = pg_namespace_value_sql(col_sql)
     ~s[md5('#{stack_id}#{shape_handle}' || #{namespaced})]
   end
 
-  defp tag_slot_sql(
-         %{subquery?: true, tag_columns: {:hash_together, cols}},
-         stack_id,
-         shape_handle
-       ) do
-    column_parts =
-      Enum.map(cols, fn col_name ->
-        col = pg_cast_column_to_text(col_name)
-        ~s['#{col_name}:' || #{pg_namespace_value_sql(col)}]
-      end)
-
-    ~s[md5('#{stack_id}#{shape_handle}' || #{Enum.join(column_parts, " || ")})]
+  defp tag_hash_sql({:hash_together, cols}, stack_id, shape_handle, encoding) do
+    ~s[md5('#{stack_id}#{shape_handle}' || #{composite_tag_input_sql(cols, encoding)})]
   end
 
-  defp tag_slot_sql(%{subquery?: false}, _stack_id, _shape_handle) do
-    "'1'"
+  @doc false
+  def composite_tag_input_sql(columns, :legacy) do
+    Enum.map_join(columns, " || ", fn col_name ->
+      col = pg_cast_column_to_text(col_name)
+      ~s['#{Utils.escape_quotes(col_name, ?')}:' || #{pg_namespace_value_sql(col)}]
+    end)
+  end
+
+  # octet_length counts the bytes md5 hashes, in the server encoding as for single-column tags.
+  def composite_tag_input_sql(columns, :length_prefixed) do
+    Enum.map_join(columns, " || ", fn col_name ->
+      namespaced = col_name |> pg_cast_column_to_text() |> pg_namespace_value_sql()
+      "octet_length(#{namespaced})::text || ':' || #{namespaced}"
+    end)
   end
 
   defp join_sql(separator, sqls) do

@@ -103,7 +103,7 @@ describe(`shape-stream static analysis`, () => {
       (entry) => entry.name
     )
 
-    expect(recursiveMethods).toContain(`#requestShape`)
+    expect(recursiveMethods).toContain(`#start`)
     expect(recursiveMethods).toContain(`#fetchSnapshotWithRetry`)
   })
 

@@ -1,5 +1,6 @@
 defmodule Electric.Client.Fetch.HTTP do
   @default_timeout 5 * 60
+  @default_max_response_bytes 256 * 1024 * 1024
   @schema NimbleOptions.new!(
             timeout: [
               type: {:or, [:pos_integer, {:in, [:infinity]}]},
@@ -38,6 +39,18 @@ defmodule Electric.Client.Fetch.HTTP do
               Options to include in `Req.new/1` for every request.
               """,
               default: []
+            ],
+            max_response_bytes: [
+              type: :pos_integer,
+              doc: """
+              Largest response body to accept, in bytes, counted as received and again after
+              decompression.
+
+              A longer response fails the request with
+              `Electric.Client.Fetch.HTTP.ResponseTooLargeError`, without a retry.
+              """,
+              default: @default_max_response_bytes,
+              type_spec: quote(do: pos_integer())
             ]
           )
 
@@ -60,6 +73,13 @@ defmodule Electric.Client.Fetch.HTTP do
       )
 
 
+  ## Retries
+
+  Transient failures are retried with exponential backoff and full jitter, up to 32 seconds
+  between attempts. If the server's response carries a `Retry-After` header (delta-seconds or
+  an HTTP-date) the client waits at least that long, up to a limit of one hour. A response
+  without the header, or with one the client can't read, keeps the client's own backoff.
+
   ## Options
 
   #{NimbleOptions.docs(@schema)}
@@ -70,6 +90,22 @@ defmodule Electric.Client.Fetch.HTTP do
   require Logger
 
   @behaviour Electric.Client.Fetch
+
+  defmodule ResponseTooLargeError do
+    @moduledoc """
+    A response body is longer than the `:max_response_bytes` option of
+    `Electric.Client.Fetch.HTTP` allows.
+    """
+
+    defexception [:max_bytes]
+
+    @impl true
+    def message(%__MODULE__{max_bytes: max_bytes}) do
+      "response body is longer than the limit of #{max_bytes} bytes"
+    end
+  end
+
+  @body_over_limit :electric_body_over_limit
 
   @impl Electric.Client.Fetch
   def validate_opts(opts) do
@@ -98,6 +134,7 @@ defmodule Electric.Client.Fetch.HTTP do
       Keyword.get(opts, :is_transient_fun, &Electric.Client.Fetch.HTTP.transient_response?/1)
 
     timeout = Keyword.get(opts, :timeout, @default_timeout)
+    max_response_bytes = Keyword.get(opts, :max_response_bytes, @default_max_response_bytes)
     {pool, request_opts} = Keyword.pop(request_opts, :finch, nil)
 
     connect_options =
@@ -124,6 +161,116 @@ defmodule Electric.Client.Fetch.HTTP do
     |> Req.new()
     |> merge_options(request_opts)
     |> Req.Request.put_private(:electric_start_request, now())
+    |> limit_response_size(max_response_bytes)
+  end
+
+  # Without `into` Req holds the whole body before anything can look at its size. With it, Req
+  # neither asks for compression nor inflates, so `compressed: true` is honoured here, for gzip
+  # alone since that is what can be inflated in bounded steps.
+  defp limit_response_size(%Req.Request{} = request, max_bytes) do
+    request = Req.merge(request, into: &collect_body(&1, &2, max_bytes))
+
+    %{
+      request
+      | response_steps:
+          Keyword.replace!(
+            request.response_steps,
+            :decompress_body,
+            &decompress_body_within_limit(&1, max_bytes)
+          )
+    }
+    |> accept_gzip()
+  end
+
+  defp accept_gzip(%Req.Request{} = request) do
+    if Req.Request.get_option(request, :compressed, false) do
+      Req.Request.put_new_header(request, "accept-encoding", "gzip")
+    else
+      request
+    end
+  end
+
+  defp collect_body({:data, data}, {request, response}, max_bytes) do
+    body = response.body <> data
+
+    if byte_size(body) > max_bytes do
+      {:halt, {request, Req.Response.put_private(%{response | body: ""}, @body_over_limit, true)}}
+    else
+      {:cont, {request, %{response | body: body}}}
+    end
+  end
+
+  defp decompress_body_within_limit({request, response}, max_bytes) do
+    cond do
+      Req.Response.get_private(response, @body_over_limit, false) ->
+        {request, %ResponseTooLargeError{max_bytes: max_bytes}}
+
+      gzip_encoded?(request, response) and is_binary(response.body) and response.body != "" ->
+        inflate_response(request, response, max_bytes)
+
+      true ->
+        {request, response}
+    end
+  end
+
+  defp gzip_encoded?(request, response) do
+    Req.Request.get_option(request, :compressed, false) and request.options[:raw] != true and
+      content_codings(response) in [["gzip"], ["x-gzip"]]
+  end
+
+  defp content_codings(response) do
+    response
+    |> Req.Response.get_header("content-encoding")
+    |> Enum.flat_map(&String.split(&1, ",", trim: true))
+    |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+  end
+
+  defp inflate_response(request, response, max_bytes) do
+    case inflate_within_limit(response.body, max_bytes) do
+      {:ok, body} ->
+        response =
+          %{response | body: body}
+          |> Req.Response.delete_header("content-encoding")
+          |> Req.Response.delete_header("content-length")
+
+        {request, response}
+
+      :too_large ->
+        {request, %ResponseTooLargeError{max_bytes: max_bytes}}
+
+      {:error, reason} ->
+        {request, %Req.DecompressError{format: :gzip, data: response.body, reason: reason}}
+    end
+  end
+
+  defp inflate_within_limit(body, max_bytes) do
+    zlib = :zlib.open()
+
+    try do
+      # 31 selects the gzip wrapper; `:reset` reads concatenated members, as `:zlib.gunzip/1` does
+      :zlib.inflateInit(zlib, 31, :reset)
+      inflate_steps(zlib, :zlib.safeInflate(zlib, body), [], 0, max_bytes)
+    rescue
+      error in ErlangError -> {:error, error.original}
+    after
+      :zlib.close(zlib)
+    end
+  end
+
+  defp inflate_steps(zlib, {status, output}, inflated, size, max_bytes) do
+    size = size + IO.iodata_length(output)
+
+    cond do
+      size > max_bytes ->
+        :too_large
+
+      status == :continue ->
+        inflate_steps(zlib, :zlib.safeInflate(zlib, []), [inflated, output], size, max_bytes)
+
+      true ->
+        :zlib.inflateEnd(zlib)
+        {:ok, IO.iodata_to_binary([inflated, output])}
+    end
   end
 
   defp request(request) do
@@ -170,7 +317,7 @@ defmodule Electric.Client.Fetch.HTTP do
          :infinity
        ) do
     if transient?(response_or_error, is_transient_fun) do
-      delay_ms = request_delay(request, retry_delay_fun)
+      delay_ms = request_delay(request, response_or_error, retry_delay_fun)
       log_retry(response_or_error, retry_count(request), delay_ms, "")
 
       {:delay, delay_ms}
@@ -187,7 +334,7 @@ defmodule Electric.Client.Fetch.HTTP do
        when is_integer(max_age) do
     start_time = Req.Request.get_private(request, :electric_start_request)
     age = now() - start_time
-    delay_ms = request_delay(request, retry_delay_fun)
+    delay_ms = request_delay(request, response_or_error, retry_delay_fun)
 
     # using the :transient retry methodology here, retrying even POSTs,
     # because our server's endpoints are idempotent by design
@@ -232,10 +379,80 @@ defmodule Electric.Client.Fetch.HTTP do
   defp retry_count(%Req.Request{} = request),
     do: Req.Request.get_private(request, :req_retry_count, 0)
 
-  defp request_delay(%Req.Request{} = request, retry_delay_fun) do
-    request
-    |> retry_count()
-    |> then(retry_delay_fun)
+  # The server's `Retry-After` is a floor under the client's own backoff.
+  defp request_delay(%Req.Request{} = request, response_or_error, retry_delay_fun) do
+    backoff_ms =
+      request
+      |> retry_count()
+      |> then(retry_delay_fun)
+
+    max(retry_after_ms(response_or_error), backoff_ms)
+  end
+
+  # A server asking for more, or sending a date far ahead, must not park the client for days.
+  # The request `timeout` still ends the retries first if it is shorter.
+  @max_retry_after_ms 3_600_000
+
+  @doc false
+  # Returns the delay in milliseconds asked for by the `Retry-After` header of a response, or `0`
+  # if there is no such header, it can't be parsed or it asks for no delay. Accepts both the
+  # delta-seconds form (`"120"`) and the HTTP-date form (`"Wed, 21 Oct 2026 07:28:00 GMT"`).
+  @spec retry_after_ms(Req.Response.t() | Exception.t(), DateTime.t()) :: non_neg_integer()
+  def retry_after_ms(response_or_error, now \\ DateTime.utc_now())
+
+  def retry_after_ms(%Req.Response{} = response, %DateTime{} = now) do
+    case Req.Response.get_header(response, "retry-after") do
+      [value | _] -> parse_retry_after(value, now)
+      [] -> 0
+    end
+  end
+
+  def retry_after_ms(_error, _now), do: 0
+
+  defp parse_retry_after(value, now) do
+    value = String.trim(value)
+
+    case Integer.parse(value) do
+      {seconds, ""} when seconds > 0 ->
+        min(seconds * 1000, @max_retry_after_ms)
+
+      {_seconds, ""} ->
+        0
+
+      _not_a_number ->
+        case parse_http_date(value) do
+          {:ok, date} ->
+            date |> DateTime.diff(now, :millisecond) |> max(0) |> min(@max_retry_after_ms)
+
+          :error ->
+            0
+        end
+    end
+  end
+
+  @months ~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
+
+  # Only the IMF-fixdate form ("Sun, 06 Nov 1994 08:49:37 GMT"). RFC 9110's two obsolete
+  # forms count as unparseable, so the client keeps its own backoff.
+  defp parse_http_date(value) do
+    with [_, day, month, year, hour, minute, second] <-
+           Regex.run(
+             ~r/\A[A-Z][a-z]{2}, (\d{2}) ([A-Z][a-z]{2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT\z/,
+             value
+           ),
+         month_number when is_integer(month_number) <- Enum.find_index(@months, &(&1 == month)),
+         {:ok, date} <-
+           Date.new(String.to_integer(year), month_number + 1, String.to_integer(day)),
+         {:ok, time} <-
+           Time.new(
+             String.to_integer(hour),
+             String.to_integer(minute),
+             String.to_integer(second)
+           ) do
+      DateTime.new(date, time, "Etc/UTC")
+    else
+      _ -> :error
+    end
   end
 
   defp retry_delay(n) do
@@ -249,6 +466,13 @@ defmodule Electric.Client.Fetch.HTTP do
   defp now, do: System.monotonic_time(:second)
 
   @transient_status [408, 429, 500, 502, 503, 504]
+
+  @transient_http1_framing_reasons [
+    :invalid_chunk_size,
+    :missing_crlf_after_chunk,
+    :invalid_trailer_header,
+    :invalid_status_line
+  ]
 
   @doc """
   List of HTTP status codes that represent a retryable error.
@@ -279,6 +503,17 @@ defmodule Electric.Client.Fetch.HTTP do
   end
 
   defp transient?(%Req.HTTPError{protocol: :http2, reason: :unprocessed}, _is_transient_fun) do
+    true
+  end
+
+  # Finch starts a pool on the first request to a host; a request racing that start finds the
+  # pool's supervisor registered before its connection, and gets this error instead of waiting.
+  defp transient?(%Req.HTTPError{reason: :pool_not_available}, _is_transient_fun) do
+    true
+  end
+
+  defp transient?(%Req.HTTPError{protocol: :http1, reason: reason}, _is_transient_fun)
+       when reason in @transient_http1_framing_reasons do
     true
   end
 

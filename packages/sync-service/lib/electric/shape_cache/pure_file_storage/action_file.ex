@@ -5,6 +5,9 @@ defmodule Electric.ShapeCache.PureFileStorage.ActionFile do
   alias Electric.ShapeCache.PureFileStorage.LogFile
   alias Electric.Utils
 
+  # A compaction entry stores its position count in 16 bits.
+  @max_compaction_positions 65_535
+
   defp base_entry({_, label, offset, _type, entry_start, _}, action),
     do: base_entry(offset, label, entry_start, action)
 
@@ -65,12 +68,13 @@ defmodule Electric.ShapeCache.PureFileStorage.ActionFile do
   # We don't care about order being reversed because it's going to be sorted.
   defp updates_to_actions([], {_, _, acc}), do: acc
 
-  # The compaction target is either last one, or after we hit 65535 updates. Technically makes it suboptimal,
+  # The compaction target is either last one, or the item that brings the entry to 65535 positions,
+  # the most its 16-bit count holds (the target counts as one of them). Technically makes it suboptimal,
   # but saves us a lot of memory because the position list will take up at most 65535 * 16 = 1048560 bytes ~ 1MB of memory,
   # as opposed to 65536MB if we allow int32 positions.
   defp updates_to_actions([item | rest], {total_positions, positions, actions})
        when rest == []
-       when total_positions > 65534 do
+       when total_positions + 1 >= @max_compaction_positions do
     actions = [compaction_entry(item, positions) | actions]
 
     updates_to_actions(rest, {0, [], actions})

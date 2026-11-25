@@ -1,56 +1,69 @@
 # Security Policy
 
+PgVolt is an independent fork of ElectricSQL, maintained by Beeldi. It is not
+upstream ElectricSQL, and it is not covered by upstream's security policy.
+
+Report here every vulnerability you find in this code, whether it comes from a change
+this fork made or from **stock upstream** code it carries. A flaw that also affects stock
+upstream is reported to upstream as soon as we receive it, and you may report it there
+directly as well. We ship our own fix on the timeline below without waiting for an
+upstream release, and we coordinate public advisory publication with upstream (respecting
+upstream's stated disclosure window, up to 90 days) so upstream users have time to patch.
+
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Electric, please report it through
-[GitHub's private vulnerability reporting](https://github.com/electric-sql/electric/security/advisories/new).
+Report through
+[this repository's private vulnerability reporting](https://github.com/beeldi/pgvolt/security/advisories/new).
 
-**Do not open a public issue for security vulnerabilities.**
+**Do not open a public issue for a security vulnerability.**
 
 ### What to include
 
 - A description of the vulnerability and its potential impact
 - Steps to reproduce or a proof of concept
-- The affected version(s) or commit(s)
+- The affected branch(es) or commit(s), and the image tag if known
 - Any suggested fix, if you have one
 
 ### Response timeline
 
-- **Acknowledgement**: within 24 hours of your report
-- **Initial assessment**: normally within 48 hours, we will confirm whether the report is accepted and share our initial severity assessment
-- **Resolution**: we aim to fix critical issues the same day, though timelines vary based on complexity. Resolution includes an OSS release and deploying the fix to Electric Cloud
-
-### Disclosure policy
-
-We follow a **coordinated disclosure** process with a **30-day embargo**:
-
-1. You report the vulnerability privately via GitHub
-2. We acknowledge and work on a fix
-3. We release the fix and publish a security advisory
-4. After the fix is released — or after 30 days, whichever comes first — you are free to publish details about the vulnerability
-
-We ask that you do not disclose the vulnerability publicly until the embargo period has passed or we have published a fix, whichever comes first.
+- **Acknowledgement**: within one business day
+- **Initial assessment**: within two business days, we confirm whether the
+  report is accepted and share an initial severity assessment
+- **Resolution**: critical issues are fixed as fast as a reviewed change allows.
+  Resolution means a fix on every supported branch, not on `main` alone.
 
 ## Supported Versions
 
-Security fixes are applied to the latest release. We do not backport fixes to older major or minor versions unless the severity warrants it.
+`main` is supported, together with any `release/**` branch that is still the
+source of a current release. Older commits are not patched: move to a supported
+branch to pick up a fix.
 
 ## Scope
 
-The following are **in scope**:
+**In scope**:
 
-- The Electric sync engine (`packages/sync-service`)
-- Official client libraries (`packages/typescript-client`, `packages/elixir-client`, `packages/react-hooks`)
-- [Electric Cloud](https://dashboard.electric-sql.cloud/)
-- [Phoenix Sync](https://github.com/electric-sql/phoenix_sync)
+- The sync service (`packages/sync-service`), including its Dockerfile
+- The client packages in this tree (`packages/typescript-client`,
+  `packages/elixir-client`)
+- The changes this fork carries on top of upstream, **including code behind
+  feature flags**
+- Third-party dependencies of the above, as pinned in this tree. Reporting
+  upstream to the dependency is welcome but does not replace a report here.
 
-The following are **out of scope**:
+**Out of scope**:
 
-- Experimental features (e.g. the `@electric-sql/experimental` package, or features behind feature flags)
-- Example applications in the `examples/` directory
-- Third-party dependencies (please report these to the upstream project)
-- Social engineering or phishing attacks against Electric team members
+- Upstream Electric Cloud and upstream's published images and packages
+- Upstream packages this fork has removed
 
-## Recognition
+## Upstream advisories
 
-We appreciate the work of security researchers. With your permission, we will credit you in the security advisory for any confirmed vulnerability you report.
+We track security advisories published by upstream ElectricSQL and by the
+dependencies of the packages in scope. An advisory affecting a supported branch
+is triaged on the same timeline as a direct report.
+
+## Disclosure
+
+We follow coordinated disclosure. Please do not publish details before a fix is
+released. Once a fix is released (and any upstream disclosure window has closed, for flaws
+that also affect stock upstream), we publish a security advisory in this repository and
+credit the reporter unless they ask not to be named.

@@ -75,6 +75,16 @@ defmodule Electric.Replication.ShapeLogCollector.RequestBatcherTest do
       assert {:error, "failed to register"} =
                RequestBatcher.add_shape(stack_id, @shape_handle_1, @shape_1, :create)
     end
+
+    @tag processor_delay: 300
+    test "answers an error rather than exiting when the processor outlasts the wait", %{
+      stack_id: stack_id
+    } do
+      # Exiting here kills the registering consumer, which the cleanup path reads as a crash and
+      # answers with a crash report and a second removal -- load added to an already-slow stack.
+      assert {:error, :timeout} =
+               RequestBatcher.add_shape(stack_id, @shape_handle_1, @shape_1, :create, 50)
+    end
   end
 
   describe "remove_shape/2" do
@@ -158,7 +168,7 @@ defmodule Electric.Replication.ShapeLogCollector.RequestBatcherTest do
       # should not call processor until acked
       Process.sleep(10)
       refute_received {:processor_called, _, _}
-      assert :ok = Task.await(task1, 500)
+      assert :ok = Task.await(task1)
 
       # should call processor immediately after with batched update
       expected_msg =
@@ -168,7 +178,7 @@ defmodule Electric.Replication.ShapeLogCollector.RequestBatcherTest do
       assert_receive ^expected_msg
 
       assert [:ok, {:error, "failed to register"}, :ok] ==
-               Task.await_many([task2, task3, task4], 500)
+               Task.await_many([task2, task3, task4])
     end
   end
 

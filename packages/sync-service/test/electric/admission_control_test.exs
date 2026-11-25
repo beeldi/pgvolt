@@ -498,6 +498,127 @@ defmodule Electric.AdmissionControlTest do
     end
   end
 
+  describe "owned permits" do
+    setup do
+      table_name = :"owned_permits_#{System.unique_integer([:positive])}"
+      {:ok, server} = start_supervised({AdmissionControl, table_name: table_name, name: nil})
+      %{table_name: table_name, server: server}
+    end
+
+    test "are released when the owner is killed while holding one", %{table_name: t} = ctx do
+      owner =
+        start_owner(fn ->
+          AdmissionControl.try_acquire_owned("s", :initial, table_name: t, max_concurrent: 1)
+        end)
+
+      assert %{initial: 1, existing: 0} = AdmissionControl.get_current("s", table_name: t)
+      assert {:error, :overloaded} = acquire_raw(t, :initial, 1)
+
+      kill_and_sync(owner, ctx.server)
+
+      assert %{initial: 0, existing: 0} = AdmissionControl.get_current("s", table_name: t)
+      assert :ok = acquire_raw(t, :initial, 1)
+    end
+
+    test "moved to :existing are released as :existing when the owner is killed",
+         %{table_name: t} = ctx do
+      :ok = acquire_raw(t, :initial, 10)
+      :ok = acquire_raw(t, :existing, 10)
+
+      owner =
+        start_owner(fn ->
+          :ok =
+            AdmissionControl.try_acquire_owned("s", :initial, table_name: t, max_concurrent: 10)
+
+          AdmissionControl.try_swap_owned("s", :initial, :existing,
+            table_name: t,
+            max_concurrent: 10
+          )
+        end)
+
+      assert %{initial: 1, existing: 2} = AdmissionControl.get_current("s", table_name: t)
+
+      kill_and_sync(owner, ctx.server)
+
+      assert %{initial: 1, existing: 1} = AdmissionControl.get_current("s", table_name: t)
+    end
+
+    test "are not released again when the owner released them before exiting",
+         %{table_name: t} = ctx do
+      :ok = acquire_raw(t, :initial, 10)
+
+      owner =
+        start_owner(fn ->
+          :ok =
+            AdmissionControl.try_acquire_owned("s", :initial, table_name: t, max_concurrent: 10)
+
+          AdmissionControl.release_owned("s", :initial, table_name: t)
+        end)
+
+      assert [{"s", 1, 0}] = :ets.tab2list(t)
+
+      kill_and_sync(owner, ctx.server)
+
+      assert %{initial: 1, existing: 0} = AdmissionControl.get_current("s", table_name: t)
+    end
+
+    test "a rejected acquire leaves nothing to release", %{table_name: t} = ctx do
+      :ok = acquire_raw(t, :existing, 1)
+
+      owner =
+        start_owner(fn ->
+          AdmissionControl.try_acquire_owned("s", :existing, table_name: t, max_concurrent: 1)
+        end)
+
+      assert [{"s", 0, 1}] = :ets.tab2list(t)
+
+      kill_and_sync(owner, ctx.server)
+
+      assert %{initial: 0, existing: 1} = AdmissionControl.get_current("s", table_name: t)
+    end
+
+    # Runs `fun` in an unlinked process that then waits until it is killed.
+    defp start_owner(fun) do
+      test_pid = self()
+
+      owner =
+        spawn(fn ->
+          send(test_pid, {:owner_ran, self(), fun.()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:owner_ran, ^owner, _result}
+      owner
+    end
+
+    defp kill_and_sync(owner, server) do
+      ref = Process.monitor(owner)
+      Process.exit(owner, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^owner, :killed}
+      wait_until_forgotten(server, owner)
+    end
+
+    defp wait_until_forgotten(server, owner, attempts \\ 100) do
+      %{owners: owners} = :sys.get_state(server)
+
+      cond do
+        not Map.has_key?(owners, owner) ->
+          :ok
+
+        attempts > 0 ->
+          Process.sleep(10)
+          wait_until_forgotten(server, owner, attempts - 1)
+
+        true ->
+          flunk("the server never handled the owner's exit")
+      end
+    end
+
+    defp acquire_raw(table_name, kind, max) do
+      AdmissionControl.try_acquire("s", kind, table_name: table_name, max_concurrent: max)
+    end
+  end
+
   describe "default table name" do
     setup [:with_stack_id_from_test]
 

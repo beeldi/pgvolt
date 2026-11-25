@@ -5,6 +5,11 @@ defmodule ElectricTelemetry.DiskUsage do
 
   @default_update_period 60_000
 
+  # The walk visits every entry under the storage directory, which takes seconds on a large
+  # shape store. Waiting at least this many times as long as the last walk took keeps the
+  # walker idle most of the time, whatever the configured period.
+  @min_idle_factor 10
+
   def start_link(args) do
     {:ok, stack_id} = Keyword.fetch(args, :stack_id)
     GenServer.start_link(__MODULE__, args, name: name(stack_id))
@@ -119,7 +124,7 @@ defmodule ElectricTelemetry.DiskUsage do
          {:ok, data} <- File.read(cache_file),
          [@cache_version, usage_bytes, updated_at] <- String.split(data, "|"),
          {usage_bytes, ""} <- Integer.parse(usage_bytes),
-         {:ok, updated_at, 0} = DateTime.from_iso8601(updated_at) do
+         {:ok, updated_at, 0} <- DateTime.from_iso8601(updated_at) do
       {usage_bytes, updated_at, false}
     else
       _ ->
@@ -154,12 +159,21 @@ defmodule ElectricTelemetry.DiskUsage do
   end
 
   defp schedule_update(%{timer: nil} = state) do
-    timer = Process.send_after(self(), :update, state.update_period)
+    delay = next_update_delay(state.update_period, state.measurement_duration)
+    timer = Process.send_after(self(), :update, delay)
     %{state | timer: timer}
   end
 
   defp schedule_update(state) do
     state
+  end
+
+  @doc false
+  # The wait before the next walk, in ms, from the configured period and the last walk's
+  # duration in ms.
+  @spec next_update_delay(pos_integer(), non_neg_integer()) :: pos_integer()
+  def next_update_delay(update_period, measurement_duration) do
+    max(update_period, measurement_duration * @min_idle_factor)
   end
 
   defp cancel_timer(%{timer: nil} = state), do: state

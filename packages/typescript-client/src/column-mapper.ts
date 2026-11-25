@@ -159,19 +159,19 @@ export function camelToSnake(str: string): string {
 export function createColumnMapper(
   mapping: Record<string, string>
 ): ColumnMapper {
-  // Build reverse mapping: app name -> db name
-  const reverseMapping: Record<string, string> = {}
-  for (const [dbName, appName] of Object.entries(mapping)) {
-    reverseMapping[appName] = dbName
-  }
+  // Maps, because column names can match what plain objects inherit
+  const dbToApp = new Map(Object.entries(mapping))
+  const appToDb = new Map(
+    Object.entries(mapping).map(([dbName, appName]) => [appName, dbName])
+  )
 
   return {
     decode: (dbColumnName: string) => {
-      return mapping[dbColumnName] ?? dbColumnName
+      return dbToApp.get(dbColumnName) ?? dbColumnName
     },
 
     encode: (appColumnName: string) => {
-      return reverseMapping[appColumnName] ?? appColumnName
+      return appToDb.get(appColumnName) ?? appColumnName
     },
   }
 }
@@ -372,11 +372,14 @@ export function encodeWhereClause(
 export function snakeCamelMapper(schema?: Schema): ColumnMapper {
   // If schema provided, build explicit mapping
   if (schema) {
-    const mapping: Record<string, string> = {}
-    for (const dbColumn of Object.keys(schema)) {
-      mapping[dbColumn] = snakeToCamel(dbColumn)
-    }
-    return createColumnMapper(mapping)
+    return createColumnMapper(
+      Object.fromEntries(
+        Object.keys(schema).map((dbColumn) => [
+          dbColumn,
+          snakeToCamel(dbColumn),
+        ])
+      )
+    )
   }
 
   // Otherwise, map dynamically

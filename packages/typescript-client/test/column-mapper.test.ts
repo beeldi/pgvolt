@@ -429,3 +429,25 @@ describe(`columnMapper and transformer together`, () => {
     })
   })
 })
+
+describe(`column names that match inherited object members`, () => {
+  const names = [`__proto__`, `constructor`, `toString`, `hasOwnProperty`]
+
+  it.each(names)(`createColumnMapper leaves %s unchanged`, (name) => {
+    const mapper = createColumnMapper({ user_id: `userId` })
+
+    expect(mapper.decode(name)).toBe(name)
+    expect(mapper.encode(name)).toBe(name)
+  })
+
+  it(`snakeCamelMapper maps a schema that declares __proto__`, () => {
+    const schema = JSON.parse(
+      `{"__proto__":{"type":"text"},"user_id":{"type":"text"}}`
+    ) as Schema
+
+    const mapper = snakeCamelMapper(schema)
+
+    expect(typeof mapper.decode(`__proto__`)).toBe(`string`)
+    expect(mapper.decode(`user_id`)).toBe(`userId`)
+  })
+})

@@ -125,6 +125,19 @@ defmodule Electric.Client.ShapeStateTest do
       assert new_state.recent_requests == []
       assert new_state.fast_loop_consecutive_count == 0
     end
+
+    test "clears schema and value mapper so the new shape's types are re-derived" do
+      state = %{
+        ShapeState.new(shape_handle: "old-handle")
+        | schema: %{"id" => %{type: "int4"}},
+          value_mapper_fun: fn value -> value end
+      }
+
+      new_state = ShapeState.reset(state, "new-handle")
+
+      assert new_state.schema == nil
+      assert new_state.value_mapper_fun == nil
+    end
   end
 
   describe "clear_fast_loop/1" do

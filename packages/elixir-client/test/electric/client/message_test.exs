@@ -4,6 +4,8 @@ defmodule Electric.Client.MessageTest do
   alias Electric.Client.Message
   alias Electric.Client.Message.{ChangeMessage, ControlMessage, MoveOutMessage}
 
+  import ExUnit.CaptureLog
+
   # request_timestamp
   @ts ~U[2024-01-15 10:30:00Z]
 
@@ -30,6 +32,28 @@ defmodule Electric.Client.MessageTest do
 
       assert [%ControlMessage{control: :snapshot_end}] =
                Message.parse(%{headers: %{control: "snapshot-end"}}, "handle", & &1, @ts)
+    end
+  end
+
+  describe "ChangeMessage with a value that cannot be cast" do
+    test "logs the kind of failure without the row value, and raises" do
+      msg = %{
+        "headers" => %{"operation" => "insert"},
+        "key" => "k1",
+        "value" => %{"amount" => "row-value-that-must-not-be-logged"}
+      }
+
+      mapper = fn %{"amount" => value} ->
+        raise Ecto.CastError, type: :integer, value: value
+      end
+
+      log =
+        capture_log(fn ->
+          assert_raise Ecto.CastError, fn -> Message.parse(msg, "handle", mapper, @ts) end
+        end)
+
+      assert log =~ "Unable to cast field values: Ecto.CastError"
+      refute log =~ "row-value-that-must-not-be-logged"
     end
   end
 

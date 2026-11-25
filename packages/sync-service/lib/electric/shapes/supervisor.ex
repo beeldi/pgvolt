@@ -26,6 +26,10 @@ defmodule Electric.Shapes.Supervisor do
   end
 
   def start_link(opts) do
+    # A replay from the slot that a stop of the subsystem before this one requested starts this
+    # one's collector from the slot: the core supervisor starts it only once that stop ends,
+    # while a connection manager that took over during the stop found the old one still running.
+    :ok = Electric.LsnTracker.apply_replay_from_slot(Keyword.fetch!(opts, :stack_id))
     name = Access.get(opts, :name, name(opts))
     Supervisor.start_link(__MODULE__, opts, name: name)
   end
@@ -58,7 +62,15 @@ defmodule Electric.Shapes.Supervisor do
       canary_spec(stack_id)
     ]
 
-    Supervisor.init(children, strategy: :one_for_all)
+    # No child below starts again in place: the collector and the consumers that start with it
+    # lose what they had not committed, the earlier fragments of an open transaction or an event a
+    # consumer lost as it exited, and the replication client, still connected, resends none of it.
+    # So the first exit of any of them stops the subsystem, and the core with it
+    # (`Electric.CoreSupervisor`). The next start reads from the slot, which Postgres resends from,
+    # and from the transaction journal what the slot was acknowledged past
+    # (`ELECTRIC_ACK_AFTER_JOURNAL`); a slot that did not survive purges the shapes instead. A
+    # consumer or a task under the supervisors below exits on its own without this.
+    Supervisor.init(children, strategy: :one_for_all, max_restarts: 0)
   end
 
   def canary_name(stack_id) do

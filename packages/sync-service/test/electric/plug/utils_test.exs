@@ -5,6 +5,29 @@ defmodule Electric.Plug.UtilsTest do
   use ExUnit.Case, async: true
   doctest Utils, import: true
 
+  describe "parse_columns_param/1" do
+    test "keeps commas inside quoted identifiers and splits the rest" do
+      assert Utils.parse_columns_param(~S|"a,b",c|) == {:ok, ["a,b", "c"]}
+    end
+
+    test "parses a large comma-separated list in linear, not quadratic, time" do
+      # 50k unquoted columns. The previous per-comma regex lookahead re-scanned to end-of-string at
+      # every comma, so an input this size burned tens of seconds; the linear split returns in ms.
+      columns = Enum.map_join(1..50_000, ",", &"c#{&1}")
+
+      task = Task.async(fn -> Utils.parse_columns_param(columns) end)
+
+      case Task.yield(task, 5_000) || Task.shutdown(task) do
+        {:ok, {:ok, parsed}} ->
+          assert length(parsed) == 50_000
+          assert List.first(parsed) == "c1"
+
+        other ->
+          flunk("parse_columns_param did not finish in 5s (quadratic split?): #{inspect(other)}")
+      end
+    end
+  end
+
   describe "redact_query_string/1" do
     test "redacts sensitive query params while preserving order and flags" do
       assert Utils.redact_query_string(
@@ -41,16 +64,20 @@ defmodule Electric.Plug.UtilsTest do
 
       assert attrs["http.query_param.secret"] == "[REDACTED]"
       assert attrs["http.query_param.api_secret"] == "[REDACTED]"
-      assert attrs["http.query_param.Token"] == "[REDACTED]"
-      assert attrs["http.query_param.api_key"] == "[REDACTED]"
       assert attrs["http.query_param.table"] == "users"
       assert attrs["http.query_param.offset"] == "-1"
-      assert attrs["http.query_param.flag"] == ""
+
+      # The query string above still redacts every sensitive value, but names outside the
+      # telemetry allowlist never become attribute keys: Token/api_key are attacker-supplied and a
+      # bare flag is not a shape param.
+      refute Map.has_key?(attrs, "http.query_param.Token")
+      refute Map.has_key?(attrs, "http.query_param.api_key")
+      refute Map.has_key?(attrs, "http.query_param.flag")
     end
 
     test "includes documented top-level subset body params alongside query params" do
       conn =
-        Plug.Test.conn(:post, "/v1/shape?foo=bar")
+        Plug.Test.conn(:post, "/v1/shape?table=bar")
         |> Plug.Conn.fetch_query_params()
         |> Plug.Conn.assign(:body_params, %{
           "where" => "value ILIKE $1",
@@ -64,7 +91,7 @@ defmodule Electric.Plug.UtilsTest do
 
       attrs = Utils.common_open_telemetry_attrs(conn)
 
-      assert attrs["http.query_param.foo"] == "bar"
+      assert attrs["http.query_param.table"] == "bar"
       assert attrs["http.body_param.subset.where"] == "value ILIKE $1"
       assert attrs["http.body_param.subset.params"] == ~s(%{"1" => "%2"})
       assert attrs["http.body_param.subset.limit"] == 1
@@ -183,6 +210,106 @@ defmodule Electric.Plug.UtilsTest do
                is_binary(key) and String.starts_with?(key, "http.body_param.")
              end)
     end
+
+    test "bounds request header attributes to the telemetry allowlist" do
+      attacker_headers = for i <- 1..200, do: {"x-attacker-#{i}", "v"}
+
+      conn =
+        %{
+          Plug.Test.conn("GET", "/v1/shape")
+          | req_headers: [{"user-agent", "curl"} | attacker_headers]
+        }
+        |> Plug.Conn.fetch_query_params()
+
+      attrs = Utils.common_open_telemetry_attrs(conn)
+
+      request_header_keys =
+        attrs
+        |> Map.keys()
+        |> Enum.filter(&(is_binary(&1) and String.starts_with?(&1, "http.request.header.")))
+
+      assert attrs["http.request.header.user-agent"] == "curl"
+      refute Map.has_key?(attrs, "http.request.header.x-attacker-1")
+      assert request_header_keys == ["http.request.header.user-agent"]
+    end
+
+    test "bounds query-param attributes to the telemetry allowlist" do
+      attacker_params = for i <- 1..200, do: "attacker_#{i}=v"
+      query_string = Enum.join(["table=foo" | attacker_params], "&")
+
+      conn =
+        Plug.Test.conn("GET", "/v1/shape?" <> query_string)
+        |> Plug.Conn.fetch_query_params()
+
+      attrs = Utils.common_open_telemetry_attrs(conn)
+
+      query_param_keys =
+        attrs
+        |> Map.keys()
+        |> Enum.filter(&(is_binary(&1) and String.starts_with?(&1, "http.query_param.")))
+
+      assert attrs["http.query_param.table"] == "foo"
+      refute Map.has_key?(attrs, "http.query_param.attacker_1")
+      assert query_param_keys == ["http.query_param.table"]
+    end
+  end
+
+  describe "CORSHeaderPlug" do
+    test "reflects a single Origin and advertises Vary on origin and the credential" do
+      conn =
+        Plug.Test.conn("GET", "/v1/shape")
+        |> Plug.Conn.put_req_header("origin", "https://a.example")
+
+      conn = Utils.CORSHeaderPlug.call(conn, %{methods: ["GET"]})
+
+      assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == [
+               "https://a.example"
+             ]
+
+      assert MapSet.member?(vary_fields(conn), "origin")
+      assert MapSet.member?(vary_fields(conn), "authorization")
+    end
+
+    # A cacheable (`cache-control: public`) response carries per-principal rows when auth lives in a
+    # header. Unless the response advertises the credential header in `Vary`, a shared cache keys on the
+    # URL alone and serves one principal the other's cached rows. Two requests differing only by the
+    # `authorization` header must both name it in `Vary` so a compliant cache keeps them apart.
+    test "varies on the credential so a shared cache cannot serve one principal's rows to another" do
+      base =
+        Plug.Test.conn("GET", "/v1/shape")
+        |> Plug.Conn.put_req_header("origin", "https://a.example")
+
+      alice = Plug.Conn.put_req_header(base, "authorization", "Bearer alice")
+      bob = Plug.Conn.put_req_header(base, "authorization", "Bearer bob")
+
+      alice = Utils.CORSHeaderPlug.call(alice, %{methods: ["GET"]})
+      bob = Utils.CORSHeaderPlug.call(bob, %{methods: ["GET"]})
+
+      for cred_header <-
+            ~w(authorization cookie x-api-key x-auth-token x-electric-secret electric-secret) do
+        assert MapSet.member?(vary_fields(alice), cred_header)
+        assert MapSet.member?(vary_fields(bob), cred_header)
+      end
+    end
+
+    test "falls back to * when no Origin is present" do
+      conn = Plug.Test.conn("GET", "/v1/shape")
+
+      conn = Utils.CORSHeaderPlug.call(conn, %{methods: ["GET"]})
+
+      assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == ["*"]
+    end
+
+    test "does not crash when the request carries duplicate Origin headers" do
+      conn = %{
+        Plug.Test.conn("GET", "/v1/shape")
+        | req_headers: [{"origin", "https://a.example"}, {"origin", "https://b.example"}]
+      }
+
+      conn = Utils.CORSHeaderPlug.call(conn, %{methods: ["GET"]})
+
+      assert Plug.Conn.get_resp_header(conn, "access-control-allow-origin") == ["*"]
+    end
   end
 
   describe "get_next_interval_timestamp/2" do
@@ -195,7 +322,6 @@ defmodule Electric.Plug.UtilsTest do
       diff_in_seconds = DateTime.diff(now, oct9th2024, :second)
       expected_interval = ceil(diff_in_seconds / long_poll_timeout_sec) * long_poll_timeout_sec
 
-      # Assert that the function returns the expected value
       assert Utils.get_next_interval_timestamp(long_poll_timeout_ms) ==
                expected_interval
     end
@@ -210,7 +336,6 @@ defmodule Electric.Plug.UtilsTest do
       diff_in_seconds = DateTime.diff(now, oct9th2024, :second)
       expected_interval = ceil(diff_in_seconds / long_poll_timeout_sec) * long_poll_timeout_sec
 
-      # Assert that the function returns the expected value
       assert Utils.get_next_interval_timestamp(long_poll_timeout_ms) ==
                expected_interval
     end
@@ -225,7 +350,6 @@ defmodule Electric.Plug.UtilsTest do
       diff_in_seconds = DateTime.diff(now, oct9th2024, :second)
       expected_interval = ceil(diff_in_seconds / long_poll_timeout_sec) * long_poll_timeout_sec
 
-      # Assert that the function returns a DIFFERENT value due to collision
       assert Utils.get_next_interval_timestamp(
                long_poll_timeout_ms,
                "#{expected_interval}"
@@ -261,5 +385,24 @@ defmodule Electric.Plug.UtilsTest do
                  "current_bucket=#{current_bucket}"
       end
     end
+
+    test "keeps moving the cursor when the timeout is below the bucket resolution" do
+      # A sub-second timeout has no whole-second bucket to derive an interval from, and the cursor was
+      # a constant there. A client handed back the value it just sent reads the response as a replay of
+      # the previous one, so the guarantee above has to survive a timeout an operator can set without
+      # touching code.
+      for long_poll_timeout_ms <- [0, 1, 999] do
+        assert Utils.get_next_interval_timestamp(long_poll_timeout_ms, "500") > 500
+        assert Utils.get_next_interval_timestamp(long_poll_timeout_ms, nil) > 0
+      end
+    end
+  end
+
+  defp vary_fields(conn) do
+    conn
+    |> Plug.Conn.get_resp_header("vary")
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> Enum.map(&(&1 |> String.trim() |> String.downcase()))
+    |> MapSet.new()
   end
 end

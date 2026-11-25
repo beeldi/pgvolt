@@ -1,5 +1,8 @@
 [global PS1=SH-PROMPT:]
 [global fail_pattern=(?i)error|fatal|no such]
+# A client that is already retrying, like a running Electric, can reach Postgres while it is
+# still starting up, and Postgres logs that refusal as FATAL. That is not a setup failure.
+[global pg_setup_fail_pattern=(?i)error|fatal(?!: +the database system is starting up)|no such]
 
 [global pg_docker_network=electric_integration_pg_net]
 [global shape_url_port=3000]
@@ -13,7 +16,7 @@
 
 [macro setup_pg_with_shell_name shell_name container_env_vars config_opts extra_volumes]
   [shell $shell_name]
-    -$fail_pattern
+    -$pg_setup_fail_pattern
 
     # Create a named network for the PG container to be able to attach pooler
     !docker network ls | grep $pg_docker_network || docker network create $pg_docker_network

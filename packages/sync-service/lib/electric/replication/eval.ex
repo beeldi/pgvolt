@@ -72,11 +72,9 @@ defmodule Electric.Replication.Eval do
   for binary protocol encoding.
 
   Most types (integers, floats, booleans, dates, times, etc.) use native Elixir
-  types that Postgrex handles directly. UUIDs are the notable type here because
-  Postgres exposes them as canonical text in decoded rows/API JSON, but Postgrex
-  expects 16-byte raw binaries when sending UUID query parameters. The eval
-  representation stores UUIDs in that compact Postgrex-ready form and converts
-  back to canonical text at type-aware output boundaries.
+  types that Postgrex handles directly. Postgrex expects UUIDs as 16-byte
+  binaries and intervals as `Postgrex.Interval` structs. Replication sends
+  bytea as hex text and JSONB as serialized JSON.
   """
   def value_to_postgrex(<<_::128>> = value, :uuid), do: value
 
@@ -84,6 +82,18 @@ defmodule Electric.Replication.Eval do
     {:ok, bin} = Ecto.UUID.dump(value)
     bin
   end
+
+  def value_to_postgrex(%PgInterop.Interval{} = interval, :interval) do
+    %Postgrex.Interval{
+      months: interval.months,
+      days: interval.days,
+      secs: div(interval.microseconds, 1_000_000),
+      microsecs: rem(interval.microseconds, 1_000_000)
+    }
+  end
+
+  def value_to_postgrex(<<"\\x", hex::binary>>, :bytea), do: Base.decode16!(hex, case: :mixed)
+  def value_to_postgrex(value, :jsonb) when is_binary(value), do: Jason.Fragment.new(value)
 
   def value_to_postgrex(value, _type), do: value
 end

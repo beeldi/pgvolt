@@ -207,6 +207,11 @@ defimpl Electric.Walkable, for: PgQuery.TypeCast do
     do: [arg: arg, type_name: type_name]
 end
 
+defimpl Electric.Walkable, for: PgQuery.CollateClause do
+  def children(%PgQuery.CollateClause{arg: arg, collname: collname}),
+    do: [arg: arg, collname: collname]
+end
+
 defimpl Electric.Walkable, for: PgQuery.FuncCall do
   def children(%PgQuery.FuncCall{args: args}), do: [args: args]
 end

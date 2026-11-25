@@ -111,6 +111,7 @@ defmodule Electric.Replication.Changes do
 
     @type t() :: %__MODULE__{
             xid: Changes.xid() | nil,
+            full_xid: pos_integer() | nil,
             lsn: Electric.Postgres.Lsn.t() | nil,
             last_log_offset: LogOffset.t() | nil,
             has_begin?: boolean(),
@@ -121,6 +122,7 @@ defmodule Electric.Replication.Changes do
           }
 
     defstruct xid: nil,
+              full_xid: nil,
               lsn: nil,
               # The last_log_offset must be the last offset seen in the
               # the range covered by this fragment. It may be not be
@@ -138,12 +140,90 @@ defmodule Electric.Replication.Changes do
                     is_struct(txn_fragment.commit, Changes.Commit)
   end
 
+  defmodule PreparedChange do
+    @moduledoc """
+    A change the router has already converted and encoded on behalf of a whole fan-out class.
+
+    Every shape in the class would have produced byte-identical output from the same change, so
+    the work is done once and the result routed to each of them rather than repeated per shape.
+    Consumers that receive one skip their own conversion and encoding; anything that cannot use it
+    reads `change` and proceeds normally, so this is always a shortcut and never a requirement.
+    """
+
+    alias Electric.Replication.Changes
+    alias Electric.Replication.LogOffset
+
+    @type log_item() :: {LogOffset.t(), String.t(), atom(), binary()}
+
+    @type t() :: %__MODULE__{
+            change: Changes.data_change(),
+            log_items: [log_item()],
+            total_size: non_neg_integer()
+          }
+
+    @enforce_keys [:change, :log_items, :total_size]
+    defstruct [:change, :log_items, :total_size]
+  end
+
+  defmodule FramedBlock do
+    @moduledoc """
+    A run of prepared fan-out-class changes framed once for the whole class.
+
+    `frame` is the exact on-disk byte block every member shape appends to its log, built a
+    single time by the routing side. The remaining fields carry what each member needs to keep
+    its own bookkeeping without iterating entries: `ets_lines` mirrors the live tail,
+    `entries_meta` locates every entry inside the frame (for chunk boundaries and replay
+    slicing), and the totals advance offset/size accounting in one step.
+
+    A block never carries the final change of a fragment for its members — the txn-end
+    `last?` marking rewrites that change per shape, so it always rides individually.
+    """
+
+    alias Electric.Replication.LogOffset
+
+    @type entry_meta() ::
+            {LogOffset.t(), frame_end :: non_neg_integer(), payload_cumsum :: non_neg_integer()}
+
+    @type t() :: %__MODULE__{
+            frame: binary(),
+            frame_size: non_neg_integer(),
+            count: pos_integer(),
+            payload_size: non_neg_integer(),
+            ets_lines: [{tuple(), binary()}],
+            entries_meta: tuple(),
+            first_offset: LogOffset.t(),
+            last_offset: LogOffset.t()
+          }
+
+    @enforce_keys [
+      :frame,
+      :frame_size,
+      :count,
+      :payload_size,
+      :ets_lines,
+      :entries_meta,
+      :first_offset,
+      :last_offset
+    ]
+    defstruct [
+      :frame,
+      :frame_size,
+      :count,
+      :payload_size,
+      :ets_lines,
+      :entries_meta,
+      :first_offset,
+      :last_offset
+    ]
+  end
+
   defmodule Transaction do
     alias Electric.Replication.Changes
     require Electric.Postgres.Xid
 
     @type t() :: %__MODULE__{
             xid: Changes.xid() | nil,
+            full_xid: pos_integer() | nil,
             changes: [Changes.change()],
             num_changes: non_neg_integer(),
             commit_timestamp: DateTime.t() | nil,
@@ -156,6 +236,7 @@ defmodule Electric.Replication.Changes do
 
     defstruct [
       :xid,
+      :full_xid,
       :commit_timestamp,
       :lsn,
       :last_log_offset,
@@ -171,16 +252,20 @@ defmodule Electric.Replication.Changes do
             %{xmin: Xid.anyxid(), xmax: Xid.anyxid(), xip_list: [Xid.anyxid()]}
             | {Xid.anyxid(), Xid.anyxid(), [Xid.anyxid()]}
           ) :: boolean()
-    def visible_in_snapshot?(%__MODULE__{xid: xid}, %{xmin: xmin, xmax: xmax, xip_list: xip_list}),
-        do: visible_in_snapshot?(xid, {xmin, xmax, xip_list})
+    def visible_in_snapshot?(transaction, %{xmin: xmin, xmax: xmax, xip_list: xip_list}),
+      do: visible_in_snapshot?(transaction, {xmin, xmax, xip_list})
 
-    def visible_in_snapshot?(%__MODULE__{xid: xid}, snapshot) when is_tuple(snapshot),
+    def visible_in_snapshot?(%{full_xid: xid}, {_, xmax, xip_list}) when is_integer(xid),
+      do: xid < xmax and xid not in xip_list
+
+    def visible_in_snapshot?(%{xid: xid}, snapshot) when is_tuple(snapshot),
       do: visible_in_snapshot?(xid, snapshot)
 
     def visible_in_snapshot?(xid, {xmin, _, _}) when Xid.is_lt(xid, xmin), do: true
     def visible_in_snapshot?(xid, {_, xmax, _}) when not Xid.is_lt(xid, xmax), do: false
-    def visible_in_snapshot?(_, {_, _, []}), do: true
-    def visible_in_snapshot?(xid, {_, _, xip_list}), do: xid not in xip_list
+
+    def visible_in_snapshot?(xid, {_, _, xip_list}),
+      do: not Enum.any?(xip_list, &Xid.is_eq(xid, &1))
   end
 
   defmodule NewRecord do
@@ -451,6 +536,54 @@ defmodule Electric.Replication.Changes do
   end
 
   def convert_update(%UpdatedRecord{} = change, to: :updated_record), do: change
+
+  @doc """
+  Reduce the locale-keyed columns of a record to the one language its reader asked for.
+
+  The snapshot does this in SQL; the replication stream carries the stored text, so the same reduction
+  happens here. A value that is not a JSON object is the plain string the column held before the
+  migration and is left as it is.
+  """
+  @spec project_locale(change(), String.t() | nil, [String.t()], [String.t()]) :: change()
+  def project_locale(change, nil, _localized_columns, _backing_columns), do: change
+  def project_locale(change, _locale, [], _backing_columns), do: change
+
+  def project_locale(%NewRecord{} = change, locale, localized_columns, backing_columns) do
+    %{change | record: take_locale(change.record, locale, localized_columns, backing_columns)}
+  end
+
+  def project_locale(%UpdatedRecord{} = change, locale, localized_columns, backing_columns) do
+    %{
+      change
+      | old_record: take_locale(change.old_record, locale, localized_columns, backing_columns),
+        record: take_locale(change.record, locale, localized_columns, backing_columns)
+    }
+  end
+
+  def project_locale(%DeletedRecord{} = change, locale, localized_columns, backing_columns) do
+    %{
+      change
+      | old_record: take_locale(change.old_record, locale, localized_columns, backing_columns)
+    }
+  end
+
+  def project_locale(change, _locale, _localized_columns, _backing_columns), do: change
+
+  defp take_locale(nil, _locale, _localized_columns, _backing_columns), do: nil
+
+  # Postgres fills one generated column per language, so the projection is a rename. One traversal for the
+  # whole record, not one per localized column: this runs on every replicated change.
+  defp take_locale(record, locale, localized_columns, backing_columns) do
+    translations =
+      Enum.reduce(localized_columns, %{}, fn column, acc ->
+        case Map.fetch(record, "#{column}_#{locale}") do
+          {:ok, value} -> Map.put(acc, column, value)
+          :error -> acc
+        end
+      end)
+
+    record |> Map.drop(backing_columns) |> Map.merge(translations)
+  end
 
   @doc """
   Filter the columns of a change to include only those provided in `columns_to_keep`.

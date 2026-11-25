@@ -6,12 +6,12 @@ defmodule Electric do
     username: [type: :string, required: true, doc: "Username"],
     password: [type: {:or, [:string, {:fun, 0}]}, required: true, doc: "User password"],
     sslmode: [
-      type: {:in, [:disable, :allow, :prefer, :require]},
+      type: {:in, [:disable, :allow, :prefer, :require, :"verify-ca", :"verify-full"]},
       required: false,
       default: :prefer,
       doc:
         "Connection SSL configuration. See https://www.postgresql.org/docs/current/libpq-ssl.html#LIBPQ-SSL-SSLMODE-STATEMENTS",
-      type_spec: quote(do: :disable | :allow | :prefer | :require)
+      type_spec: quote(do: :disable | :allow | :prefer | :require | :"verify-ca" | :"verify-full")
     ],
     ipv6: [
       type: :boolean,

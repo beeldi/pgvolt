@@ -7,6 +7,15 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
 
   @stack_id "the_stack_id"
 
+  defp report_span_creation do
+    test_pid = self()
+
+    Repatch.patch(:otel_tracer, :with_span, fn tracer, name, opts, fun ->
+      send(test_pid, :span_created)
+      Repatch.real(:otel_tracer, :with_span, [tracer, name, opts, fun])
+    end)
+  end
+
   test "baggage is propagated to new processes when the context is carried over" do
     OpenTelemetry.with_span("test", %{}, @stack_id, fn ->
       OpenTelemetry.set_in_baggage("some_key", "some_value")
@@ -24,24 +33,24 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
 
   describe "with_span/4" do
     test "creates a OTEL span" do
-      Repatch.spy(:otel_tracer)
+      report_span_creation()
 
       OpenTelemetry.with_span("test_span", %{}, @stack_id, fn ->
         :some_code
       end)
 
-      assert Repatch.called?(:otel_tracer, :with_span, 4)
+      assert_received :span_created
     end
 
     test "does not create an OTEL span if the samler does not include it" do
-      Repatch.spy(:otel_tracer)
+      report_span_creation()
       Repatch.patch(Sampler, :include_span?, fn _ -> false end)
 
       OpenTelemetry.with_span("test_span", %{}, @stack_id, fn ->
         :some_code
       end)
 
-      refute Repatch.called?(:otel_tracer, :with_span, 4)
+      refute_received :span_created
     end
 
     test "calls :telemetry.span/3 even if the samler does not include it" do
@@ -67,24 +76,24 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
   describe "with_child_span/4" do
     test "creates a span if there is a parent span" do
       OpenTelemetry.with_span("parent_span", %{}, @stack_id, fn ->
-        Repatch.spy(:otel_tracer)
+        report_span_creation()
 
         OpenTelemetry.with_child_span("child_span", %{}, @stack_id, fn ->
           :some_code
         end)
 
-        assert Repatch.called?(:otel_tracer, :with_span, 4)
+        assert_received :span_created
       end)
     end
 
     test "does not create a span if there is not a parent span" do
-      Repatch.spy(:otel_tracer)
+      report_span_creation()
 
       OpenTelemetry.with_child_span("child_span", %{}, @stack_id, fn ->
         :some_code
       end)
 
-      refute Repatch.called?(:otel_tracer, :with_span, 4)
+      refute_received :span_created
     end
 
     test "calls :telemetry.span/3 even if there is not a parent span" do
@@ -106,7 +115,7 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
 
     test "does not create a span if the sampler does not include the child span" do
       OpenTelemetry.with_span("parent_span", %{}, @stack_id, fn ->
-        Repatch.spy(:otel_tracer)
+        report_span_creation()
 
         Repatch.patch(Sampler, :include_span?, fn _ -> false end)
 
@@ -114,7 +123,7 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
           :some_code
         end)
 
-        refute Repatch.called?(:otel_tracer, :with_span, 4)
+        refute_received :span_created
       end)
     end
   end
@@ -166,12 +175,34 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
     end
 
     test "only calls the function when outside any span context" do
-      Repatch.spy(:otel_span)
+      test_pid = self()
+
+      Repatch.patch(:otel_span, :set_attributes, fn ctx, attrs ->
+        send(test_pid, {:set_attributes, attrs})
+        Repatch.real(:otel_span, :set_attributes, [ctx, attrs])
+      end)
 
       assert OpenTelemetry.with_flattened_span("inner_op", fn -> :some_result end) ==
                :some_result
 
-      refute Repatch.called?(:otel_span, :set_attributes, 2)
+      refute_received {:set_attributes, _}
+    end
+
+    test "only calls the function under a span that is not recording" do
+      test_pid = self()
+
+      Repatch.patch(:otel_span, :set_attributes, fn ctx, attrs ->
+        send(test_pid, {:set_attributes, attrs})
+        Repatch.real(:otel_span, :set_attributes, [ctx, attrs])
+      end)
+
+      # What a sampler that drops the trace leaves current: a span context that records nothing.
+      :otel_tracer.set_current_span(:otel_tracer.from_remote_span(1, 1, 0))
+
+      assert OpenTelemetry.with_flattened_span("inner_op", fn -> :some_result end) ==
+               :some_result
+
+      refute_received {:set_attributes, _}
     end
   end
 
@@ -238,6 +269,21 @@ defmodule Electric.Telemetry.OpenTelemetryTest do
     test "is a no-op outside any span context" do
       # No surrounding with_span — should short-circuit and skip Process.info
       assert OpenTelemetry.add_process_memory_attributes(:start) == false
+    end
+
+    test "is a no-op under a span that is not recording" do
+      test_pid = self()
+
+      Repatch.patch(:otel_span, :set_attributes, fn ctx, attrs ->
+        send(test_pid, {:set_attributes, attrs})
+        Repatch.real(:otel_span, :set_attributes, [ctx, attrs])
+      end)
+
+      # What a sampler that drops the trace leaves current: a span context that records nothing.
+      :otel_tracer.set_current_span(:otel_tracer.from_remote_span(1, 1, 0))
+
+      assert OpenTelemetry.add_process_memory_attributes(:start) == false
+      refute_received {:set_attributes, _}
     end
   end
 end

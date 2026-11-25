@@ -266,11 +266,33 @@ responses cannot overwrite it.
 
 ### C6: SSE offset update rules
 
-- SSE up-to-date messages update offset via `upToDateOffset`
+- SSE up-to-date messages update offset via `upToDateOffset`, but only when it
+  is strictly ahead of the current offset (LSN first, then op position). It is
+  derived from the LSN alone (`${lsn}_0`), so it falls behind the response's
+  offset when one LSN carries several operations, and taking it would replay
+  them.
 - Non-SSE up-to-date messages preserve existing offset
+- SSE responses do not take the `electric-offset` header when they open.
+  LiveState holds it and applies it at the body's next up-to-date, where the
+  up-to-date's own offset replaces it only if it is ahead. An SSE body's
+  messages are applied only at an up-to-date, and the header is the end of the
+  chunk the body is about to send, so taking it at open would skip that chunk
+  whenever the body ends first.
+- An SSE body that ends (cleanly, with an error, or aborted) with messages no
+  up-to-date has flushed drops them, and LiveState then long polls from the
+  same offset until the next up-to-date. A body that ends cleanly before its
+  up-to-date may be a complete catch-up chunk, so asking again over SSE could
+  return the same chunk forever; a long poll reads the whole body before taking
+  the header, so it moves past each chunk.
 
-**Enforcement**: Dedicated tests (`SSE up-to-date message updates offset`,
-`non-SSE up-to-date message preserves existing offset`).
+**Enforcement**: Dedicated tests in `shape-stream-state.test.ts`
+(`SSE up-to-date message updates offset`,
+`non-SSE up-to-date message preserves existing offset`, the
+`SSE up-to-date offset ...` cases for behind, ahead, same LSN with a higher op
+and the `0_inf` boundary, `SSE response keeps the offset until an up-to-date`,
+`long polls after an SSE body ends with unflushed messages, until an up-to-date`)
+and `SSE body that ends cleanly / breaks before its up-to-date` in
+`stream.test.ts`.
 
 ### C7: Stale response always enters stale-retry
 
@@ -283,10 +305,13 @@ The `currentFields` (including any valid local handle) are preserved in the new
 
 ### C8: SSE state is private to LiveState
 
-`sseFallbackToLongPolling` and `consecutiveShortSseConnections` are private fields
-on `LiveState`, not carried in `SharedStateFields`. LiveState preserves SSE state
-through its own self-transitions (`handleResponseMetadata`, `onUpToDate`,
-`handleSseConnectionClosed`, `withHandle`) via a private `sseState` accessor.
+`sseFallbackToLongPolling`, `consecutiveShortSseConnections`, and C6's pending
+SSE header and long-poll flag are private fields on `LiveState`, not carried in
+`SharedStateFields`. LiveState preserves SSE state through its own
+self-transitions (`handleResponseMetadata`, `onUpToDate`,
+`handleSseConnectionClosed`, `withHandle`) via a private `sseState` accessor,
+except that `onUpToDate` clears the pending header and the long-poll flag, and
+`handleResponseMetadata` replaces the pending header with the new response's.
 Other states don't carry SSE state — when transitioning from a non-Live state
 back to Live, SSE state resets to defaults.
 
@@ -311,6 +336,64 @@ sends `live=true` from LiveState, and ReplayingState is only entered from a
 fetching state — so against a conforming server the first up-to-date a replaying
 stream sees never carries a cursor and suppression does not fire. The dedicated
 test drives the branch with a synthetic cursor header on a non-live response.
+
+### C10: An SSE response that moved the offset is not a short connection
+
+`LiveState.handleSseConnectionClosed` counts a non-aborted SSE response that
+ended within `minConnectionDuration` as a short connection, unless it delivered
+messages and the stream's offset now differs from the offset the request was
+made at. The offset header alone does not exempt a response. Three short
+connections in a row fall back to long polling.
+
+The server answers a live SSE request that is behind the log end with the
+catch-up and then closes it, so a burst of writes ends several SSE responses
+within milliseconds. Each delivered messages and moved the offset, so no proxy
+buffered it: such a response neither increments nor resets the counter, and no
+short-connection backoff follows. A response that carried messages but left the
+offset where it was (a replay of the same operations) still counts, so a loop
+at one offset still backs off and falls back.
+
+A response that ended with messages no up-to-date had flushed (C6) is exempt in
+the same way: it is a catch-up chunk the server closed at a chunk boundary, it
+leaves the offset where it was by design, and the next request is a long poll.
+
+**Enforcement**: Dedicated tests in `shape-stream-state.test.ts`
+(`short connection that advanced the offset leaves the counter unchanged`,
+`short connection that ended with unflushed messages leaves the counter unchanged`)
+and `SSE short-connection fallback` in `stream.test.ts`, which covers both the
+exempt and the still-counted responses.
+
+## Subset snapshot stream-position semantics
+
+`ShapeStream.requestSnapshot()` pauses the main request loop while it injects a
+subset snapshot. A snapshot holds only its own subset, so it cannot stand in for
+the changes to other rows that the log holds between the stream's offset and the
+snapshot's.
+
+### SS1: A snapshot only moves the stream to an earlier offset
+
+When a snapshot is injected, its response offset replaces the stream's offset
+only if the stream has no position yet (`"-1"` or `"now"`) or the snapshot's
+offset is strictly before the stream's. An established stream keeps its offset,
+resumes from there and replays every intervening change; `SnapshotTracker`
+filters the changes already represented in the subset, and changes to keys
+outside it remain visible.
+
+Concurrent snapshots on a cold stream therefore end at the earliest of their
+offsets, whatever order they return in, because each snapshot covers only its
+own subset. A 409 during a snapshot moves the stream to the new handle, and the
+snapshot's offset on that handle replaces the offset from the old handle when it
+is earlier. The response handle is adopted in every case.
+
+Offsets are ordered numerically by transaction, then operation, without losing
+integer precision (`compareLogOffsets`). The `inf` operation sorts after all
+finite operations at the same transaction offset; `0_inf` is a valid initial
+snapshot boundary.
+
+**Enforcement**: `requestSnapshot offset coordination` in `test/stream.test.ts`
+covers an established stream, cold start at `now` and `-1`, both completion
+orders of concurrent cold snapshots, the 409 case, and numeric and `inf`
+boundaries.
 
 ## Shape notification semantics
 
@@ -389,6 +472,7 @@ observing an intermediate empty-rows notification. The
 | C7         | -     | yes         | yes            |
 | C8         | -     | -           | yes            |
 | C9         | -     | -           | yes            |
+| C10        | -     | -           | yes            |
 
 ### Code -> Doc: Is each test derived from the spec?
 
@@ -400,7 +484,7 @@ observing an intermediate empty-rows notification. The
 | Fuzz testing                   | I0-I12 (all invariants)     |
 | Mutation testing               | I0-I12 (robustness)         |
 | shouldUseSse guard tests       | LiveState SSE behavior      |
-| SSE connection closed tests    | LiveState SSE fallback      |
+| SSE connection closed tests    | LiveState SSE fallback, C10 |
 | applyUrlParams tests           | URL construction            |
 | Schema adoption tests          | C4                          |
 | 204/200 lastSyncedAt tests     | C5                          |
@@ -443,6 +527,18 @@ identity or caching logic — it only affects the raw URL sent to the server/CDN
 - L4 (main stream `#requestShape` 409 path): model-based property test commands `Respond409SameHandleCmd` and `Respond409NoHandleCmd` in `test/model-based.test.ts`.
 - L6 (`fetchSnapshotWithRetry` 409 path): property tests in `test/pbt-micro.test.ts > Shape #fetchSnapshotWithRetry 409 loop PBT` — asserts every retry URL carries a unique `cache-buster` param across 409-new, 409-same, and 409-no-handle sequences, and that `#maxSnapshotRetries = 5` is strictly upheld.
 
+### Snapshot cancellation
+
+Snapshot GET and POST requests use the external `ShapeStreamOptions.signal`, so
+aborting the stream also cancels in-flight `fetchSnapshot` and `requestSnapshot`
+requests through the existing abort-aware fetch wrapper. They must not use the
+internal live-request controller: acquiring the snapshot pause lock intentionally
+aborts that controller while the snapshot must remain able to complete.
+
+**Enforcement**: `stream.test.ts` covers both snapshot methods and HTTP methods,
+asserting that the snapshot remains active until the external signal is aborted
+and then rejects without another fetch attempt.
+
 ### Loop-back sites
 
 Six sites in `client.ts` recurse or loop to issue a new fetch:
@@ -460,14 +556,16 @@ Six sites in `client.ts` recurse or loop to issue a new fetch:
 
 | Guard                         | Scope                                        | How it works                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ----------------------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `#checkFastLoop`              | Non-live `#requestShape` only                | Detects N requests at same offset within a time window. First: clears caches + resets. Persistent: exponential backoff → throws FetchError(502).                                                                                                                                                                                                                                                                                                      |
+| `#checkFastLoop`              | Non-live `#requestShape` only                | Detects N responses to requests at the same offset within a time window; a request aborted before its response (a snapshot pause, a restart) is not counted. First: clears caches + resets. Persistent: exponential backoff → throws FetchError(502).                                                                                                                                                                                                 |
 | `maxStaleCacheRetries`        | Stale response path (L3)                     | State machine counts stale retries. After 3 consecutive stale responses, clears expired entry and attempts one self-healing retry. Throws FetchError(502) if self-healing also fails.                                                                                                                                                                                                                                                                 |
 | `#expiredShapeRecoveryKey`    | Self-healing (L3 extension)                  | Records shape key after first self-healing attempt. Second exhaustion on same key skips self-healing → FetchError(502). Cleared on up-to-date.                                                                                                                                                                                                                                                                                                        |
 | `#maxSnapshotRetries`         | Snapshot 409 path (L6)                       | Counts consecutive snapshot 409s. Unconditional cache buster on every retry. Throws FetchError(502) after 5. Runtime-enforced by `Shape #fetchSnapshotWithRetry 409 loop PBT` in `test/pbt-micro.test.ts`.                                                                                                                                                                                                                                            |
 | `#maxConsecutiveErrorRetries` | `#start` onError retry (L5)                  | Counts consecutive error retries. Before each retry, waits with abort-aware full-jitter exponential backoff using `backoffOptions` (`initialDelay`, `multiplier`, `maxDelay`). Sends error to subscribers and tears down after 50. Reset on successful message batch or accepted 204.                                                                                                                                                                 |
-| Request watchdog              | Live long-poll and refresh catch-up requests | Aborts with `live-request-timeout` and marks the request for restart after `liveRequestTimeoutMs` (default 45s; positive finite number or `false` to disable), then rejects independently of platform fetch abort behavior so runtimes with stuck fetch promises cannot block the request loop forever. Applies to non-live refresh catch-up requests because mobile runtimes can also wedge after the wake abort has already sent catch-up requests. |
+| Request watchdog              | Long-poll, SSE and refresh catch-up requests | Aborts with `live-request-timeout` and marks the request for restart after `liveRequestTimeoutMs` (default 45s; positive finite number or `false` to disable), then rejects independently of platform fetch abort behavior so runtimes with stuck fetch promises cannot block the request loop forever. Applies to non-live refresh catch-up requests because mobile runtimes can also wedge after the wake abort has already sent catch-up requests. |
 | Pause lock                    | `#requestShape` entry                        | Returns immediately if paused. Prevents fetches during snapshots and hidden/background runtime states. Browser `document.visibilitychange` is used when available; React Native AppState is wired through the React Native package export when Metro/Expo resolves the `react-native` condition; other runtimes can pass `runtimeVisibility` to pause while hidden/backgrounded and resume with a non-live catch-up request after foregrounding.      |
 | Up-to-date exit               | `#requestShape` entry                        | Returns if `!subscribe` and `isUpToDate`. Breaks loop for one-shot syncs.                                                                                                                                                                                                                                                                                                                                                                             |
+
+The request watchdog times an SSE request from its start and re-arms when the headers arrive and on every body chunk, including the server's keep-alive comments, so only a request that receives nothing for the whole timeout (a half-open connection) restarts. The watchdog of any request stands still while that request waits to retry (a fetch backoff, or a retried body read), and starts a whole window again after the wait, so a `Retry-After` longer than `liveRequestTimeoutMs` is honoured rather than aborted by the watchdog. When an SSE request is aborted, by the watchdog or otherwise, the body it was reading is cancelled too and fails with the reason of the abort, so a runtime whose fetch ignores the abort does not leave bodies open with a read pending.
 
 ### Coverage gaps
 

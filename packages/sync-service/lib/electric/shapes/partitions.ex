@@ -38,7 +38,28 @@ defmodule Electric.Shapes.Partitions do
   @spec add_shape(t(), shape_id(), Electric.Shapes.Shape.t()) ::
           {:ok, t()} | {:error, term()}
   def add_shape(%__MODULE__{} = state, shape_id, shape) do
-    case Inspector.load_relation_info(shape.root_table_id, state.inspector) do
+    add_shapes(state, {shape.root_table_id, shape.root_table}, MapSet.new([shape_id]))
+  end
+
+  @doc """
+  Introspects a root table ahead of `add_shape/3` or `add_shapes/3`, from any process, for the
+  inspector to have it cached by then. Whatever the introspection finds, or fails to, is left to
+  them.
+  """
+  @spec preload_root_table(t(), Electric.relation_id()) :: :ok
+  def preload_root_table(%__MODULE__{inspector: inspector}, root_table_id) do
+    _ = Inspector.load_relation_info(root_table_id, inspector)
+    :ok
+  end
+
+  @doc """
+  `add_shape/3` for every shape in `shape_ids`, all of them on the same root table, with one
+  introspection of that table.
+  """
+  @spec add_shapes(t(), Electric.oid_relation(), MapSet.t(shape_id())) ::
+          {:ok, t()} | {:error, term()}
+  def add_shapes(%__MODULE__{} = state, {root_table_id, root_table}, shape_ids) do
+    case Inspector.load_relation_info(root_table_id, state.inspector) do
       {:ok, relation} ->
         children = List.wrap(Map.get(relation, :children, []))
 
@@ -46,17 +67,17 @@ defmodule Electric.Shapes.Partitions do
           state
           |> Map.update!(:partitions, fn partitions ->
             Enum.reduce(children, partitions, fn child, partitions ->
-              Map.put(partitions, child, [shape.root_table])
+              Map.put(partitions, child, [root_table])
             end)
           end)
           |> Map.update!(:partition_ownership, fn ownership ->
-            [shape.root_table | children]
+            [root_table | children]
             |> Enum.reduce(ownership, fn relation, relation_ownership ->
               Map.update(
                 relation_ownership,
                 relation,
-                MapSet.new([shape_id]),
-                &MapSet.put(&1, shape_id)
+                shape_ids,
+                &MapSet.union(&1, shape_ids)
               )
             end)
           end)
@@ -131,17 +152,26 @@ defmodule Electric.Shapes.Partitions do
         {:ok, state |> Map.update!(:partitions, &Map.put(&1, table, [parent])) |> update_active()}
 
       {:ok, _} ->
-        {:ok, state}
+        # not a partition (any more): a detached partition, or a plain table recreated under a
+        # dropped partition's name, must stop sending its changes to the old root
+        {:ok, forget_partition(state, table)}
 
       :table_not_found ->
         # the table was dropped (or dropped and recreated under a new oid)
         # between the relation message being written to the WAL and us
         # introspecting it, so there are no partitions left to track
-        {:ok, state}
+        {:ok, forget_partition(state, table)}
 
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  # Changes are mapped to their root by table name, so a stale entry would send the changes of the
+  # next table with that name to the old root. Only the mapping goes: `partition_ownership` keeps
+  # the old root's claim, so re-attaching the table maps it back.
+  defp forget_partition(state, table) do
+    state |> Map.update!(:partitions, &Map.delete(&1, table)) |> update_active()
   end
 
   @doc """

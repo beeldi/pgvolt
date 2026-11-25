@@ -599,4 +599,69 @@ defmodule Electric.Utils do
       Map.new([{prefix, nested} | rest])
     end
   end
+
+  @doc """
+  Make a directory's own contents durable, so entries created or renamed inside it survive a
+  machine crash.
+
+  Syncing a file covers its bytes and never the directory entry naming it, so a file can be fully
+  datasynced and still be unreachable by name after a crash. Callers that treat a file's presence
+  as a durable fact need this after creating or renaming it.
+
+  Raises on failure: a filesystem that cannot sync a directory cannot give callers the durability
+  they are relying on, and degrading quietly would leave them believing it did.
+  """
+  @spec sync_dir!(String.t()) :: :ok
+  def sync_dir!(dir) do
+    case :prim_file.open(dir, [:read, :directory]) do
+      {:ok, fd} ->
+        try do
+          case :prim_file.sync(fd) do
+            :ok ->
+              :ok
+
+            {:error, reason} ->
+              raise File.Error, reason: reason, action: "sync directory", path: dir
+          end
+        after
+          :prim_file.close(fd)
+        end
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "open directory to sync", path: dir
+    end
+  end
+
+  @doc """
+  Make the bytes written through `file` durable, then close it.
+
+  A write the device fails after the call that wrote it returned is reported to the descriptor
+  that wrote it, at its sync or at its close, and a descriptor opened later to sync may not hear
+  of it. Raises when either fails, for the reason `sync_dir!/1` does.
+  """
+  @spec datasync_and_close!(File.io_device(), String.t()) :: :ok
+  def datasync_and_close!(file, path) do
+    synced = :file.datasync(file)
+    closed = File.close(file)
+
+    case {synced, closed} do
+      {{:error, reason}, _} -> raise File.Error, reason: reason, action: "datasync", path: path
+      {:ok, {:error, reason}} -> raise File.Error, reason: reason, action: "close", path: path
+      {:ok, :ok} -> :ok
+    end
+  end
+
+  @doc """
+  Make a file's bytes durable when the writer that wrote them is gone and left no handle to sync.
+
+  Raises on failure, for the reason `sync_dir!/1` does.
+  """
+  @spec datasync_file!(String.t()) :: :ok
+  def datasync_file!(path) do
+    case File.open(path, [:read, :raw], &:file.datasync/1) do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, reason}} -> raise File.Error, reason: reason, action: "datasync", path: path
+      {:error, reason} -> raise File.Error, reason: reason, action: "open to datasync", path: path
+    end
+  end
 end

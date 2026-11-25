@@ -35,14 +35,22 @@ defmodule Electric.Replication.TransactionBuilder do
     |> maybe_complete_transaction(fragment)
   end
 
+  @doc """
+  Number of changes held for the transaction being built, 0 when none is in progress.
+  """
+  @spec num_changes(t()) :: non_neg_integer()
+  def num_changes(%__MODULE__{transaction: nil}), do: 0
+  def num_changes(%__MODULE__{transaction: txn}), do: txn.num_changes
+
   defp maybe_start_transaction(state, %TransactionFragment{has_begin?: false}), do: state
 
   defp maybe_start_transaction(
          %__MODULE__{} = state,
-         %TransactionFragment{xid: xid, has_begin?: true}
+         %TransactionFragment{xid: xid, full_xid: full_xid, has_begin?: true}
        ) do
     txn = %Transaction{
       xid: xid,
+      full_xid: full_xid,
       changes: [],
       commit_timestamp: nil,
       lsn: nil,

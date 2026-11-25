@@ -20,6 +20,8 @@ import {
   isUpToDateMessage,
   isChangeMessage,
   bigintSafeStringify,
+  compareLogOffsets,
+  toError,
 } from './helpers'
 import {
   FetchError,
@@ -35,11 +37,15 @@ import {
 import {
   BackoffDefaults,
   BackoffOptions,
+  InternalBackoffOptions,
   consumeResponseBody,
   createFetchWithBackoff,
   createFetchWithChunkBuffer,
   createFetchWithConsumedMessages,
   createFetchWithResponseHeadersCheck,
+  observeResponseBodyChunks,
+  retryOnBodyReadFailure,
+  watchRetryWaits,
 } from './fetch'
 import {
   CHUNK_LAST_OFFSET_HEADER,
@@ -60,6 +66,7 @@ import {
   PAUSE_STREAM,
   SYSTEM_WAKE,
   LIVE_REQUEST_TIMEOUT,
+  STREAM_STOPPED,
   EXPERIMENTAL_LIVE_SSE_QUERY_PARAM,
   LIVE_SSE_QUERY_PARAM,
   ELECTRIC_PROTOCOL_QUERY_PARAMS,
@@ -80,6 +87,7 @@ import {
 } from '@microsoft/fetch-event-source'
 import { expiredShapesCache } from './expired-shapes-cache'
 import { upToDateTracker } from './up-to-date-tracker'
+import { DEFAULT_MAX_RESPONSE_BYTES } from './response-body'
 import { SnapshotTracker } from './snapshot-tracker'
 import {
   createInitialState,
@@ -376,15 +384,40 @@ export interface ShapeStreamOptions<T = never> {
   backoffOptions?: BackoffOptions
 
   /**
+   * Largest response body the client holds in memory, in bytes. A longer
+   * response ends the stream with `ResponseTooLargeError`, which reaches
+   * `onError` and is not retried on its own.
+   *
+   * On a live SSE request it limits what is held back for the next up-to-date
+   * or for slow subscribers: past it the connection closes, and the stream
+   * catches up with a long poll or reconnects once subscribers have caught up.
+   * Bytes are counted per network read, so what is held can pass the limit by
+   * at most one read.
+   *
+   * Defaults to 256 MiB, well above the 10 MB chunks Electric sends by default.
+   */
+  maxResponseBytes?: number
+
+  /**
    * Maximum time in milliseconds to wait for a live long-poll request or
    * refresh catch-up request before aborting it and reconnecting. This guards
    * against runtimes (notably some React Native fetch implementations) where an
    * in-flight fetch can hang indefinitely across app lifecycle or network
    * transitions.
    *
+   * Live SSE requests are watched too, but the timer re-arms whenever the
+   * response's headers or any body bytes arrive, so it only fires on an SSE
+   * connection that has gone silent (for example, half-open after a network
+   * change).
+   *
+   * The timer stands still while a request waits to retry a failed attempt, so
+   * a long `Retry-After` is honoured, and the next attempt gets a full window.
+   *
    * The default (45s) is intentionally longer than Electric's server-side
-   * long-poll timeout (20s), so firing the watchdog indicates a request that
-   * failed to settle rather than a normal long-poll waiting for data.
+   * long-poll timeout (20s) and SSE keep-alive interval (21s), so firing the
+   * watchdog indicates a request that failed to settle rather than a normal
+   * long-poll waiting for data or an idle SSE stream. Keep any custom value
+   * above both.
    *
    * Must be a positive finite number. Set to `false` to disable the watchdog.
    */
@@ -659,6 +692,17 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
   readonly #fetchClient: typeof fetch
   readonly #sseFetchClient: typeof fetch
+  readonly #backoffOptions: InternalBackoffOptions
+  // The latest time (ms since the epoch) the server has asked a request to wait
+  // until with Retry-After, plus the spread that request drew on top of it, so
+  // an early restart at this time lands where this stream's own retry would
+  // rather than where every stream with the same Retry-After would. A deadline
+  // in the past does nothing, so it is never cleared. It only grows, and any
+  // request of this stream may raise it, so a failing snapshot request cannot
+  // shorten the wait of the stream's own.
+  #retryNotBefore = 0
+  // Counts the requests the stream has sent to the server, retries included.
+  #fetchAttempts = 0
   readonly #messageParser: MessageParser<T>
 
   readonly #subscribers = new Map<
@@ -670,6 +714,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
   >()
 
   #started = false
+  #stopped = false
   #syncState: ShapeStreamState
   #connected: boolean = false
   #mode: LogMode
@@ -694,6 +739,12 @@ export class ShapeStream<T extends Row<unknown> = Row>
   // queueing it behind the subscriber that is awaiting it.
   #isPublishing = false
   #snapshotTracker = new SnapshotTracker()
+  // Highest snapshot database_lsn applied per row key. Overlapping subset
+  // snapshots complete in an arbitrary order; without this an older snapshot
+  // finishing last would overwrite a newer row, and the newer snapshot's dedup
+  // would suppress the live replay that could repair it. Keyed application by
+  // database_lsn makes the outcome order-independent.
+  #snapshotAppliedLsnByKey = new Map<string, bigint>()
   #pauseLock: PauseLock
   #currentFetchUrl?: URL // Current fetch URL for computing shape key
   #lastSseConnectionStartTime?: number
@@ -704,8 +755,11 @@ export class ShapeStream<T extends Row<unknown> = Row>
   #liveRequestTimeoutMs: number | false
   #unsubscribeFromVisibilityChanges?: () => void
   #unsubscribeFromWakeDetection?: () => void
+  #unsubscribeFromOnlineEvent?: () => void
+  // Counts #start calls so a teardown can tell whether a newer #start has taken over.
+  #startGeneration = 0
   #maxStaleCacheRetries = 3
-  // Fast-loop detection: track recent non-live requests to detect tight retry
+  // Fast-loop detection: track recent non-live responses to detect tight retry
   // loops caused by proxy/CDN misconfiguration or stale client-side caches
   #recentRequestEntries: Array<{ timestamp: number; offset: string }> = []
   #fastLoopWindowMs = 500
@@ -716,6 +770,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
   #fastLoopMaxCount = 5
   #pendingRequestShapeCacheBuster?: string
   #maxSnapshotRetries = 5
+  readonly #maxResponseBytes: number
+  #undeliveredSseBytes = 0
   #expiredShapeRecoveryKey: string | null = null
   #pendingSelfHealCheck: { shapeKey: string; staleHandle: string } | null = null
   #consecutiveErrorRetries = 0
@@ -762,12 +818,14 @@ export class ShapeStream<T extends Row<unknown> = Row>
       const applyColumnMapper = (
         row: Row<GetExtensions<T>>
       ): Row<GetExtensions<T>> => {
-        const result: Record<string, unknown> = {}
-        for (const [dbKey, value] of Object.entries(row)) {
-          const appKey = options.columnMapper!.decode(dbKey)
-          result[appKey] = value
-        }
-        return result as Row<GetExtensions<T>>
+        // `Object.fromEntries` defines data properties, so every column stays
+        // an ordinary field of the row whatever its name.
+        return Object.fromEntries(
+          Object.entries(row).map(([dbKey, value]) => [
+            options.columnMapper!.decode(dbKey),
+            value,
+          ])
+        ) as Row<GetExtensions<T>>
       }
 
       transformer = options.transformer
@@ -785,18 +843,31 @@ export class ShapeStream<T extends Row<unknown> = Row>
     // Default exceeds Electric's 20s server long-poll timeout, so this only
     // fires when the runtime request appears wedged rather than normally held.
     this.#liveRequestTimeoutMs = this.options.liveRequestTimeoutMs ?? 45_000
+    this.#maxResponseBytes =
+      this.options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES
 
-    const baseFetchClient =
+    const runtimeFetchClient =
       options.fetchClient ??
       ((...args: Parameters<typeof fetch>) => fetch(...args))
+    const baseFetchClient: typeof fetch = (...args) => {
+      this.#fetchAttempts++
+      return runtimeFetchClient(...args)
+    }
 
-    const backOffOpts = {
+    const backOffOpts: InternalBackoffOptions = {
       ...(options.backoffOptions ?? BackoffDefaults),
       onFailedAttempt: () => {
         this.#connected = false
         options.backoffOptions?.onFailedAttempt?.()
       },
+      onRetryWait: ({ notBeforeMs }) => {
+        this.#retryNotBefore = Math.max(
+          this.#retryNotBefore,
+          Date.now() + notBeforeMs
+        )
+      },
     }
+    this.#backoffOptions = backOffOpts
     this.#onErrorBackoff = {
       initialDelay: backOffOpts.initialDelay,
       maxDelay: backOffOpts.maxDelay,
@@ -812,7 +883,10 @@ export class ShapeStream<T extends Row<unknown> = Row>
       createFetchWithChunkBuffer(fetchWithBackoffClient)
     )
 
-    this.#fetchClient = createFetchWithConsumedMessages(this.#sseFetchClient)
+    this.#fetchClient = createFetchWithConsumedMessages(
+      this.#sseFetchClient,
+      this.#maxResponseBytes
+    )
 
     this.#subscribeToVisibilityChanges()
   }
@@ -838,8 +912,10 @@ export class ShapeStream<T extends Row<unknown> = Row>
   }
 
   async #start(): Promise<void> {
+    const generation = ++this.#startGeneration
     this.#started = true
     this.#subscribeToWakeDetection()
+    this.#subscribeToOnlineEvent()
 
     try {
       await this.#requestShape()
@@ -848,6 +924,9 @@ export class ShapeStream<T extends Row<unknown> = Row>
       if (err instanceof Error) {
         this.#syncState = this.#syncState.toErrorState(err)
       }
+      // A custom fetchClient can reject with a non-Error; subscribers must
+      // still be told the stream stopped.
+      const error = toError(err)
 
       // Check if onError handler wants to retry
       if (this.#onError) {
@@ -879,15 +958,14 @@ export class ShapeStream<T extends Row<unknown> = Row>
             this.#consecutiveErrorRetries > this.#maxConsecutiveErrorRetries
           ) {
             console.warn(
-              `[Electric] onError retry loop exhausted after ${this.#maxConsecutiveErrorRetries} consecutive retries. ` +
+              `[Electric]`,
+              `onError retry loop exhausted after ${this.#maxConsecutiveErrorRetries} consecutive retries. ` +
                 `The error was never resolved by the onError handler. ` +
                 `Error: ${err instanceof Error ? err.message : String(err)}`,
               new Error(`stack trace`)
             )
-            if (err instanceof Error) {
-              this.#sendErrorToSubscribers(err)
-            }
-            this.#teardown()
+            this.#sendErrorToSubscribers(error)
+            this.#teardownForGood(generation)
             return
           }
 
@@ -901,7 +979,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
           await this.#backoffOnErrorRetry(this.#consecutiveErrorRetries)
           if (this.options.signal?.aborted) {
-            this.#teardown()
+            this.#teardownForGood(generation)
             return
           }
 
@@ -911,29 +989,53 @@ export class ShapeStream<T extends Row<unknown> = Row>
         }
         // onError returned void, meaning it doesn't want to retry
         // This is an unrecoverable error, notify subscribers
-        if (err instanceof Error) {
-          this.#sendErrorToSubscribers(err)
-        }
-        this.#teardown()
+        this.#sendErrorToSubscribers(error)
+        this.#teardownForGood(generation)
         return
       }
 
       // No onError handler provided, this is an unrecoverable error
       // Notify subscribers and throw
-      if (err instanceof Error) {
-        this.#sendErrorToSubscribers(err)
-      }
-      this.#teardown()
+      this.#sendErrorToSubscribers(error)
+      this.#teardownForGood(generation)
       throw err
     }
 
-    this.#teardown()
+    // The loop also ends for a pause, which the visibility listener resumes.
+    if (
+      this.#stopped ||
+      this.options.signal?.aborted ||
+      (!this.options.subscribe && this.#syncState.isUpToDate)
+    ) {
+      this.#teardownForGood(generation)
+    } else {
+      this.#teardown(generation)
+    }
   }
 
-  #teardown() {
+  // `generation` is the #start that is tearing down. A pause aborts that start's request loop, and
+  // the resume can begin a new #start before the aborted loop has settled. The new start finds the
+  // wake and online subscriptions still in place and reuses them, so when the aborted loop then
+  // reaches its teardown it must leave them alone: dropping them would leave the resumed stream
+  // with no wake detection and no online listener. Only the newest #start drops them. Callers on
+  // the terminal paths (#stop and the stop check in #requestShape) pass no generation and always
+  // drop them. The visibility listener is NOT dropped here: #teardown also runs on a temporary
+  // visibility pause, and the listener is registered once in the constructor — not per-start — so
+  // removing it would leave nothing to resume the stream when the tab reappears. It is dropped
+  // only on the terminal paths, through #teardownForGood.
+  #teardown(generation?: number) {
     this.#connected = false
     this.#tickPromiseRejecter?.()
+    if (generation !== undefined && generation !== this.#startGeneration) return
     this.#unsubscribeFromWakeDetection?.()
+    this.#unsubscribeFromOnlineEvent?.()
+  }
+
+  // #teardown for a stream that will not run again: nothing is left to resume, so the visibility
+  // listener goes too, and no longer keeps the stream and its options reachable.
+  #teardownForGood(generation?: number) {
+    this.#teardown(generation)
+    this.#unsubscribeFromVisibilityChanges?.()
   }
 
   async #backoffOnErrorRetry(retryAttempt: number): Promise<void> {
@@ -968,163 +1070,189 @@ export class ShapeStream<T extends Row<unknown> = Row>
   }
 
   async #requestShape(requestShapeCacheBuster?: string): Promise<void> {
-    if (this.options.signal?.aborted) {
-      this.#teardown()
-      return
-    }
+    // Poll iteratively: a tail-recursive self-call pins ~106 B of promise chain per cycle,
+    // reclaimed only when the stream aborts.
+    let pendingCacheBuster = requestShapeCacheBuster
 
-    // ErrorState should never reach the request loop — re-throw so
-    // #start's catch block can route it through onError properly.
-    if (this.#syncState instanceof ErrorState) {
-      throw this.#syncState.error
-    }
+    while (true) {
+      const activeCacheBuster =
+        pendingCacheBuster ?? this.#pendingRequestShapeCacheBuster
+      pendingCacheBuster = undefined
 
-    const activeCacheBuster =
-      requestShapeCacheBuster ?? this.#pendingRequestShapeCacheBuster
-
-    if (this.#pauseLock.isPaused) {
-      if (activeCacheBuster) {
-        this.#pendingRequestShapeCacheBuster = activeCacheBuster
+      if (this.#stopped || this.options.signal?.aborted) {
+        this.#teardown()
+        return
       }
-      return
-    }
 
-    if (
-      !this.options.subscribe &&
-      (this.options.signal?.aborted || this.#syncState.isUpToDate)
-    ) {
-      return
-    }
-
-    // Only check for fast loops on non-live requests; live polling is expected to be rapid
-    if (!this.#syncState.isUpToDate) {
-      await this.#checkFastLoop()
-    } else {
-      this.#fastLoopConsecutiveCount = 0
-      this.#recentRequestEntries = []
-    }
-
-    let resumingFromPause = false
-    if (this.#syncState instanceof PausedState) {
-      resumingFromPause = true
-      this.#syncState = this.#syncState.resume()
-    }
-
-    const { url, signal } = this.options
-    const { fetchUrl, requestHeaders } = await this.#constructUrl(
-      url,
-      resumingFromPause
-    )
-
-    if (activeCacheBuster) {
-      fetchUrl.searchParams.set(CACHE_BUSTER_QUERY_PARAM, activeCacheBuster)
-      fetchUrl.searchParams.sort()
-    }
-    const abortListener = await this.#createAbortListener(signal)
-    const requestAbortController = this.#requestAbortController! // we know that it is not undefined because it is set by `this.#createAbortListener`
-
-    // Re-check after async setup — the lock may have been acquired
-    // during URL construction or abort controller creation (e.g., by
-    // requestSnapshot), when the abort controller didn't exist yet.
-    if (this.#pauseLock.isPaused) {
-      if (abortListener && signal) {
-        signal.removeEventListener(`abort`, abortListener)
+      // ErrorState should never reach the request loop — re-throw so
+      // #start's catch block can route it through onError properly.
+      if (this.#syncState instanceof ErrorState) {
+        throw this.#syncState.error
       }
-      if (activeCacheBuster) {
-        this.#pendingRequestShapeCacheBuster = activeCacheBuster
+
+      if (this.#pauseLock.isPaused) {
+        if (activeCacheBuster) {
+          this.#pendingRequestShapeCacheBuster = activeCacheBuster
+        }
+        return
       }
-      this.#requestAbortController = undefined
-      return
-    }
-
-    this.#pendingRequestShapeCacheBuster = undefined
-
-    try {
-      await this.#fetchShape({
-        fetchUrl,
-        requestAbortController,
-        headers: requestHeaders,
-        resumingFromPause,
-      })
-    } catch (e) {
-      const abortReason = requestAbortController.signal.reason
-      const isMarkedRestartAbort = this.#restartAbortControllers.delete(
-        requestAbortController
-      )
-      const isRestartAbort =
-        requestAbortController.signal.aborted &&
-        (isMarkedRestartAbort ||
-          abortReason === FORCE_DISCONNECT_AND_REFRESH ||
-          abortReason === SYSTEM_WAKE ||
-          abortReason === LIVE_REQUEST_TIMEOUT)
 
       if (
-        (e instanceof FetchError || e instanceof FetchBackoffAbortError) &&
-        isRestartAbort
+        !this.options.subscribe &&
+        (this.options.signal?.aborted || this.#syncState.isUpToDate)
       ) {
-        return this.#requestShape()
+        return
       }
 
-      if (e instanceof FetchBackoffAbortError) {
-        return // interrupted
-      }
-
-      if (e instanceof StaleCacheError) {
-        // Two paths throw StaleCacheError:
-        // 1. Normal stale-retry: response handle matched expired handle,
-        //    #staleCacheBuster set to bypass CDN cache on next request.
-        // 2. Self-healing: stale retries exhausted, expired entry cleared,
-        //    stream reset — retry without expired_handle param.
-        return this.#requestShape()
-      }
-
-      if (!(e instanceof FetchError)) throw e // should never happen
-
-      if (e.status == 409) {
-        // Upon receiving a 409, start from scratch with the newly
-        // provided shape handle (if present). An unconditional cache
-        // buster ensures the retry URL is always unique regardless of
-        // whether the server returns a new, same, or missing handle.
-
-        // Store the current shape URL as expired to avoid future 409s
-        if (this.#syncState.handle) {
-          const shapeKey = canonicalShapeKey(fetchUrl)
-          expiredShapesCache.markExpired(shapeKey, this.#syncState.handle)
-        }
-
-        const newShapeHandle = e.headers[SHAPE_HANDLE_HEADER]
-        if (!newShapeHandle) {
-          console.warn(
-            `[Electric] Received 409 response without a shape handle header. ` +
-              `This likely indicates a proxy or CDN stripping required headers.`
-          )
-        }
-        const nextRequestShapeCacheBuster = createCacheBuster()
-        this.#reset(newShapeHandle)
-
-        // Notify subscribers that data must be re-fetched so they can
-        // clear accumulated state (e.g., Shape clears its row map).
-        // We publish a synthetic control message rather than the raw 409
-        // body to avoid delivering stale data rows to subscribers.
-        await this.#publish([{ headers: { control: `must-refetch` } }])
-
-        return this.#requestShape(nextRequestShapeCacheBuster)
+      // Only check for fast loops on non-live requests; live polling is expected to be rapid
+      if (!this.#syncState.isUpToDate) {
+        await this.#checkFastLoop()
       } else {
-        // errors that have reached this point are not actionable without
-        // additional user input, such as 400s or failures to read the
-        // body of a response, so we exit the loop and let #start handle it
-        // Note: We don't notify subscribers here because onError might recover
-        throw e
+        this.#fastLoopConsecutiveCount = 0
+        this.#recentRequestEntries = []
       }
-    } finally {
-      if (abortListener && signal) {
-        signal.removeEventListener(`abort`, abortListener)
-      }
-      this.#requestAbortController = undefined
-    }
 
-    this.#tickPromiseResolver?.()
-    return this.#requestShape()
+      let resumingFromPause = false
+      if (this.#syncState instanceof PausedState) {
+        resumingFromPause = true
+        this.#syncState = this.#syncState.resume()
+      }
+
+      const { url, signal } = this.options
+      const { fetchUrl, requestHeaders } = await this.#constructUrl(
+        url,
+        resumingFromPause
+      )
+
+      if (activeCacheBuster) {
+        fetchUrl.searchParams.set(CACHE_BUSTER_QUERY_PARAM, activeCacheBuster)
+        fetchUrl.searchParams.sort()
+      }
+      const abortListener = await this.#createAbortListener(signal)
+      const requestAbortController = this.#requestAbortController! // we know that it is not undefined because it is set by `this.#createAbortListener`
+
+      // Re-check after async setup — the lock may have been acquired
+      // during URL construction or abort controller creation (e.g., by
+      // requestSnapshot), when the abort controller didn't exist yet.
+      if (this.#pauseLock.isPaused) {
+        if (abortListener && signal) {
+          signal.removeEventListener(`abort`, abortListener)
+        }
+        if (activeCacheBuster) {
+          this.#pendingRequestShapeCacheBuster = activeCacheBuster
+        }
+        this.#releaseRequestAbortController(requestAbortController)
+        return
+      }
+
+      this.#pendingRequestShapeCacheBuster = undefined
+
+      const requestOffset = this.#syncState.offset
+
+      try {
+        await this.#fetchShape({
+          fetchUrl,
+          requestAbortController,
+          headers: requestHeaders,
+          resumingFromPause,
+        })
+        this.#recordFastLoopResponse(requestOffset)
+      } catch (e) {
+        const abortReason = requestAbortController.signal.reason
+        const isMarkedRestartAbort = this.#restartAbortControllers.delete(
+          requestAbortController
+        )
+        const isRestartAbort =
+          requestAbortController.signal.aborted &&
+          (isMarkedRestartAbort ||
+            abortReason === FORCE_DISCONNECT_AND_REFRESH ||
+            abortReason === SYSTEM_WAKE ||
+            abortReason === LIVE_REQUEST_TIMEOUT)
+
+        if (
+          (e instanceof FetchError || e instanceof FetchBackoffAbortError) &&
+          isRestartAbort
+        ) {
+          continue
+        }
+
+        if (e instanceof FetchBackoffAbortError) {
+          return // interrupted
+        }
+
+        if (e instanceof StaleCacheError) {
+          // Two paths throw StaleCacheError:
+          // 1. Normal stale-retry: response handle matched expired handle,
+          //    #staleCacheBuster set to bypass CDN cache on next request.
+          // 2. Self-healing: stale retries exhausted, expired entry cleared,
+          //    stream reset — retry without expired_handle param.
+          this.#recordFastLoopResponse(requestOffset)
+          continue
+        }
+
+        if (!(e instanceof FetchError)) throw e // should never happen
+
+        if (e.status == 409) {
+          this.#recordFastLoopResponse(requestOffset)
+
+          // Upon receiving a 409, start from scratch with the newly
+          // provided shape handle (if present). An unconditional cache
+          // buster ensures the retry URL is always unique regardless of
+          // whether the server returns a new, same, or missing handle.
+
+          // Store the current shape URL as expired to avoid future 409s
+          if (this.#syncState.handle) {
+            const shapeKey = canonicalShapeKey(fetchUrl)
+            expiredShapesCache.markExpired(shapeKey, this.#syncState.handle)
+          }
+
+          const newShapeHandle = e.headers[SHAPE_HANDLE_HEADER]
+          if (!newShapeHandle) {
+            console.warn(
+              `[Electric] Received 409 response without a shape handle header. ` +
+                `This likely indicates a proxy or CDN stripping required headers.`
+            )
+          }
+          const nextRequestShapeCacheBuster = createCacheBuster()
+          this.#reset(newShapeHandle)
+
+          // Notify subscribers that data must be re-fetched so they can
+          // clear accumulated state (e.g., Shape clears its row map).
+          // We publish a synthetic control message rather than the raw 409
+          // body to avoid delivering stale data rows to subscribers.
+          await this.#publish([{ headers: { control: `must-refetch` } }])
+
+          pendingCacheBuster = nextRequestShapeCacheBuster
+          continue
+        } else {
+          // errors that have reached this point are not actionable without
+          // additional user input, such as 400s, or have exhausted their
+          // retries (network errors, bodies cut off mid-read), so we exit the
+          // loop and let #start handle it
+          // Note: We don't notify subscribers here because onError might recover
+          throw e
+        }
+      } finally {
+        if (abortListener && signal) {
+          signal.removeEventListener(`abort`, abortListener)
+        }
+        this.#releaseRequestAbortController(requestAbortController)
+      }
+
+      this.#tickPromiseResolver?.()
+    }
+  }
+
+  /**
+   * Records a request that got a response, for fast-loop detection. Requests
+   * aborted before a response (e.g. by a snapshot pausing the stream) are not
+   * recorded; they say nothing about a retry loop.
+   */
+  #recordFastLoopResponse(requestOffset: Offset): void {
+    this.#recentRequestEntries.push({
+      timestamp: Date.now(),
+      offset: requestOffset,
+    })
   }
 
   /**
@@ -1141,7 +1269,6 @@ export class ShapeStream<T extends Row<unknown> = Row>
     this.#recentRequestEntries = this.#recentRequestEntries.filter(
       (e) => now - e.timestamp < this.#fastLoopWindowMs
     )
-    this.#recentRequestEntries.push({ timestamp: now, offset: currentOffset })
 
     // Only flag as a fast loop if requests are stuck at the same offset.
     // Normal rapid syncing advances the offset with each response.
@@ -1175,7 +1302,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
     if (this.#fastLoopConsecutiveCount === 1) {
       console.warn(
-        `[Electric] Detected fast retry loop ` +
+        `[Electric]`,
+        `Detected fast retry loop ` +
           `(${this.#fastLoopThreshold} requests in ${this.#fastLoopWindowMs}ms at the same offset). ` +
           `Clearing client-side caches and resetting stream to recover. ` +
           `If this persists, check that your proxy includes all query parameters ` +
@@ -1362,6 +1490,16 @@ export class ShapeStream<T extends Row<unknown> = Row>
     }
   }
 
+  // Clears the current request's controller, but only if it still belongs to the request that is
+  // finishing. A request loop that a pause aborted can settle after the resumed loop has started
+  // its own request; clearing unconditionally would drop the resumed loop's controller, and
+  // `#stop`, the wake check and the online event would then find nothing to abort.
+  #releaseRequestAbortController(controller: AbortController) {
+    if (this.#requestAbortController === controller) {
+      this.#requestAbortController = undefined
+    }
+  }
+
   async #createAbortListener(signal?: AbortSignal) {
     // Create a new AbortController for this request
     this.#requestAbortController = new AbortController()
@@ -1389,7 +1527,10 @@ export class ShapeStream<T extends Row<unknown> = Row>
    * or `false` if the response was ignored (stale) and the body should be skipped.
    * Throws on stale-retry (to trigger a retry with cache buster).
    */
-  async #onInitialResponse(response: Response): Promise<boolean> {
+  async #onInitialResponse(
+    response: Response,
+    isSse = false
+  ): Promise<boolean> {
     const { headers, status } = response
     const shapeHandle = headers.get(SHAPE_HANDLE_HEADER)
     const shapeKey = this.#currentFetchUrl
@@ -1408,7 +1549,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
       this.#pendingSelfHealCheck = null
       if (shapeKey === healedKey && shapeHandle === staleHandle) {
         console.warn(
-          `[Electric] Self-healing retry received the same handle "${staleHandle}" that was just marked expired. ` +
+          `[Electric]`,
+          `Self-healing retry received the same handle "${staleHandle}" that was just marked expired. ` +
             `This means your proxy/CDN is serving a stale cached response and ignoring cache-buster query params. ` +
             `The client will proceed with this stale data to avoid a permanent failure, but it may be out of date until the cache refreshes. ` +
             `Fix: configure your proxy/CDN to include all query parameters (especially 'handle' and 'offset') in its cache key. ` +
@@ -1425,6 +1567,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
       responseCursor: headers.get(LIVE_CACHE_BUSTER_HEADER),
       responseSchema: getSchemaFromHeaders(headers),
       expiredHandle,
+      isSse,
       now: Date.now(),
       maxStaleCacheRetries: this.#maxStaleCacheRetries,
       createCacheBuster,
@@ -1456,7 +1599,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
           // handle and won't trigger stale detection.
           if (this.#expiredShapeRecoveryKey !== shapeKey) {
             console.warn(
-              `[Electric] Stale cache retries exhausted (${this.#maxStaleCacheRetries} attempts). ` +
+              `[Electric]`,
+              `Stale cache retries exhausted (${this.#maxStaleCacheRetries} attempts). ` +
                 `Clearing expired handle entry and attempting self-healing retry without the expired_handle parameter. ` +
                 `For more information visit the troubleshooting guide: ${TROUBLESHOOTING_URL}`,
               new Error(`stack trace`)
@@ -1491,7 +1635,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
         )
       }
       console.warn(
-        `[Electric] Received stale cached response with expired shape handle. ` +
+        `[Electric]`,
+        `Received stale cached response with expired shape handle. ` +
           `This should not happen and indicates a proxy/CDN caching misconfiguration. ` +
           `The response contained handle "${shapeHandle}" which was previously marked as expired. ` +
           `Check that your proxy includes all query parameters (especially 'handle' and 'offset') in its cache key. ` +
@@ -1508,7 +1653,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
     if (transition.action === `ignored`) {
       console.warn(
-        `[Electric] Response was ignored by state "${this.#syncState.kind}". ` +
+        `[Electric]`,
+        `Response was ignored by state "${this.#syncState.kind}". ` +
           `The response body will be skipped. ` +
           `This may indicate a proxy/CDN caching issue or a client state machine bug.`,
         new Error(`stack trace`)
@@ -1519,22 +1665,25 @@ export class ShapeStream<T extends Row<unknown> = Row>
     return true
   }
 
-  async #onMessages(
+  /**
+   * Throws synchronously, with nothing moved, when the batch cannot be
+   * processed: the caller's error path then asks for the batch again.
+   */
+  #onMessages(
     batch: Array<Message<T>>,
     isSseMessage = false,
     opts: { allowReentrantPublishBypass?: boolean } = {}
-  ) {
+  ): Promise<void[]> {
     if (!Array.isArray(batch)) {
       console.warn(
-        `[Electric] #onMessages called with non-array argument (${typeof batch}). ` +
+        `[Electric]`,
+        `#onMessages called with non-array argument (${typeof batch}). ` +
           `This is a client bug — please report it.`,
         new Error(`stack trace`)
       )
-      return
+      return Promise.resolve([])
     }
-    if (batch.length === 0) return
-
-    this.#consecutiveErrorRetries = 0
+    if (batch.length === 0) return Promise.resolve([])
 
     const lastMessage = batch[batch.length - 1]
     const hasUpToDateMessage = isUpToDateMessage(lastMessage)
@@ -1550,6 +1699,40 @@ export class ShapeStream<T extends Row<unknown> = Row>
       now: Date.now(),
       currentCursor: this.#syncState.liveCacheBuster,
     })
+    // Filter messages using snapshot tracker
+    const snapshotTracker = this.#snapshotTracker.clone()
+    const messagesToProcess = batch.filter((message) => {
+      if (isChangeMessage(message)) {
+        const changeLsn = message.headers.lsn
+        if (typeof changeLsn === `string` && changeLsn) {
+          // A quiet SSE stream may deliver its first later change before the
+          // next up-to-date boundary. Retire snapshots against that change's
+          // WAL position before resolving its wrapped transaction ID.
+          snapshotTracker.lastSeenUpdate(BigInt(changeLsn))
+        }
+        return !snapshotTracker.shouldRejectMessage(message)
+      }
+
+      if (isUpToDateMessage(message)) {
+        const lastSeenLsn = message.headers.global_last_seen_lsn
+        if (typeof lastSeenLsn === `string` && lastSeenLsn) {
+          // Process this in message order: changes before the up-to-date
+          // boundary still need snapshot deduplication, while later changes do
+          // not once the database has passed the snapshot's LSN.
+          snapshotTracker.lastSeenUpdate(BigInt(lastSeenLsn))
+        }
+
+        // A replayed up-to-date for the previous session's cursor still
+        // carries real WAL progress, which is applied above; only its
+        // delivery to subscribers is skipped.
+        if (transition.suppressUpToDate) return false
+      }
+
+      return true // Always process control messages
+    })
+
+    this.#snapshotTracker = snapshotTracker
+    this.#consecutiveErrorRetries = 0
     this.#syncState = transition.state
 
     if (hasUpToDateMessage) {
@@ -1564,46 +1747,17 @@ export class ShapeStream<T extends Row<unknown> = Row>
       }
     }
 
-    // Filter messages using snapshot tracker
-    const messagesToProcess = batch.filter((message) => {
-      if (isChangeMessage(message)) {
-        const changeLsn = message.headers.lsn
-        if (typeof changeLsn === `string` && changeLsn) {
-          // A quiet SSE stream may deliver its first later change before the
-          // next up-to-date boundary. Retire snapshots against that change's
-          // WAL position before resolving its wrapped transaction ID.
-          this.#snapshotTracker.lastSeenUpdate(BigInt(changeLsn))
-        }
-        return !this.#snapshotTracker.shouldRejectMessage(message)
-      }
-
-      if (isUpToDateMessage(message)) {
-        const lastSeenLsn = message.headers.global_last_seen_lsn
-        if (typeof lastSeenLsn === `string` && lastSeenLsn) {
-          // Process this in message order: changes before the up-to-date
-          // boundary still need snapshot deduplication, while later changes do
-          // not once the database has passed the snapshot's LSN.
-          this.#snapshotTracker.lastSeenUpdate(BigInt(lastSeenLsn))
-        }
-
-        // A replayed up-to-date for the previous session's cursor still
-        // carries real WAL progress, which is applied above; only its
-        // delivery to subscribers is skipped.
-        if (transition.suppressUpToDate) return false
-      }
-
-      return true // Always process control messages
-    })
-
     // A replay batch that carried nothing but the suppressed up-to-date has
     // nothing to deliver. Skip the callback rather than publishing an empty
     // batch: subscribers are promised one or more messages per notification,
     // and the pre-suppression code never notified for a suppressed replay.
     // Batches emptied by the snapshot tracker alone are still published as
     // before.
-    if (messagesToProcess.length === 0 && transition.suppressUpToDate) return
+    if (messagesToProcess.length === 0 && transition.suppressUpToDate) {
+      return Promise.resolve([])
+    }
 
-    await this.#publish(messagesToProcess, {
+    return this.#publish(messagesToProcess, {
       allowReentrantBypass: opts.allowReentrantPublishBypass,
     })
   }
@@ -1652,8 +1806,10 @@ export class ShapeStream<T extends Row<unknown> = Row>
     return this.#requestShapeLongPoll(opts)
   }
 
+  // `start` runs the request and gets `progress`, which it calls when the request moves on, to
+  // give the watchdog a whole window again.
   async #withRequestTimeout<T>(
-    promise: Promise<T>,
+    start: (progress: () => void) => Promise<T>,
     requestAbortController: AbortController,
     fetchUrl: URL
   ): Promise<T> {
@@ -1663,25 +1819,76 @@ export class ShapeStream<T extends Row<unknown> = Row>
       this.#isRefreshing || this.#refreshCatchUpWatchdogActive
 
     if (timeoutMs === false || (!isLiveRequest && !isRefreshCatchUpRequest)) {
-      return promise
+      return start(() => {})
     }
 
-    let timeout: ReturnType<typeof setTimeout> | undefined
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeout = setTimeout(() => {
-        if (!requestAbortController.signal.aborted) {
-          this.#restartAbortControllers.add(requestAbortController)
-          requestAbortController.abort(LIVE_REQUEST_TIMEOUT)
-        }
-        reject(new FetchBackoffAbortError())
-      }, timeoutMs)
+    const watchdog = this.#watchRequest(requestAbortController)
+    // Retry waits happen on this signal, and the timeout must not run through them.
+    const unwatch = watchRetryWaits(requestAbortController.signal, {
+      pause: watchdog.pause,
+      resume: watchdog.rearm,
     })
 
     try {
-      return await Promise.race([promise, timeoutPromise])
+      return await Promise.race([start(watchdog.rearm), watchdog.interrupted])
     } finally {
-      if (timeout) clearTimeout(timeout)
+      unwatch()
+      watchdog.dispose()
     }
+  }
+
+  /**
+   * Restarts a request that receives nothing for `liveRequestTimeoutMs`. The
+   * timer runs from the call. A request calls `rearm` when the headers
+   * arrive and on every body chunk, which includes an SSE server's keep-alive
+   * comments, so a large body that keeps arriving is never cut off. A request that waits to retry calls `pause` for the wait and
+   * `rearm` after it, so the next attempt gets a whole window. Call `dispose`
+   * when the request is over.
+   *
+   * `interrupted` rejects with `FetchBackoffAbortError` when the watchdog
+   * fires and also when the request is aborted by anything else, so racing a
+   * request against it settles even if its fetch or body ignores the signal.
+   * An abort also stops the timer, which would otherwise outlive the stream.
+   */
+  #watchRequest(requestAbortController: AbortController) {
+    const timeoutMs = this.#liveRequestTimeoutMs
+    const signal = requestAbortController.signal
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let rejectInterrupted!: (error: Error) => void
+    const interrupted = new Promise<never>((_, reject) => {
+      rejectInterrupted = reject
+    })
+    // Nobody may be racing it yet when it rejects.
+    interrupted.catch(() => {})
+
+    const pause = () => clearTimeout(timeout)
+    const rearm = () => {
+      pause()
+      if (timeoutMs === false || signal.aborted) return
+      timeout = setTimeout(() => {
+        if (!signal.aborted) {
+          this.#restartAbortControllers.add(requestAbortController)
+          requestAbortController.abort(LIVE_REQUEST_TIMEOUT)
+        }
+        rejectInterrupted(new FetchBackoffAbortError())
+      }, timeoutMs)
+    }
+    const onAbort = () => {
+      pause()
+      rejectInterrupted(new FetchBackoffAbortError())
+    }
+    const dispose = () => {
+      pause()
+      signal.removeEventListener(`abort`, onAbort)
+    }
+
+    if (signal.aborted) {
+      onAbort()
+    } else {
+      signal.addEventListener(`abort`, onAbort, { once: true })
+      rearm()
+    }
+    return { rearm, pause, interrupted, dispose }
   }
 
   async #requestShapeLongPoll(opts: {
@@ -1691,43 +1898,88 @@ export class ShapeStream<T extends Row<unknown> = Row>
   }): Promise<void> {
     const { fetchUrl, requestAbortController, headers } = opts
     const fetchUrlString = fetchUrl.toString()
-    const rawResponse = await this.#withRequestTimeout(
-      this.#sseFetchClient(fetchUrlString, {
-        signal: requestAbortController.signal,
-        headers,
-      }),
-      requestAbortController,
-      fetchUrl
-    )
-    const response = await consumeResponseBody(
-      rawResponse,
-      fetchUrlString,
+    const isLiveRequest = fetchUrl.searchParams.get(LIVE_QUERY_PARAM) === `true`
+    const consumeBody = (raw: Response, onChunk?: () => void) =>
+      consumeResponseBody(
+        raw,
+        fetchUrlString,
+        requestAbortController.signal,
+        this.#maxResponseBytes,
+        onChunk
+      )
+
+    // A body cut off mid-read is as transient as a connection dropped before
+    // the headers, so retry it with the fetch backoff instead of ending the
+    // stream. Nothing is committed to the sync state until this returns.
+    const response = await retryOnBodyReadFailure(
+      async () => {
+        const fetchResponse = this.#sseFetchClient(fetchUrlString, {
+          signal: requestAbortController.signal,
+          headers,
+        })
+
+        // A live long-poll streams its body over a held-open connection, so a
+        // body that stalls past the timeout must trip the same watchdog as
+        // stalled headers. The watchdog counts the time since the last sign of
+        // life, not the time of the whole request, so a large body that keeps
+        // arriving finishes. A non-live catch-up is bounded data that may
+        // legitimately be slow, so only its headers are watched and the body
+        // is read afterwards.
+        return isLiveRequest
+          ? this.#withRequestTimeout(
+              async (progress) => {
+                const res = await fetchResponse
+                progress()
+                return consumeBody(res, progress)
+              },
+              requestAbortController,
+              fetchUrl
+            )
+          : this.#withRequestTimeout(
+              () => fetchResponse,
+              requestAbortController,
+              fetchUrl
+            ).then((res) => consumeBody(res))
+      },
+      this.#backoffOptions,
       requestAbortController.signal
     )
 
     this.#connected = true
+    // #onInitialResponse commits the offset and live cursor from the response
+    // headers before the body below is parsed. Snapshot the pre-response sync
+    // state so a body that fails to parse (or is not an array) rolls the offset
+    // back instead of advancing past a chunk that was never applied — otherwise
+    // an onError retry resumes past it and skips those rows silently.
+    const preResponseSyncState = this.#syncState
     const shouldProcessBody = await this.#onInitialResponse(response)
     if (!shouldProcessBody) return
 
     const schema = this.#syncState.schema! // we know that it is not undefined because it is set by `this.#onInitialResponse`
     const res = await response.text()
     const messages = res || `[]`
-    const batch = this.#messageParser.parse<Array<Message<T>>>(messages, schema)
+    let batch: Array<Message<T>>
+    try {
+      batch = this.#messageParser.parse<Array<Message<T>>>(messages, schema)
 
-    if (!Array.isArray(batch)) {
-      const preview = bigintSafeStringify(batch)?.slice(0, 200)
-      throw new FetchError(
-        response.status,
-        `Received non-array response body from shape endpoint. ` +
-          `This may indicate a proxy or CDN is returning an unexpected response. ` +
-          `Expected a JSON array, got ${typeof batch}: ${preview}`,
-        undefined,
-        Object.fromEntries(response.headers.entries()),
-        fetchUrl.toString()
-      )
+      if (!Array.isArray(batch)) {
+        const preview = bigintSafeStringify(batch)?.slice(0, 200)
+        throw new FetchError(
+          response.status,
+          `Received non-array response body from shape endpoint. ` +
+            `This may indicate a proxy or CDN is returning an unexpected response. ` +
+            `Expected a JSON array, got ${typeof batch}: ${preview}`,
+          undefined,
+          Object.fromEntries(response.headers.entries()),
+          fetchUrl.toString()
+        )
+      }
+
+      await this.#onMessages(batch)
+    } catch (bodyError) {
+      this.#syncState = preResponseSyncState
+      throw bodyError
     }
-
-    await this.#onMessages(batch)
   }
 
   async #requestShapeSSE(opts: {
@@ -1736,7 +1988,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
     headers: Record<string, string>
   }): Promise<void> {
     const { fetchUrl, requestAbortController, headers } = opts
-    const fetch = this.#sseFetchClient
+    const watchdog = this.#watchRequest(requestAbortController)
 
     // Track when the SSE connection starts
     this.#lastSseConnectionStartTime = Date.now()
@@ -1748,21 +2000,63 @@ export class ShapeStream<T extends Row<unknown> = Row>
     }
 
     let ignoredStaleResponse = false
+    let buffer: Array<Message<T>> = []
+    let receivedMessages = false
+    let unflushedBytes = 0
+    let exceededByteLimit = false
+    let closedForSlowSubscribers = false
     try {
-      let buffer: Array<Message<T>> = []
-      await fetchEventSource(fetchUrl.toString(), {
+      const sse = fetchEventSource(fetchUrl.toString(), {
         headers: sseHeaders,
-        fetch,
+        // The SSE parser drops keep-alive comments before `onmessage`, so the
+        // watchdog watches the raw body chunks instead.
+        fetch: async (input, init) => {
+          // The retry waits of this fetch are found by the signal it was given,
+          // which is fetchEventSource's own, not `requestAbortController`'s.
+          const unwatch = watchRetryWaits(init?.signal, {
+            pause: watchdog.pause,
+            resume: watchdog.rearm,
+          })
+          try {
+            return observeResponseBodyChunks(
+              await this.#sseFetchClient(input, init),
+              (chunk) => {
+                watchdog.rearm()
+                unflushedBytes += chunk.byteLength
+                if (unflushedBytes > this.#maxResponseBytes) {
+                  exceededByteLimit = true
+                  throw new Error(`SSE messages exceeded maxResponseBytes`)
+                }
+              },
+              // Aborted with the request, and by fetchEventSource for each
+              // attempt, which `requestAbortController` is not.
+              init?.signal ?? undefined
+            )
+          } finally {
+            unwatch()
+          }
+        },
+        // A fetch that ignored the watchdog's abort can still resolve after
+        // the request restarted; its response must not reach the stream.
         onopen: async (response: Response) => {
+          if (requestAbortController.signal.aborted) {
+            throw new FetchBackoffAbortError()
+          }
+          watchdog.rearm()
           this.#connected = true
-          const shouldProcessBody = await this.#onInitialResponse(response)
+          const shouldProcessBody = await this.#onInitialResponse(
+            response,
+            true
+          )
           if (!shouldProcessBody) {
             ignoredStaleResponse = true
             throw new Error(`stale response ignored`)
           }
         },
         onmessage: (event: EventSourceMessage) => {
+          if (requestAbortController.signal.aborted) return
           if (event.data) {
+            receivedMessages = true
             // event.data is a single JSON object
             const schema = this.#syncState.schema! // we know that it is not undefined because it is set in onopen when we call this.#onInitialResponse
             const message = this.#messageParser.parse<Message<T>>(
@@ -1774,8 +2068,23 @@ export class ShapeStream<T extends Row<unknown> = Row>
             if (isUpToDateMessage(message)) {
               // Flush the buffer on up-to-date message.
               // Ensures that we only process complete batches of operations.
-              this.#onMessages(buffer, true)
+              // A batch that cannot be processed throws out of `onmessage`,
+              // so the connection closes and the batch stays unflushed.
+              const delivered = this.#onMessages(buffer, true)
+              const batchBytes = unflushedBytes
+              unflushedBytes = 0
+              this.#undeliveredSseBytes += batchBytes
+              delivered.finally(() => {
+                this.#undeliveredSseBytes -= batchBytes
+              })
               buffer = []
+
+              // `onmessage` cannot wait for subscribers. Closing the
+              // connection is the only way to stop the server sending.
+              if (this.#undeliveredSseBytes > this.#maxResponseBytes) {
+                closedForSlowSubscribers = true
+                throw new Error(`Undelivered SSE messages exceeded the limit`)
+              }
             }
           }
         },
@@ -1785,6 +2094,7 @@ export class ShapeStream<T extends Row<unknown> = Row>
         },
         signal: requestAbortController.signal,
       })
+      await Promise.race([sse, watchdog.interrupted])
     } catch (error) {
       if (ignoredStaleResponse) {
         // Stale response was ignored in onopen — let the fetch loop retry
@@ -1809,15 +2119,24 @@ export class ShapeStream<T extends Row<unknown> = Row>
         throw error
       }
     } finally {
+      watchdog.dispose()
+
       // Check if the SSE connection closed too quickly
       // This can happen when responses are cached or when the proxy/server
       // is misconfigured for SSE and closes the connection immediately
       const connectionDuration = Date.now() - this.#lastSseConnectionStartTime!
-      const wasAborted = requestAbortController.signal.aborted
+      const wasAborted =
+        requestAbortController.signal.aborted || closedForSlowSubscribers
 
       const transition = this.#syncState.handleSseConnectionClosed({
         connectionDuration,
         wasAborted,
+        hadUnflushedMessages: buffer.length > 0 || exceededByteLimit,
+        // The header alone can move the offset; it counts only with messages.
+        advancedOffset:
+          receivedMessages &&
+          this.#syncState.offset !==
+            fetchUrl.searchParams.get(OFFSET_QUERY_PARAM),
         minConnectionDuration: this.#minSseConnectionDuration,
         maxShortConnections: this.#maxShortSseConnections,
       })
@@ -1841,6 +2160,10 @@ export class ShapeStream<T extends Row<unknown> = Row>
         )
         const delayMs = Math.floor(Math.random() * maxDelay)
         await new Promise((resolve) => setTimeout(resolve, delayMs))
+      }
+
+      if (this.#undeliveredSseBytes > this.#maxResponseBytes) {
+        await this.#messageChain
       }
     }
   }
@@ -1866,8 +2189,17 @@ export class ShapeStream<T extends Row<unknown> = Row>
 
   unsubscribeAll(): void {
     this.#subscribers.clear()
-    this.#unsubscribeFromVisibilityChanges?.()
-    this.#unsubscribeFromWakeDetection?.()
+    this.#stop()
+  }
+
+  // Tears the stream down for good: the long-poll loop cannot recurse past the `#stopped` guard,
+  // the in-flight request is aborted, `#teardown` drops the wake listener, and the constructor-
+  // registered visibility listener is dropped here — only on this terminal path. Without it,
+  // `unsubscribeAll` left an orphan polling forever and leaking a hidden-tab subscription.
+  #stop(): void {
+    this.#stopped = true
+    this.#requestAbortController?.abort(STREAM_STOPPED)
+    this.#teardownForGood()
   }
 
   /** Unix time at which we last synced. Undefined until first successful up-to-date. */
@@ -2122,12 +2454,75 @@ export class ShapeStream<T extends Row<unknown> = Row>
   }
 
   /**
+   * Cuts a retry backoff short when the browser reports it is back online.
+   * Nothing else would: a stream that lost its connection waits out its own
+   * backoff timer, which can run for tens of seconds. A stream that is not
+   * connected restarts its request the way a system wake does, after a random
+   * delay so that many streams do not hit the server at the same instant.
+   * The restart never comes before a `Retry-After` deadline: the event only
+   * says the network is back, not that the server is ready for the retry. The
+   * deadline includes the spread the stream's own retry drew on top of the
+   * server's time, so streams that were given the same `Retry-After` do not
+   * restart together at the moment it ends.
+   *
+   * Needs a `window` that can listen for events, which Node, Bun and web
+   * workers do not have and React Native may not implement.
+   */
+  #subscribeToOnlineEvent() {
+    if (this.#unsubscribeFromOnlineEvent) return
+    if (
+      typeof window === `undefined` ||
+      typeof window.addEventListener !== `function`
+    ) {
+      return
+    }
+
+    const ONLINE_RETRY_JITTER_MS = 500
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let attemptsAtEvent = 0
+
+    const restart = () => {
+      timer = undefined
+      if (this.#connected) return
+      // The stream's own retry can come first, at the same moment as a restart
+      // that waited for the deadline. That request was sent after the event, so
+      // restarting it would only send it twice.
+      if (this.#fetchAttempts !== attemptsAtEvent) return
+      const untilServerDeadline = this.#retryNotBefore - Date.now()
+      if (untilServerDeadline > 0) {
+        timer = setTimeout(restart, untilServerDeadline)
+        return
+      }
+      this.#forceDisconnectAndRefreshFromWake()
+    }
+
+    const onOnline = () => {
+      // A connected stream has a healthy request in flight.
+      if (this.#connected || timer) return
+      attemptsAtEvent = this.#fetchAttempts
+      timer = setTimeout(restart, Math.random() * ONLINE_RETRY_JITTER_MS)
+    }
+
+    const target = window
+    target.addEventListener(`online`, onOnline)
+
+    this.#unsubscribeFromOnlineEvent = () => {
+      target.removeEventListener(`online`, onOnline)
+      clearTimeout(timer)
+      this.#unsubscribeFromOnlineEvent = undefined
+    }
+  }
+
+  /**
    * Resets the state of the stream, optionally with a provided
    * shape handle
    */
   #reset(handle?: string) {
     this.#syncState = this.#syncState.markMustRefetch(handle)
     this.#connected = false
+    // The row map is cleared on rotation, so the per-key snapshot freshness
+    // tracking must reset with it.
+    this.#snapshotAppliedLsnByKey.clear()
     // releaseAllMatching intentionally doesn't fire onReleased — every caller
     // (#requestShape's 409 handler, #checkFastLoop, and stale-retry
     // self-healing in #onInitialResponse) runs inside the active stream loop,
@@ -2175,7 +2570,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
     // intentionally long-lived so the warning lives here, not in PauseLock.
     const snapshotWarnTimer = setTimeout(() => {
       console.warn(
-        `[Electric] Snapshot "${snapshotReason}" has held the pause lock for 30s — ` +
+        `[Electric]`,
+        `Snapshot "${snapshotReason}" has held the pause lock for 30s — ` +
           `possible hung request or leaked lock. ` +
           `Current holders: ${[...new Set([snapshotReason])].join(`, `)}`,
         new Error(`stack trace`)
@@ -2186,7 +2582,24 @@ export class ShapeStream<T extends Row<unknown> = Row>
       const { metadata, data, responseOffset, responseHandle } =
         await this.fetchSnapshot(opts)
 
-      const dataWithEndBoundary = (data as Array<Message<T>>).concat([
+      // Drop rows a fresher snapshot has already applied for the same key so an
+      // out-of-order older snapshot cannot overwrite a newer row. The freshness
+      // map is updated synchronously, before the injection await, so concurrent
+      // overlapping snapshots arbitrate against a consistent view regardless of
+      // completion order.
+      const snapshotLsn = BigInt(metadata.database_lsn)
+      const freshData = data.filter((message) => {
+        const applied = this.#snapshotAppliedLsnByKey.get(message.key)
+        return applied === undefined || snapshotLsn >= applied
+      })
+      for (const message of freshData) {
+        const applied = this.#snapshotAppliedLsnByKey.get(message.key)
+        if (applied === undefined || snapshotLsn > applied) {
+          this.#snapshotAppliedLsnByKey.set(message.key, snapshotLsn)
+        }
+      }
+
+      const dataWithEndBoundary = (freshData as Array<Message<T>>).concat([
         { headers: { control: `snapshot-end`, ...metadata } },
         { headers: { control: `subset-end`, ...opts } },
       ])
@@ -2199,15 +2612,30 @@ export class ShapeStream<T extends Row<unknown> = Row>
         allowReentrantPublishBypass: true,
       })
 
-      // On cold start the stream's offset is still at "now". Advance it
-      // to the snapshot's position so no updates are missed in between.
-      if (responseOffset !== null || responseHandle !== null) {
+      // A snapshot may only move the stream to an earlier offset. It holds
+      // just its own subset, so the log between the stream's offset and a
+      // later snapshot offset has changes to other rows that it cannot supply,
+      // and adopting that offset would drop them silently. A stream with no
+      // position yet (`-1`, `now`) takes the snapshot's, and of concurrent
+      // cold-start snapshots the earliest wins whichever returns first. The
+      // handle is adopted either way.
+      const streamOffset = this.#syncState.offset
+      const streamHasNoPosition =
+        streamOffset === `-1` || streamOffset === `now`
+      const snapshotIsEarlier =
+        responseOffset !== null &&
+        (compareLogOffsets(responseOffset, streamOffset) ?? 0) < 0
+      const snapshotOffset =
+        streamHasNoPosition || snapshotIsEarlier ? responseOffset : null
+
+      if (snapshotOffset !== null || responseHandle !== null) {
         const transition = this.#syncState.handleResponseMetadata({
           status: 200,
           responseHandle,
-          responseOffset,
+          responseOffset: snapshotOffset,
           responseCursor: null,
           expiredHandle: null,
+          isSse: false,
           now: Date.now(),
           maxStaleCacheRetries: this.#maxStaleCacheRetries,
           createCacheBuster,
@@ -2216,7 +2644,8 @@ export class ShapeStream<T extends Row<unknown> = Row>
           this.#syncState = transition.state
         } else {
           console.warn(
-            `[Electric] Snapshot response metadata was not accepted ` +
+            `[Electric]`,
+            `Snapshot response metadata was not accepted ` +
               `by state "${this.#syncState.kind}" (action: ${transition.action}). ` +
               `Stream offset was not advanced from snapshot.`,
             new Error(`stack trace`)
@@ -2270,6 +2699,13 @@ export class ShapeStream<T extends Row<unknown> = Row>
     let fetchUrl: URL
     let fetchOptions: RequestInit
 
+    // The caller's stream signal, never #requestAbortController: the pause lock
+    // this snapshot holds has already aborted that controller, so using it would
+    // abort the snapshot's own fetch. Without a signal the backoff wrapper's
+    // default maxRetries: Infinity keeps retrying a disposed stream's snapshot
+    // and holds its pause lock until the request settles.
+    const signal = this.options.signal
+
     if (usePost) {
       const result = await this.#constructUrl(this.options.url, true)
       fetchUrl = result.fetchUrl
@@ -2280,11 +2716,12 @@ export class ShapeStream<T extends Row<unknown> = Row>
           'Content-Type': `application/json`,
         },
         body: bigintSafeStringify(this.#buildSubsetBody(opts)),
+        signal,
       }
     } else {
       const result = await this.#constructUrl(this.options.url, true, opts)
       fetchUrl = result.fetchUrl
-      fetchOptions = { headers: result.requestHeaders }
+      fetchOptions = { headers: result.requestHeaders, signal }
     }
 
     // Apply cache buster from same-handle 409 retry
@@ -2511,6 +2948,16 @@ function validateOptions<T>(options: Partial<ShapeStreamOptions<T>>): void {
   ) {
     throw new InvalidShapeOptionsError(
       `Invalid shape options: liveRequestTimeoutMs must be a positive finite number or false`
+    )
+  }
+
+  if (
+    options.maxResponseBytes !== undefined &&
+    (!Number.isFinite(options.maxResponseBytes) ||
+      options.maxResponseBytes <= 0)
+  ) {
+    throw new InvalidShapeOptionsError(
+      `Invalid shape options: maxResponseBytes must be a positive finite number`
     )
   }
 

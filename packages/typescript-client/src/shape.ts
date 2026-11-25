@@ -15,6 +15,12 @@ export type ShapeChangedCallback<T extends Row<unknown> = Row> = (data: {
 
 type ShapeStatus = `syncing` | `up-to-date`
 
+function coerceToFetchError(e: unknown): FetchError {
+  if (e instanceof FetchError) return e
+  const message = e instanceof Error ? e.message : String(e)
+  return new FetchError(0, message, undefined, {}, ``, message)
+}
+
 /**
  * Shape subscriber notification semantics (see SPEC.md → "Shape
  * notification semantics" for the canonical contract):
@@ -116,12 +122,17 @@ export class Shape<T extends Row<unknown> = Row> {
 
   get value(): Promise<ShapeData<T>> {
     return new Promise((resolve, reject) => {
+      // A stream that has already failed will never notify again, so a late
+      // reader must observe the stored error up front rather than subscribing
+      // for a notification that can never arrive.
+      if (this.#error) return reject(this.#error)
+      if (this.stream.error) return reject(this.stream.error as Error)
       if (this.stream.isUpToDate) {
         resolve(this.currentValue)
       } else {
         const unsubscribe = this.subscribe(({ value }) => {
           unsubscribe()
-          if (this.#error) reject(this.#error)
+          if (this.#error) return reject(this.#error)
           resolve(value)
         })
       }
@@ -296,13 +307,7 @@ export class Shape<T extends Row<unknown> = Row> {
   }
 
   #surfaceReexecuteError(e: unknown): void {
-    if (e instanceof FetchError) {
-      this.#error = e
-    } else if (e instanceof Error) {
-      this.#error = new FetchError(0, e.message, undefined, {}, ``, e.message)
-    } else {
-      this.#error = new FetchError(0, String(e), undefined, {}, ``, String(e))
-    }
+    this.#error = coerceToFetchError(e)
     this.#notify()
   }
 
@@ -346,10 +351,11 @@ export class Shape<T extends Row<unknown> = Row> {
   }
 
   #handleError(e: Error): void {
-    if (e instanceof FetchError) {
-      this.#error = e
-      this.#notify()
-    }
+    // Any terminal stream error, not only FetchError, must land in Shape's
+    // error state and wake waiting readers — otherwise rows/value promises
+    // (awaited by preloadShape/electric-ax) hang forever after the stream stops.
+    this.#error = coerceToFetchError(e)
+    this.#notify()
   }
 
   #notify(): void {

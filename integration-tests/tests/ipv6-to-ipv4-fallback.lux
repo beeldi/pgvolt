@@ -1,5 +1,7 @@
 [doc Verify fallback from IPv6 to IPv4 when connecting to a PostgreSQL server]
 
+[config skip=PUBLIC_DNS_UNAVAILABLE]
+
 [include _macros.luxinc]
 
 [global pg_container_name=ipv6-to-ipv4-fallback__pg]

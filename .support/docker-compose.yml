@@ -4,6 +4,9 @@ name: 'electric_example-${PROJECT_NAME:-default}'
 services:
   postgres:
     image: postgres:16-alpine
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: electric
       POSTGRES_USER: postgres
@@ -15,6 +18,7 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
       - /tmp
+      - /var/run/postgresql
     command:
       - postgres
       - -c
@@ -22,6 +26,9 @@ services:
 
   backend:
     image: electricsql/electric:canary
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     environment:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/electric?sslmode=disable
       # Not suitable for production. Only use insecure mode in development or if you've otherwise secured the Electric API.
@@ -31,5 +38,11 @@ services:
       - 3000:3000
     build:
       context: ../packages/sync-service/
+      additional_contexts:
+        electric-telemetry: ../packages/electric-telemetry/
     depends_on:
       - postgres
+    # The image runs as uid 65534. Like Postgres's data above, the shape store lives in memory and
+    # goes with the container.
+    tmpfs:
+      - /app/persistent:uid=65534,gid=65534

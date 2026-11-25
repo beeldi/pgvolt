@@ -9,6 +9,7 @@ defmodule Electric.Replication.Eval.Env.ExplicitCasts do
   | source    | target         | function name |
   | --------- | -------------- | ------------- |
   | bool      | int4           | bool_to_int4  |
+  | bool      | text           | bool_to_text  |
   | char      | int4           |               |
   | int8      | bit            |               |
   | int4      | bit            |               |
@@ -45,6 +46,8 @@ defmodule Electric.Replication.Eval.Env.ExplicitCasts do
   | xid8      | xid            |               |
   """
 
+  def bool_to_text(true), do: "true"
+  def bool_to_text(false), do: "false"
   def bool_to_int4(true), do: 1
   def bool_to_int4(false), do: 0
   def int4_to_bool(0), do: false

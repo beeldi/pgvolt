@@ -5,15 +5,28 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
   alias Electric.ShapeCache.PureFileStorage.KeyIndex
   alias Electric.ShapeCache.PureFileStorage.ActionFile
   alias Electric.ShapeCache.PureFileStorage.ChunkIndex
+  alias Electric.ShapeCache.PureFileStorage.PayloadArena
   alias Electric.LogItems
   alias Electric.Replication.LogOffset
   alias Electric.ShapeCache.LogChunker
 
+  import Bitwise
   import Electric.Replication.LogOffset, only: :macros
-  import Electric.ShapeCache.PureFileStorage, only: [safely_open_file!: 3]
+
+  import Electric.ShapeCache.PureFileStorage,
+    only: [discard_shape_after_data_loss!: 2, safely_open_file!: 3]
 
   # 16 bytes offset + 4 bytes key size + 1 byte op type + 1 byte processed flag + 8 bytes json size = 30 bytes
   @line_overhead 16 + 4 + 1 + 1 + 8
+
+  # Flag bit marking an entry whose payload is a fixed-size ref into the shared payload
+  # arena rather than the JSON itself. The frame stays self-describing (json_size is the
+  # ref's byte size), so scanning, trimming and chunk-index arithmetic are unchanged.
+  # Bit 0 remains the compaction-processed flag; ref entries never carry it because
+  # compaction inlines refs before processing.
+  @ref_flag 0b10
+  def ref_flag, do: @ref_flag
+  defguard is_ref_flag(flag) when (flag &&& @ref_flag) != 0
 
   @type operation_type() :: :insert | :update | :delete
   @type op_type() :: ?u | ?i | ?d
@@ -42,6 +55,18 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
            key_index_path :: String.t()}
 
   @spec make_entry(log_item_with_sizes()) :: {iodata(), iodata_size :: non_neg_integer()}
+  # Arena-ref entry: the payload written to the log is the ref binary; the JSON rides along
+  # in the tuple only for the live-tail ETS mirror, and the real payload size only for chunk
+  # accounting — neither reaches the file.
+  def make_entry({offset, 0, "", op_type, flag, ref_size, {ref, _json, _payload_size}})
+      when is_ref_flag(flag) do
+    {[
+       LogOffset.to_int128(offset),
+       <<0::32, op_type::8, flag::8, ref_size::64>>,
+       ref
+     ], ref_size + @line_overhead}
+  end
+
   def make_entry({offset, key_size, key, op_type, flag, json_size, json}) do
     {[
        LogOffset.to_int128(offset),
@@ -50,6 +75,56 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
        <<op_type::8, flag::8, json_size::64>>,
        json
      ], key_size + json_size + @line_overhead}
+  end
+
+  @doc """
+  Frame a run of prepared fan-out-class log items once for every member shape.
+
+  The returned block's `frame` is byte-identical to what `make_entry/1` produces for each
+  item in order, so a member appending the block writes exactly the bytes it would have
+  written appending the items one at a time. `entries_meta` records, per entry, its log
+  offset, its end position inside the frame, and the cumulative real payload size — enough
+  for chunk-boundary arithmetic and replay slicing without re-parsing the frame.
+  """
+  @spec build_framed_block([log_item()]) :: Electric.Replication.Changes.FramedBlock.t()
+  def build_framed_block([_ | _] = log_items) do
+    {frame_iodata, meta_reversed, ets_reversed, frame_size, payload_size, count} =
+      Enum.reduce(log_items, {[], [], [], 0, 0, 0}, fn item,
+                                                       {frame, meta, ets, fsize, psize, count} ->
+        {offset, json, payload_bytes, normalized} = normalize_block_item(item)
+        {iodata, iodata_size} = make_entry(normalized)
+        frame_end = fsize + iodata_size
+        payload_cum = psize + payload_bytes
+
+        {[frame | iodata], [{offset, frame_end, payload_cum} | meta],
+         [{LogOffset.to_tuple(offset), json} | ets], frame_end, payload_cum, count + 1}
+      end)
+
+    [{last_offset, _, _} | _] = meta_reversed
+    entries_meta = meta_reversed |> Enum.reverse() |> List.to_tuple()
+    {first_offset, _, _} = elem(entries_meta, 0)
+
+    %Electric.Replication.Changes.FramedBlock{
+      frame: IO.iodata_to_binary(frame_iodata),
+      frame_size: frame_size,
+      count: count,
+      payload_size: payload_size,
+      ets_lines: Enum.reverse(ets_reversed),
+      entries_meta: entries_meta,
+      first_offset: first_offset,
+      last_offset: last_offset
+    }
+  end
+
+  defp normalize_block_item({offset, key, op_type, json}) when is_binary(json) do
+    {offset, json, byte_size(json),
+     {offset, byte_size(key), key, get_op_type(op_type), 0, byte_size(json), json}}
+  end
+
+  defp normalize_block_item({offset, _key, op_type, json, ref}) when is_binary(ref) do
+    {offset, json, byte_size(json),
+     {offset, 0, "", get_op_type(op_type), @ref_flag, byte_size(ref),
+      {ref, json, byte_size(json)}}}
   end
 
   @doc """
@@ -167,11 +242,75 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
 
             {[{entry, position}], {file, expected_position(position, entry)}}
           else
+            # An I/O error is not the end of the stream. Halting on one hands back a short log that
+            # reads as complete, and both callers build something durable out of it — a key index, or
+            # the inlined copy compaction swaps in — so the truncation outlives the error that caused
+            # it. `read_back_jsons` below already separates the two; this reader did not. A torn tail
+            # still halts, because a partial write comes back as a short binary rather than an error.
+            {:error, reason} -> raise File.Error, path: log_file_path, reason: reason
             _ -> {:halt, {file, position}}
           end
       end,
       &File.close(elem(&1, 0))
     )
+  end
+
+  @doc """
+  Write a copy of the log segment `[0, end_pos)` with every arena-ref entry materialized
+  into a self-contained entry (key and JSON restored from the arena, ref flag cleared).
+
+  Compaction's key index, action file and merge internals all read payloads back from the
+  log file by position, which a fixed-size ref cannot satisfy; running them on an inlined
+  copy keeps those internals untouched and naturally ages shared payloads out of the log.
+
+  Returns the size of the written copy.
+  """
+  @spec write_inlined_copy!(String.t(), String.t(), non_neg_integer(), String.t()) ::
+          non_neg_integer()
+  def write_inlined_copy!(src_path, dst_path, end_pos, base_path) do
+    # On a raise mid-copy the caller (a compaction task) dies and the raw handles die with
+    # the process, so only the success path needs an explicit close.
+    File.open!(dst_path, [:write, :raw, :binary], fn dst ->
+      stream_entries(src_path, 0, end_pos)
+      |> Enum.reduce(PayloadArena.open_reader(base_path), fn {entry, _pos}, reader ->
+        {reader, entry} = inline_entry(reader, entry)
+        {iodata, _size} = make_entry(entry)
+        IO.binwrite(dst, iodata)
+        reader
+      end)
+    end)
+    |> PayloadArena.close_reader!()
+
+    File.stat!(dst_path).size
+  end
+
+  defp inline_entry(reader, {offset, _key_size, _key, op_type, flag, _json_size, ref})
+       when is_ref_flag(flag) do
+    {reader, {key, json}} = PayloadArena.read_payload!(reader, ref)
+    {reader, {offset, byte_size(key), key, op_type, 0, byte_size(json), json}}
+  end
+
+  defp inline_entry(reader, entry), do: {reader, entry}
+
+  @doc """
+  The set of payload-arena generations reachable from the ref entries in one log file.
+
+  A generation the arena still holds is dead once no surviving log resolves a ref into it, so the
+  reclaimer needs the reachable set to know which files it may drop. Only uncompacted log entries
+  carry refs -- compaction inlines them (`write_inlined_copy!` clears the flag) -- so a compacted
+  file yields the empty set at the cost of a scan.
+  """
+  @spec arena_generations_in_log(String.t()) :: MapSet.t(non_neg_integer())
+  def arena_generations_in_log(log_file_path) do
+    stream_entries(log_file_path, 0, :eof)
+    |> Enum.reduce(MapSet.new(), fn
+      {{_offset, _key_size, _key, _op_type, flag, _json_size, ref}, _pos}, gens
+      when is_ref_flag(flag) ->
+        MapSet.put(gens, PayloadArena.ref_generation(ref))
+
+      {_entry, _pos}, gens ->
+        gens
+    end)
   end
 
   # Read the log range lazily in bounded blocks rather than all at once.
@@ -207,7 +346,11 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
           else
             # A partial entry at the end of the range means the file is
             # shorter than the chunk index says it should be.
-            raise "unexpected end of file"
+            discard_shape_after_data_loss!(
+              opts,
+              "Log #{log_file_path} ends mid-entry at #{end_position}, short of what the " <>
+                "chunk index describes; the storage has lost durable data"
+            )
           end
 
         {file, position, binary_rest} ->
@@ -221,7 +364,11 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
               {jsons, {file, position + byte_size(data), rest}}
 
             :eof ->
-              raise "unexpected end of file"
+              discard_shape_after_data_loss!(
+                opts,
+                "Log #{log_file_path} ends at #{position}, short of the #{end_position} the " <>
+                  "chunk index describes; the storage has lost durable data"
+              )
 
             {:error, reason} ->
               raise File.Error,
@@ -236,6 +383,8 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
       end
     )
   end
+
+  @tail_read_block_bytes 4096
 
   def stream_jsons_until_offset(
         %PFS{} = opts,
@@ -259,17 +408,20 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
         :halt ->
           {:halt, []}
 
-        {file, binary_rest} ->
-          case :file.read(file, 4096) do
-            {:ok, data} ->
-              {jsons, rest} =
-                extract_jsons_from_binary(
-                  binary_rest <> data,
-                  exclusive_min_offset,
-                  inclusive_max_offset
-                )
+        {file, :done} ->
+          {:halt, {file, ""}}
 
-              {jsons, {file, rest}}
+        {file, binary_rest} ->
+          case :file.read(file, next_read_size(binary_rest)) do
+            {:ok, data} ->
+              case extract_jsons_from_binary(
+                     binary_rest <> data,
+                     exclusive_min_offset,
+                     inclusive_max_offset
+                   ) do
+                {jsons, :halt} -> {jsons, {file, :done}}
+                {jsons, rest} -> {jsons, {file, rest}}
+              end
 
             :eof ->
               {:halt, {file, binary_rest}}
@@ -281,6 +433,14 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
       end
     )
   end
+
+  defp next_read_size(<<_::128, key_size::32, tail::binary>> = pending)
+       when byte_size(tail) >= key_size + 10 do
+    <<_key::binary-size(^key_size), _::8, _::8, json_size::64, _::binary>> = tail
+    max(@tail_read_block_bytes, @line_overhead + key_size + json_size - byte_size(pending))
+  end
+
+  defp next_read_size(_pending), do: @tail_read_block_bytes
 
   @spec extract_jsons_from_binary(binary(), LogOffset.t(), LogOffset.t() | nil) ::
           Enumerable.t(String.t())
@@ -301,36 +461,44 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
        do: extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, acc)
 
   defp extract_jsons_from_binary(
-         <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
+         <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, flag::8,
            json_size::64, json::binary-size(json_size), _::binary>>,
-         log_offset,
-         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2} = inclusive_max_offset,
+         _log_offset,
+         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2},
          acc
        )
        when tx_offset1 == tx_offset2 and op_offset1 == op_offset2,
-       do: extract_jsons_from_binary("", log_offset, inclusive_max_offset, [json | acc])
+       do: {Enum.reverse([tag_payload(flag, json) | acc]), :halt}
 
   defp extract_jsons_from_binary(
          <<tx_offset1::64, op_offset1::64, key_size::32, _::binary-size(key_size), _::8, _flag::8,
            json_size::64, _json::binary-size(json_size), _::binary>>,
-         log_offset,
-         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2} = inclusive_max_offset,
+         _log_offset,
+         %LogOffset{tx_offset: tx_offset2, op_offset: op_offset2},
          acc
        )
        when tx_offset1 > tx_offset2 or (tx_offset1 == tx_offset2 and op_offset1 > op_offset2),
-       do: extract_jsons_from_binary("", log_offset, inclusive_max_offset, acc)
+       do: {Enum.reverse(acc), :halt}
 
   defp extract_jsons_from_binary(
-         <<_::128, key_size::32, _::binary-size(key_size), _::8, _flag::8, json_size::64,
+         <<_::128, key_size::32, _::binary-size(key_size), _::8, flag::8, json_size::64,
            json::binary-size(json_size), rest::binary>>,
          log_offset,
          inclusive_max_offset,
          acc
        ),
-       do: extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, [json | acc])
+       do:
+         extract_jsons_from_binary(rest, log_offset, inclusive_max_offset, [
+           tag_payload(flag, json) | acc
+         ])
 
   defp extract_jsons_from_binary(rest, _, _, acc),
     do: {Enum.reverse(acc), rest}
+
+  # Arena-ref entries surface as `{:ref, ref}` for `PayloadArena.resolve_refs/2` to turn back
+  # into the payload JSON; inline entries pass through as the stored binary.
+  defp tag_payload(flag, payload) when is_ref_flag(flag), do: {:ref, payload}
+  defp tag_payload(_flag, json), do: json
 
   defp get_op_type(:insert), do: ?i
   defp get_op_type(:update), do: ?u
@@ -352,34 +520,93 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
 
   @doc """
   Truncate the log file at the given persisted offset, starting the search from the given position.
+
+  Returns `:ok` when the log holds the entry at the offset, `:past_boundary` when it holds none
+  there but one past it, and `:short_of_boundary` when it ends before reaching the offset.
+
+  A read that fails raises, and trims nothing. With `read_errors: :return` it returns
+  `:unreadable` instead, for a caller probing a boundary it can fall back from.
   """
-  def trim(log_file_path, search_start_pos, last_persisted_offset) do
+  def trim(log_file_path, search_start_pos, last_persisted_offset, opts \\ []) do
     File.open!(log_file_path, [:raw, :read, :write, :read_ahead], fn file ->
-      :file.position(file, search_start_pos)
+      # A seek that fails leaves the scan at the start of the file while it counts positions from
+      # the search start, and the trim then cuts the log where no entry ends.
+      case :file.position(file, search_start_pos) do
+        {:ok, _} -> :ok
+        {:error, reason} -> raise File.Error, reason: reason, action: "seek", path: log_file_path
+      end
 
       Stream.unfold(search_start_pos, fn position ->
-        with <<tx_offset::64, op_offset::64, key_size::32>> <- IO.binread(file, 20),
-             <<_::binary-size(^key_size)>> <- IO.binread(file, key_size),
-             <<_::8, _::8, json_size::64>> <- IO.binread(file, 10),
-             <<_::binary-size(^json_size)>> <- IO.binread(file, json_size) do
-          read = 20 + key_size + json_size + 10
-          {{LogOffset.new(tx_offset, op_offset), position + read, read}, position + read}
-        else
-          _ -> {{nil, position}, position}
+        case read_entry(file) do
+          # An entry cut short is a tail a crash left, for the trim to remove. A read that fails
+          # says nothing about the bytes, and trimming there dropped durable entries for it.
+          {:error, reason} ->
+            {{:read_error, reason}, position}
+
+          :partial ->
+            {{nil, position}, position}
+
+          {offset, read} ->
+            {{offset, position + read, read}, position + read}
         end
       end)
       |> Enum.find_value(fn
-        {nil, position} -> position
+        {:read_error, _reason} = failed -> failed
+        # The scan ran out of readable entries without ever reaching the persisted offset, so
+        # the file stops short of what the metadata claims is durable. Only the caller knows
+        # whether that is possible for this store, so report it rather than trimming quietly.
+        {nil, position} -> {:short_of_boundary, position}
         {offset, _, _} when is_log_offset_lt(offset, last_persisted_offset) -> false
         # On the persisted offset, trim what's after it
-        {^last_persisted_offset, position, _} -> position
+        {^last_persisted_offset, position, _} -> {:ok, position}
         # On an offset larger than the persisted offset, trim the line itself and the rest of the file
-        {_, position, width} -> position - width
+        {_, position, width} -> {:past_boundary, position - width}
       end)
-      |> then(&:file.position(file, &1))
+      |> case do
+        {:read_error, reason} ->
+          if Keyword.get(opts, :read_errors) == :return,
+            do: :unreadable,
+            else: raise(File.Error, reason: reason, action: "read", path: log_file_path)
 
-      :file.truncate(file)
+        {status, position} ->
+          # A truncate that fails leaves the bytes past the position, and recovery judges what the
+          # chunk index covers by where the log ends: reported as done, it read as lost data.
+          case truncate_at(file, position) do
+            :ok ->
+              status
+
+            {:error, reason} ->
+              raise File.Error, reason: reason, action: "truncate", path: log_file_path
+          end
+      end
     end)
+  end
+
+  # A log that already ends at the position needs no truncate, and one that failed there failed
+  # the reopen of an intact log. A log that ends before it is one the scan found short: a truncate
+  # past the end grew it with zeros, which a later scan reads as entries.
+  defp truncate_at(file, position) do
+    case :file.position(file, :eof) do
+      {:ok, eof} when eof <= position -> :ok
+      {:ok, _} -> truncate_file(file, position)
+      error -> error
+    end
+  end
+
+  defp truncate_file(file, position) do
+    with {:ok, _} <- :file.position(file, position), do: :file.truncate(file)
+  end
+
+  defp read_entry(file) do
+    with <<tx_offset::64, op_offset::64, key_size::32>> <- IO.binread(file, 20),
+         <<_::binary-size(^key_size)>> <- IO.binread(file, key_size),
+         <<_::8, _::8, json_size::64>> <- IO.binread(file, 10),
+         <<_::binary-size(^json_size)>> <- IO.binread(file, json_size) do
+      {LogOffset.new(tx_offset, op_offset), 20 + key_size + json_size + 10}
+    else
+      {:error, _reason} = error -> error
+      _ -> :partial
+    end
   end
 
   alias Electric.LogItems
@@ -393,12 +620,7 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
       ) do
     ActionFile.stream(action_file_path)
     |> Stream.transform(
-      fn ->
-        Map.new(paths_with_labels, fn {label, path} ->
-          file = File.open!(path, [:read, :raw, :read_ahead])
-          {label, file}
-        end)
-      end,
+      fn -> open_labeled_logs!(paths_with_labels) end,
       # Actions are in log-offset order, so we can apply them as we go along
       fn {_offset, label, _entry_start, action}, files ->
         file = Map.fetch!(files, label)
@@ -418,6 +640,30 @@ defmodule Electric.ShapeCache.PureFileStorage.LogFile do
       &Enum.each(&1, fn {_, file} -> File.close(file) end)
     )
     |> write_log_file(resulting_file, chunk_size)
+  end
+
+  @doc false
+  # Open every labeled input up front, as the merge's `start_fun`. Opening them in one
+  # comprehension leaked the handles opened before a failing one: the raise escaped `start_fun`, so
+  # the accumulator was never handed back and the transform's `after_fun` never ran to close them.
+  # Closing what we already hold before re-raising keeps a mid-way `:enoent` from stranding a
+  # descriptor per surviving input until the next GC.
+  @type log_opener() :: (String.t() -> {:ok, File.io_device()} | {:error, File.posix()})
+  @spec open_labeled_logs!([{term(), String.t()}], log_opener()) :: %{term() => File.io_device()}
+  def open_labeled_logs!(
+        paths_with_labels,
+        open_fun \\ &File.open(&1, [:read, :raw, :read_ahead])
+      ) do
+    Enum.reduce(paths_with_labels, %{}, fn {label, path}, opened ->
+      case open_fun.(path) do
+        {:ok, file} ->
+          Map.put(opened, label, file)
+
+        {:error, reason} ->
+          Enum.each(opened, fn {_, file} -> File.close(file) end)
+          raise File.Error, path: path, reason: reason, action: "open"
+      end
+    end)
   end
 
   defp skip_line(file) do

@@ -78,13 +78,33 @@ defmodule Support.OracleHarness.WhereClauseGenerator do
   defp bool_gen, do: member_of(["true", "false"])
   defp tag_gen, do: member_of(@tags)
 
+  # A text universe of `v0..v19` alone can never disagree with Postgres on the LIKE, collation or
+  # case-folding classes: it carries no uppercase, newline, non-ASCII or backslash character for
+  # those classes to turn on. These adversarial literals and patterns give the differential oracle
+  # inputs that can actually surface such a divergence (paired with the adversarial stored values in
+  # StandardSchema).
+  @adversarial_value_literals ["V5", "café", "over\nflow", "back\\slash"]
+  @adversarial_like_patterns ["V%", "%É%", "%\n%", "v\\%", "back\\\\%"]
+
+  @doc "Adversarial value literals mixed into the comparison corpus (see the module note)."
+  def adversarial_value_literals, do: @adversarial_value_literals
+
+  @doc "Adversarial LIKE patterns mixed into the corpus (see the module note)."
+  def adversarial_like_patterns, do: @adversarial_like_patterns
+
   # Value patterns for level_4.value column
   defp value_literal_gen do
-    member_of(["v0", "v1", "v5", "v10", "v15", "v19"])
+    frequency([
+      {5, member_of(["v0", "v1", "v5", "v10", "v15", "v19"])},
+      {1, member_of(@adversarial_value_literals)}
+    ])
   end
 
   defp like_pattern_gen do
-    member_of(["v%", "v1%", "v_", "%5", "%1%"])
+    frequency([
+      {5, member_of(["v%", "v1%", "v_", "%5", "%1%"])},
+      {1, member_of(@adversarial_like_patterns)}
+    ])
   end
 
   # ============================================================================

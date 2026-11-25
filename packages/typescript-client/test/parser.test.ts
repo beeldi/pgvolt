@@ -77,6 +77,53 @@ describe(`Default parser`, () => {
       { c: [{ d: 5 }] },
     ])
   })
+
+  it(`should preserve json/jsonb integers beyond 2^53 as exact bigints`, () => {
+    expect(defaultParser.json(`9007199254740993`)).toEqual(
+      BigInt(`9007199254740993`)
+    )
+    expect(defaultParser.jsonb(`9007199254740993`)).toEqual(
+      BigInt(`9007199254740993`)
+    )
+    expect(defaultParser.jsonb(`-9007199254740993`)).toEqual(
+      BigInt(`-9007199254740993`)
+    )
+    expect(defaultParser.jsonb(`{"n":9007199254740993}`)).toEqual({
+      n: BigInt(`9007199254740993`),
+    })
+    expect(defaultParser.jsonb(`[9007199254740995]`)).toEqual([
+      BigInt(`9007199254740995`),
+    ])
+    expect(defaultParser.jsonb(`{"a":{"b":9007199254740993}}`)).toEqual({
+      a: { b: BigInt(`9007199254740993`) },
+    })
+  })
+
+  it(`should parse a json document nested deeper than the call stack allows a reviver`, () => {
+    const depth = 10_000
+    const nested = (inner: string) =>
+      `[`.repeat(depth) + inner + `]`.repeat(depth)
+    const innermost = (value: unknown) => {
+      let node = value
+      for (let level = 0; level < depth; level++) node = (node as unknown[])[0]
+      return node
+    }
+
+    expect(innermost(defaultParser.jsonb(nested(`1`)))).toEqual(1)
+    // Too deep for the reviver, so the integer is a double, as JSON.parse reads it.
+    expect(innermost(defaultParser.jsonb(nested(`9007199254740993`)))).toEqual(
+      Number(`9007199254740993`)
+    )
+  })
+
+  it(`should leave safe integers and floats as numbers`, () => {
+    expect(typeof defaultParser.jsonb(`9007199254740991`)).toBe(`number`)
+    expect(defaultParser.jsonb(`9007199254740991`)).toEqual(9007199254740991)
+    expect(typeof defaultParser.jsonb(`1e308`)).toBe(`number`)
+    expect(defaultParser.jsonb(`1e308`)).toEqual(1e308)
+    expect(defaultParser.jsonb(`3.14`)).toEqual(3.14)
+    expect(defaultParser.jsonb(`{"a":1,"b":2}`)).toEqual({ a: 1, b: 2 })
+  })
 })
 
 describe(`Postgres array parser`, () => {
@@ -122,6 +169,31 @@ describe(`Postgres array parser`, () => {
         nullableDefaultParser.float8
       )
     ).toEqual([Infinity, -Infinity, NaN, null])
+  })
+
+  it(`should parse an array of the 6 dimensions Postgres allows`, () => {
+    expect(pgArrayParser(`{{{{{{1}}}}}}`, nullableDefaultParser.int2)).toEqual([
+      [[[[[1]]]]],
+    ])
+  })
+
+  it(`should refuse an array nested deeper than Postgres allows`, () => {
+    expect(() =>
+      pgArrayParser(`{{{{{{{1}}}}}}}`, nullableDefaultParser.int2)
+    ).toThrow(/nested deeper than the 6 dimensions/)
+  })
+
+  it(`should refuse a very deep array with an error, not a stack overflow`, () => {
+    const depth = 1_000_000
+    expect(() =>
+      pgArrayParser(`{`.repeat(depth) + `}`.repeat(depth), (v) => v)
+    ).toThrow(/nested deeper than the 6 dimensions/)
+  })
+
+  it(`should not count braces inside quoted elements as nesting`, () => {
+    expect(pgArrayParser(`{"{{{{{{{{x}}}}}}}}"}`, (v) => v)).toEqual([
+      `{{{{{{{{x}}}}}}}}`,
+    ])
   })
 
   it(`should parse nested arrays`, () => {
@@ -173,10 +245,38 @@ describe(`Postgres array parser`, () => {
       [NaN, Infinity, -Infinity],
     ])
   })
+
+  it(`should not append the array length for unterminated array text`, () => {
+    // A dimension with no closing brace leaves `last < i` true at the end of
+    // the loop. The tail must push the trailing value once, not push the return
+    // value of an inner push (its new length) as a bogus extra element.
+    expect(pgArrayParser(`{1,2`, (v) => v)).toEqual([`1`, `2`])
+    expect(pgArrayParser(`{1,2,3`, (v) => v)).toEqual([`1`, `2`, `3`])
+    expect(pgArrayParser(`{a`, (v) => v)).toEqual([`a`])
+  })
+
+  it(`should reject an explicit non-default lower bound instead of silently reindexing`, () => {
+    expect(() =>
+      pgArrayParser(`[-2:0]={1,2,3}`, nullableDefaultParser.int2)
+    ).toThrowError(
+      `Postgres array literal "[-2:0]={1,2,3}" has an explicit lower bound, which cannot be represented as a zero-indexed array`
+    )
+
+    expect(pgArrayParser(`{1,2,3}`, nullableDefaultParser.int2)).toEqual([
+      1, 2, 3,
+    ])
+  })
 })
 
 describe(`Message parser`, () => {
   const parser = new MessageParser()
+
+  it(`should preserve jsonb integers beyond 2^53 through the message pipeline`, () => {
+    const messages = `[ { "value": { "meta": "{\\"id\\":9007199254740993}" } } ]`
+    expect(parser.parse(messages, { meta: { type: `jsonb` } })).toEqual([
+      { value: { meta: { id: BigInt(`9007199254740993`) } } },
+    ])
+  })
 
   it(`should parse null values`, () => {
     const messages = `[ { "value": { "a": null } }, { "value": { "value": null } } ]`
@@ -250,12 +350,57 @@ describe(`Message parser`, () => {
       })
     ).toEqual([{ value: { a: [`a`, `NULL`, null, `b`] } }])
 
-    // should fail if the array contains null in a non null type
-    expect(() =>
+    // A NOT NULL array column constrains the array value, not its elements: a
+    // NULL element is valid and must not throw.
+    expect(
       parser.parse(messagesNullStringAndReal, {
         a: { type: `text`, dims: 1, not_null: true },
       })
+    ).toEqual([{ value: { a: [`a`, `NULL`, null, `b`] } }])
+  })
+
+  it(`should keep NOT NULL array constraints on the array value, not its elements`, () => {
+    // A NULL element under a NOT NULL array parses to null.
+    expect(
+      parser.parse(`[ { "value": { "a": "{1,NULL,3}" } } ]`, {
+        a: { type: `int2`, dims: 1, not_null: true },
+      })
+    ).toEqual([{ value: { a: [1, null, 3] } }])
+
+    // The array value itself being NULL under NOT NULL still throws.
+    expect(() =>
+      parser.parse(`[ { "value": { "a": null } } ]`, {
+        a: { type: `int2`, dims: 1, not_null: true },
+      })
     ).toThrowError(`Column "a" does not allow NULL values`)
+  })
+
+  it(`should reject an array literal arriving under a scalar schema entry`, () => {
+    for (const type of [`int2`, `int4`, `int8`, `float4`, `float8`, `bool`]) {
+      expect(() =>
+        parser.parse(`[ { "value": { "a": "{1,2,3}" } } ]`, {
+          a: { type },
+        })
+      ).toThrowError(
+        `Column "a" is typed as scalar "${type}" but received an array literal`
+      )
+    }
+
+    // The explicit-lower-bound serialization is also an array literal.
+    expect(() =>
+      parser.parse(`[ { "value": { "a": "[0:2]={1,2,3}" } } ]`, {
+        a: { type: `int4` },
+      })
+    ).toThrowError(
+      `Column "a" is typed as scalar "int4" but received an array literal`
+    )
+
+    // A text scalar legitimately holds a value that starts with a brace.
+    expect(
+      parser.parse(`[ { "value": { "a": "{not an array}" } } ]`, {
+        a: { type: `text` },
+      })
+    ).toEqual([{ value: { a: `{not an array}` } }])
   })
 
   it(`should parse arrays including null values`, () => {
@@ -266,5 +411,21 @@ describe(`Message parser`, () => {
     expect(
       parser.parse(`[ { "value": { "a": "{1,2,NULL,4,5}" } } ]`, schema)
     ).toEqual([{ value: { a: [1, 2, null, 4, 5] } }])
+  })
+
+  it(`should reject an array value carrying an explicit lower bound`, () => {
+    expect(() =>
+      parser.parse(`[ { "value": { "a": "[-2:0]={1,2,3}" } } ]`, {
+        a: { type: `int2`, dims: 1 },
+      })
+    ).toThrowError(
+      `Postgres array literal "[-2:0]={1,2,3}" has an explicit lower bound, which cannot be represented as a zero-indexed array`
+    )
+
+    expect(
+      parser.parse(`[ { "value": { "a": "{1,2,3}" } } ]`, {
+        a: { type: `int2`, dims: 1 },
+      })
+    ).toEqual([{ value: { a: [1, 2, 3] } }])
   })
 })

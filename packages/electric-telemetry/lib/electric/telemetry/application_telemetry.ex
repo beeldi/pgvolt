@@ -145,9 +145,16 @@ defmodule ElectricTelemetry.ApplicationTelemetry do
   end
 
   def cpu_utilization_metrics do
-    1..:erlang.system_info(:logical_processors)
+    cpu_utilization_metrics(:erlang.system_info(:logical_processors))
+  end
+
+  def cpu_utilization_metrics(logical_processors)
+      when is_integer(logical_processors) and logical_processors > 0 do
+    1..logical_processors
     |> Enum.map(&last_value("system.cpu.utilization.core_#{&1 - 1}"))
   end
+
+  def cpu_utilization_metrics(_logical_processors), do: []
 
   def scheduler_utilization_metrics do
     num_schedulers = :erlang.system_info(:schedulers)

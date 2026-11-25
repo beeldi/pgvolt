@@ -25,6 +25,10 @@ defmodule Electric.ShapeCache.ShapeStatus.ShapeDb.Supervisor do
     # NimblePool treats `worker_idle_timeout: nil` as no idle timeout
     write_pool_idle_timeout = if(exclusive_mode, do: nil, else: idle_timeout)
 
+    Logger.notice(
+      "ShapeDb boot read timeout: #{Electric.Config.get_env(:shape_db_boot_read_timeout)}ms"
+    )
+
     connection_count = :atomics.new(1, signed: false)
 
     opts = Keyword.put(opts, :connection_count, connection_count)

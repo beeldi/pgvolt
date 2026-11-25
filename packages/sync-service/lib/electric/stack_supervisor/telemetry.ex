@@ -1,4 +1,28 @@
 defmodule Electric.StackSupervisor.Telemetry do
+  # Prometheus histogram buckets. The shared reporter defaults every non-byte distribution to a
+  # 0.01..1 second ladder, so these millisecond-lag and fan-out-count series would land entirely
+  # in +Inf and no percentile or le-based query could work on the Prometheus endpoint. Cover
+  # the expected ranges instead: single-digit ms up to a 5-minute staleness, and fan-out from one
+  # shape into the thousands.
+  @lag_ms_buckets [
+    1,
+    5,
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1_000,
+    2_500,
+    5_000,
+    10_000,
+    30_000,
+    60_000,
+    300_000
+  ]
+  @fanout_buckets [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000]
+
   def configure(config) do
     # Set shared OpenTelemetry span attributes for the given stack. They are stored in
     # persistent_term so it doesn't matter which process this function is called from.
@@ -52,10 +76,12 @@ defmodule Electric.StackSupervisor.Telemetry do
       Telemetry.Metrics.last_value("electric.postgres.replication.slot_confirmed_flush_lsn_lag",
         unit: :byte
       ),
+      Telemetry.Metrics.counter("electric.postgres.full_transaction_id.anchor.count"),
       # replication lag, time-based: wall-clock staleness of received transactions
       Telemetry.Metrics.distribution(
         "electric.postgres.replication.transaction_received.receive_lag",
-        unit: :millisecond
+        unit: :millisecond,
+        reporter_options: [buckets: @lag_ms_buckets]
       ),
       # HTTP response status-code counts for the shape endpoint (200s, 409s, 50xs, ...).
       # The event also carries :known_error and :live; we tag by :status only so the series
@@ -68,7 +94,53 @@ defmodule Electric.StackSupervisor.Telemetry do
       # admission control: current in-flight concurrency per kind
       Telemetry.Metrics.last_value("electric.admission_control.acquire.current", tags: [:kind]),
       # admission control: number of rejected requests per kind
-      Telemetry.Metrics.sum("electric.admission_control.reject.count", tags: [:kind])
+      Telemetry.Metrics.sum("electric.admission_control.reject.count", tags: [:kind]),
+      # shape-db write buffer depth. Reading a high backlog needs this series, and it is only
+      # otherwise defined in `default_metrics_from_periodic_measurements/0`, which reaches only the
+      # StatsD/OTel reporters. Listed on both channels deliberately: the duplicate
+      # the moduledoc warns about is cheaper than a series the Prometheus endpoint cannot show.
+      Telemetry.Metrics.last_value("electric.shape_db.write_buffer.pending_writes.count"),
+      Telemetry.Metrics.last_value("electric.shape_db.sqlite.connections"),
+      # admission control: permit swaps, and swaps refused because the target bucket was full.
+      # The refusal is an overload signal in its own right.
+      Telemetry.Metrics.sum("electric.admission_control.swap.count", tags: [:from, :to]),
+      Telemetry.Metrics.sum("electric.admission_control.swap_rejected.count", tags: [:from, :to]),
+      # admission control: permits a dead request process still held, given back when it died.
+      # Each one was a slot lost to every other request until then.
+      Telemetry.Metrics.sum("electric.admission_control.reclaim.initial"),
+      Telemetry.Metrics.sum("electric.admission_control.reclaim.existing"),
+      # shape responses killed because their client stopped reading. Untagged: the shape
+      # handle is unbounded, and the warning log names it.
+      Telemetry.Metrics.sum("electric.plug.serve_shape.reaped.count"),
+      # the replication socket has been paused longer than the retry budget, i.e. an ack nobody is
+      # going to send. This is the only detector for a slot held open by such a pause, and the
+      # check that watches for it reports rather than acts, so the report has to arrive somewhere.
+      Telemetry.Metrics.sum("electric.flush_tracker.stall_detected.count"),
+      # a shape writer went down; `reason_class` separates a deliberate stop from a crash
+      Telemetry.Metrics.counter("electric.flush_tracker.writer_down.count",
+        tags: [:reason_class]
+      ),
+      # bytes on the shape storage volume. Nothing shrinks the volume and nothing caps WAL
+      # retention, so this is the one series that shows the ratchet before the volume does.
+      Telemetry.Metrics.last_value("electric.storage.used.bytes", unit: :byte),
+      # how many shapes one transaction fanned out to -- the cost driver behind the routing work
+      Telemetry.Metrics.distribution(
+        "electric.shape_log_collector.transaction.affected_shape_count",
+        reporter_options: [buckets: @fanout_buckets]
+      ),
+      # wall-clock staleness between a transaction committing and its rows reaching shape storage
+      Telemetry.Metrics.distribution("electric.storage.transaction_stored.replication_lag",
+        unit: :millisecond,
+        reporter_options: [buckets: @lag_ms_buckets]
+      ),
+      # rows dropped from a shape because their predicate could not be evaluated. Any non-zero
+      # value here is silent data loss: the snapshot holds the row and its live changes do not
+      # arrive. Untagged deliberately -- the refs that failed are unbounded cardinality, and the
+      # question this answers is "is it happening at all", which the warning log then localises.
+      Telemetry.Metrics.sum("electric.shape.unevaluable_row_excluded.count",
+        event_name: [:electric, :shape, :unevaluable_row_excluded],
+        measurement: :count
+      )
     ]
   end
 
@@ -81,14 +153,19 @@ defmodule Electric.StackSupervisor.Telemetry do
       %{stack_id: stack_id}
     )
 
-    %{total: num_shapes, indexed: indexed_shapes, unindexed: unindexed_shapes} =
-      Electric.ShapeCache.shape_counts(stack_id)
+    case Electric.ShapeCache.shape_counts(stack_id) do
+      %{total: num_shapes, indexed: indexed_shapes, unindexed: unindexed_shapes} ->
+        Electric.Telemetry.OpenTelemetry.execute(
+          [:electric, :shapes, :total_shapes],
+          %{count: num_shapes, count_indexed: indexed_shapes, count_unindexed: unindexed_shapes},
+          %{stack_id: stack_id}
+        )
 
-    Electric.Telemetry.OpenTelemetry.execute(
-      [:electric, :shapes, :total_shapes],
-      %{count: num_shapes, count_indexed: indexed_shapes, count_unindexed: unindexed_shapes},
-      %{stack_id: stack_id}
-    )
+      # Not counted yet: at boot, the collector's restore counts the stored shapes, and an
+      # instance waiting for the lock has not restored them.
+      :error ->
+        :ok
+    end
   end
 
   def report_write_buffer_size(stack_id, _telemetry_opts) do

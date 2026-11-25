@@ -17,7 +17,7 @@ defmodule Support.TransactionConsumer do
     GenServer.start_link(__MODULE__, opts, name: name(opts))
   end
 
-  def assert_consume(consumers, evts, timeout \\ 100) do
+  def assert_consume(consumers, evts, timeout \\ ExUnit.configuration()[:assert_receive_timeout]) do
     for consumer <- consumers, into: MapSet.new() do
       assert_receive {Support.TransactionConsumer, ^consumer, received_evts}, timeout
 
@@ -35,7 +35,7 @@ defmodule Support.TransactionConsumer do
 
             Enum.zip(received.changes, txn_fragment.changes)
             |> Enum.each(fn {received_change, expected_change} ->
-              assert Map.drop(received_change, [:key, :old_key]) ==
+              assert Map.drop(unwrap_prepared(received_change), [:key, :old_key]) ==
                        Map.drop(expected_change, [:key, :old_key])
             end)
 
@@ -50,6 +50,12 @@ defmodule Support.TransactionConsumer do
     |> Enum.to_list()
     |> List.flatten()
   end
+
+  # When a change fans out to several shapes that would each convert it identically, the router
+  # converts once and routes the shared result, so consumers receive that rather than the raw
+  # change. The change itself is what these assertions are about either way.
+  defp unwrap_prepared(%Changes.PreparedChange{change: change}), do: change
+  defp unwrap_prepared(change), do: change
 
   def refute_consume(consumers, timeout \\ 100) do
     for consumer <- consumers do
@@ -77,10 +83,19 @@ defmodule Support.TransactionConsumer do
     action = Keyword.get(opts, :action, :create)
     shape = Keyword.fetch!(opts, :shape)
     shape_handle = Keyword.fetch!(opts, :shape_handle)
+    handle_event_delay = Keyword.get(opts, :handle_event_delay)
 
     Electric.Replication.ShapeLogCollector.add_shape(stack_id, shape_handle, shape, action)
 
-    {:ok, %{id: id, stack_id: stack_id, parent: parent, shape_handle: shape_handle}}
+    {:ok,
+     %{
+       id: id,
+       stack_id: stack_id,
+       parent: parent,
+       shape_handle: shape_handle,
+       handle_event_delay: handle_event_delay,
+       silent_exit?: false
+     }}
   end
 
   def handle_call(
@@ -88,17 +103,35 @@ defmodule Support.TransactionConsumer do
         from,
         state
       ) do
+    if state.handle_event_delay, do: Process.sleep(state.handle_event_delay)
     send(state.parent, {__MODULE__, {state.id, self()}, [txn_fragment]})
 
     handle = state.shape_handle
 
-    case txn_fragment.changes do
+    # Under shared conversion the router hands the consumer a PreparedChange wrapping the raw
+    # change, so the control-record clauses below must match the unwrapped form the same way the
+    # assertions do.
+    case Enum.map(txn_fragment.changes, &unwrap_prepared/1) do
       [
         %Changes.NewRecord{
           record: %{"id" => "stop-with-reason", "handle" => ^handle, "reason" => reason}
         }
       ] ->
         exit(reason)
+
+      [
+        %Changes.NewRecord{
+          record: %{"id" => "die-silently", "handle" => ^handle, "reason" => reason}
+        }
+      ] ->
+        # Exit without deregistering from the collector, as a real consumer does for a
+        # bare :shutdown or :normal and as one that dies without running terminate/2 does.
+        {:stop, reason, %{state | silent_exit?: true}}
+
+      [%Changes.NewRecord{record: %{"id" => "hang", "handle" => ^handle}}] ->
+        # Wedge alive inside the broadcast without replying, like a consumer stuck
+        # on a hung storage write: only a kill can end it.
+        Process.sleep(:infinity)
 
       [%Changes.NewRecord{record: %{"id" => "block-until-released", "handle" => ^handle}}] ->
         # Hold the reply so the test can hold the ShapeLogCollector inside
@@ -131,6 +164,10 @@ defmodule Support.TransactionConsumer do
 
   # we no longer monitor consumer processes in the ShapeLogCollector
   # so consumers must de-register themselves
+  def terminate(reason, %{silent_exit?: true} = state) do
+    send(state.parent, {__MODULE__, {state.id, self()}, {:terminate, reason}})
+  end
+
   def terminate(reason, %{stack_id: stack_id, shape_handle: shape_handle} = state) do
     send(state.parent, {__MODULE__, {state.id, self()}, {:terminate, reason}})
     Electric.Replication.ShapeLogCollector.remove_shape(stack_id, shape_handle)

@@ -22,14 +22,14 @@ defmodule PgInterop.Interval.PostgresAndSQLParser do
       century:
         ~r/(?<=\s|^)(?<century>(?:\+|-)?\s*\d+(?:\.\d+)?)\s*(?:c|cent|century|centuries)(?=\s|$)/,
       millennium:
-        ~r/(?<=\s|^)(?<millennium>(?:\+|-)?\s*\d+(?:\.\d+)?)\s*(?:mils|millenniums)(?=\s|$)/,
+        ~r/(?<=\s|^)(?<millennium>(?:\+|-)?\s*\d+(?:\.\d+)?)\s*(?:millenniums|millennium|millennia|mils|mil)(?=\s|$)/,
       sql_ym: ~r/(?<=\s|^)(?<sign>\+|-)?\s*(?<year>\d+)-(?<month>\-?\d+)(?=\s|$)/,
       sql_dhm:
-        ~r/(?<=\s|^)(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)?\s+(?<sign>\+|-)?\s*(?<hour>\d+):(?<minute>\d+)(?=\s|$)/,
+        ~r/(?<=\s|^)(?:(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)\s+)?(?<sign>\+|-)?\s*(?<hour>\d+):(?<minute>\d+)(?=\s|$)/,
       sql_dhms:
-        ~r/(?<=\s|^)(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)?\s+(?<sign>\+|-)?\s*(?<hour>\d+):(?<minute>\d+):(?<second>\d+(?:\.\d+)?)(?=\s|$)/,
+        ~r/(?<=\s|^)(?:(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)\s+)?(?<sign>\+|-)?\s*(?<hour>\d+):(?<minute>\d+):(?<second>\d+(?:\.\d+)?)(?=\s|$)/,
       sql_dms:
-        ~r/(?<=\s|^)(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)?\s+(?<sign>\+|-)?\s*(?<minute>\d+):(?<second>\d+\.\d+)(?=\s|$)/
+        ~r/(?<=\s|^)(?:(?<day>(?:\+|-)?\s*\d+(?:\.\d+)?)\s+)?(?<sign>\+|-)?\s*(?<minute>\d+):(?<second>\d+\.\d+)(?=\s|$)/
     ]
 
   @doc """
@@ -104,7 +104,19 @@ defmodule PgInterop.Interval.PostgresAndSQLParser do
 
   def parse(<<?@, rest::binary>>), do: parse(rest)
 
+  # Postgres takes one `ago`, as the last word: the rest is parsed as plain parts, so a second
+  # `ago` is invalid input rather than a second negation, and the input is scanned once.
   def parse(str) do
+    case Regex.run(~r/\A(?<parts>.*\S)\s+ago\s*\z/is, str, capture: ["parts"]) do
+      [parts] ->
+        with {:ok, interval} <- parse_parts(parts), do: {:ok, Interval.scale(interval, -1)}
+
+      nil ->
+        parse_parts(str)
+    end
+  end
+
+  defp parse_parts(str) do
     {parsed_parts, rest} =
       Enum.map_reduce(parse_part_regexes(), str, fn {key, regex}, str ->
         {{key, Regex.named_captures(regex, str)}, Regex.replace(regex, str, "")}

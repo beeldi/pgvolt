@@ -1,3 +1,5 @@
+import { hashShapeKey } from './shape-key-hash'
+
 interface UpToDateEntry {
   timestamp: number
   cursor: string
@@ -16,7 +18,8 @@ interface UpToDateEntry {
  */
 export class UpToDateTracker {
   private data: Record<string, UpToDateEntry> = {}
-  private readonly storageKey = `electric_up_to_date_tracker`
+  private readonly storageKey = `electric_up_to_date_tracker_v2`
+  private readonly legacyStorageKey = `electric_up_to_date_tracker`
   private readonly cacheTTL = 60_000 // 60s to match typical CDN s-maxage cache duration
   private readonly maxEntries = 250
   private readonly writeThrottleMs = 60_000 // Throttle localStorage writes to once per 60s
@@ -34,7 +37,7 @@ export class UpToDateTracker {
    * Updates in-memory immediately, but throttles localStorage writes.
    */
   recordUpToDate(shapeKey: string, cursor: string): void {
-    this.data[shapeKey] = {
+    this.data[hashShapeKey(shapeKey)] = {
       timestamp: Date.now(),
       cursor,
     }
@@ -82,7 +85,7 @@ export class UpToDateTracker {
    * Returns null if no recent up-to-date exists.
    */
   shouldEnterReplayMode(shapeKey: string): string | null {
-    const entry = this.data[shapeKey]
+    const entry = this.data[hashShapeKey(shapeKey)]
     if (!entry) {
       return null
     }
@@ -118,8 +121,8 @@ export class UpToDateTracker {
   }
 
   private save(): void {
-    if (typeof localStorage === `undefined`) return
     try {
+      if (typeof localStorage === `undefined`) return
       localStorage.setItem(this.storageKey, JSON.stringify(this.data))
     } catch {
       // Ignore localStorage errors (quota exceeded, etc.)
@@ -127,8 +130,9 @@ export class UpToDateTracker {
   }
 
   private load(): void {
-    if (typeof localStorage === `undefined`) return
     try {
+      if (typeof localStorage === `undefined`) return
+      localStorage.removeItem(this.legacyStorageKey)
       const stored = localStorage.getItem(this.storageKey)
       if (stored) {
         this.data = JSON.parse(stored)
@@ -153,7 +157,7 @@ export class UpToDateTracker {
   }
 
   delete(shapeKey: string): void {
-    delete this.data[shapeKey]
+    delete this.data[hashShapeKey(shapeKey)]
     this.save()
   }
 }

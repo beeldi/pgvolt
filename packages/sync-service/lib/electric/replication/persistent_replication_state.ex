@@ -1,4 +1,5 @@
 defmodule Electric.Replication.PersistentReplicationState do
+  require Logger
   alias Electric.PersistentKV
   alias Electric.Replication.Changes
 
@@ -25,8 +26,19 @@ defmodule Electric.Replication.PersistentReplicationState do
   @spec get_tracked_relations(opts()) :: tracked_relations()
   def get_tracked_relations(opts) do
     case get("tracked_relations", opts) do
-      {:ok, tracked_relations} -> tracked_relations
-      {:error, :not_found} -> @base_tracked_relations
+      {:ok, tracked_relations} ->
+        tracked_relations
+
+      {:error, :not_found} ->
+        @base_tracked_relations
+
+      {:error, reason} ->
+        Logger.warning(
+          "Could not read the tracked relations (#{inspect(reason)}), starting from empty. " <>
+            "They are repopulated from the replication stream."
+        )
+
+        @base_tracked_relations
     end
   end
 
@@ -42,7 +54,7 @@ defmodule Electric.Replication.PersistentReplicationState do
     PersistentKV.set(persistent_kv, "#{stack_id}:#{key}", value)
   end
 
-  @spec get(String.t(), opts()) :: {:ok, any()} | {:error, :not_found}
+  @spec get(String.t(), opts()) :: {:ok, any()} | {:error, term()}
   defp get(key, opts) do
     persistent_kv = Access.fetch!(opts, :persistent_kv)
     stack_id = Access.fetch!(opts, :stack_id)

@@ -61,9 +61,16 @@ defmodule ElectricTelemetry.StackTelemetry do
     ]
   end
 
-  defp disk_usage_child_specs(%{stack_id: stack_id} = opts) do
-    if storage_dir = Map.get(opts, :storage_dir) do
-      [{ElectricTelemetry.DiskUsage, stack_id: stack_id, storage_dir: storage_dir}]
+  @doc false
+  def disk_usage_child_specs(%{stack_id: stack_id} = opts) do
+    storage_dir = Map.get(opts, :storage_dir)
+    scan_period = opts.intervals_and_thresholds.disk_usage_scan_period
+
+    if storage_dir && scan_period > 0 do
+      [
+        {ElectricTelemetry.DiskUsage,
+         stack_id: stack_id, storage_dir: storage_dir, update_period: scan_period}
+      ]
     else
       []
     end

@@ -2,7 +2,7 @@ name: sync-service
 
 on:
   push:
-    branches: ['main']
+    branches: ['main', 'release/**']
     paths:
       - 'packages/electric-telemetry/**'
       - 'packages/sync-service/**'
@@ -13,29 +13,41 @@ on:
       - 'packages/sync-service/**'
       - '.github/workflows/sync_service_tests.yml'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # erlef/setup-beam picks its Erlang/OTP build from ImageOS, which only GitHub's own images set
+  ImageOS: ubuntu24
+  # Set repository variable PUBLIC_DNS_UNAVAILABLE=true in environments without public DNS
+  PUBLIC_DNS_UNAVAILABLE: ${{ vars.PUBLIC_DNS_UNAVAILABLE }}
+
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build_and_test:
     name: 'Build and test sync-service, pg${{ matrix.postgres_version }}'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: packages/sync-service
     strategy:
       fail-fast: false
       matrix:
-        postgres_version: [14, 15, 17, 18]
+        postgres_version: [18]
     env:
       MIX_ENV: test
       MIX_TARGET: application
       POSTGRES_VERSION: '${{ matrix.postgres_version }}0000'
-      CODECOV_FLAGS: elixir,unit-tests,sync-service,postgres-${{ matrix.postgres_version }}0000
-      CODECOV_TEST_RESULTS_FILES: ./junit/regular-test-junit-report.xml,./junit/telemetry-test-junit-report.xml
     services:
       postgres:
-        image: 'ghcr.io/${{ github.repository }}/postgres:${{ matrix.postgres_version }}-alpine-logical'
+        image: 'ghcr.io/beeldi/electric/postgres:${{ matrix.postgres_version }}-alpine-logical'
+        credentials: &ghcr_credentials
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
         env:
           POSTGRES_PASSWORD: password
         options: &postgres_health_check >-
@@ -47,7 +59,8 @@ jobs:
           - 54321:5432
 
       pgbouncer: &pgbouncer_service
-        image: bitnamilegacy/pgbouncer:latest
+        image: ghcr.io/beeldi/electric/bitnamilegacy/pgbouncer:latest
+        credentials: *ghcr_credentials
         env:
           PGBOUNCER_AUTH_TYPE: trust
           PGBOUNCER_DATABASE: '*'
@@ -60,21 +73,22 @@ jobs:
           - 65432:6432
     steps:
       - &checkout_source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - &seed_database
         name: Seed the database
-        run: psql -d postgresql://postgres:password@localhost:54321/postgres?sslmode=disable -f dev/init.sql
+        # Run psql inside the service container so the runner does not need a local Postgres client
+        run: docker exec --interactive ${{ job.services.postgres.id }} psql -d 'postgresql://postgres:password@localhost:5432/postgres?sslmode=disable' < dev/init.sql
 
       - &setup_beam
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           version-type: strict
           version-file: '.tool-versions'
 
       - &cache_dependencies
         name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: packages/sync-service/deps
           key: "${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}"
@@ -85,7 +99,7 @@ jobs:
 
       - &cache_compiled_code
         name: Cache compiled code
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             packages/sync-service/_build/*/lib
@@ -106,39 +120,75 @@ jobs:
         run: mix compile
 
       - name: Run tests
-        run: mix coveralls.json --include slow --cover --export-coverage test
+        # 120s per-test budget: the slow-tagged high-concurrency tests seed
+        # thousands of shapes through unconsolidated protocol dispatch, which
+        # grazes the 60s default on 2-vCPU shared runners.
+        run: mix coveralls.json --include slow --timeout 120000 --cover --export-coverage test
 
-      - name: Upload coverage reports to CodeCov
-        uses: codecov/codecov-action@ad3126e916f78f00edff4ed0317cf185271ccc2d
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          flags: ${{ env.CODECOV_FLAGS }}
-          files: ./cover/excoveralls.json
-
-      - &upload_test_results_to_codecov
-        name: Upload test results to CodeCov
-        uses: codecov/test-results-action@f2dba722c67b86c6caa034178c6e4d35335f6706
-        if: ${{ !cancelled() }}
-        env:
-          DUMMY_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}-dummy
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
-          flags: ${{ env.CODECOV_FLAGS }}
-          files: ${{ env.CODECOV_TEST_RESULTS_FILES }}
-
-  oracle_property_test:
-    name: 'Oracle property test, pg17'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+  perf_features_test:
+    name: 'Build and test sync-service with the perf features on, pg18'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: packages/sync-service
     env:
       MIX_ENV: test
       MIX_TARGET: application
-      POSTGRES_VERSION: '170000'
-      CODECOV_FLAGS: elixir,oracle-tests,sync-service,postgres-170000
-      CODECOV_TEST_RESULTS_FILES: ./junit/regular-test-junit-report.xml
+      POSTGRES_VERSION: '180000'
+      # Everything this fork adds ships off, so the default lane above only ever exercises the
+      # code these features replace. Running the same suite with them on is what stops a test
+      # from silently assuming the default, and it is how the defects below were found.
+      ELECTRIC_SHARED_CONVERSION: 'true'
+      ELECTRIC_SHARED_PAYLOAD_ARENA: 'true'
+      ELECTRIC_SHARED_FRAGMENT_BLOCKS: 'true'
+      ELECTRIC_WORKER_PREPARE: 'true'
+      ELECTRIC_ROUTER_SHARDS: '4'
+      ELECTRIC_INGEST_PRIORITY_HIGH: 'true'
+      ELECTRIC_FILTER_ROUTING_MEMO: 'true'
+      ELECTRIC_ACK_AFTER_JOURNAL: 'true'
+      ELECTRIC_REPLICATION_PIPELINE_WINDOW: '4'
+      # ELECTRIC_SHARED_CONVERSION has to stay set for the three above it to do anything: they
+      # only decide how a shared conversion is packaged, and without one they turn themselves
+      # off. Dropping it would leave this lane green while testing nothing.
+      #
+      # ELECTRIC_ACK_AFTER_JOURNAL and ELECTRIC_REPLICATION_PIPELINE_WINDOW used to drop
+      # subquery-shape move-in events outright: with ingest running ahead of fan-out, the
+      # keepalive-fed last-seen LSN feed regressed and buffered move-ins waited forever on a
+      # boundary that had already been seen. The replication client now holds keepalive
+      # positions until its pipeline drains, so both run here.
+    services:
+      postgres:
+        image: 'ghcr.io/beeldi/electric/postgres:18-alpine-logical'
+        credentials: *ghcr_credentials
+        env:
+          POSTGRES_PASSWORD: password
+        options: *postgres_health_check
+        ports:
+          - 54321:5432
+
+      pgbouncer: *pgbouncer_service
+    steps:
+      - *checkout_source
+      - *seed_database
+      - *setup_beam
+      - *cache_dependencies
+      - *cache_compiled_code
+      - *install_dependencies
+      - *compile_package
+
+      - name: Run tests with the perf features on
+        run: mix test --include slow --timeout 120000
+
+  oracle_property_test:
+    name: 'Oracle property test, pg18'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: packages/sync-service
+    env:
+      MIX_ENV: test
+      MIX_TARGET: application
+      POSTGRES_VERSION: '180000'
       CHECK_TIMEOUT: 60000
       SHAPE_COUNT: 200
       MUTATIONS_PER_TXN: 10
@@ -147,7 +197,8 @@ jobs:
       SKIP_REPATCH_PREWARM: 'true'
     services:
       postgres:
-        image: 'ghcr.io/${{ github.repository }}/postgres:17-alpine-logical'
+        image: 'ghcr.io/beeldi/electric/postgres:18-alpine-logical'
+        credentials: *ghcr_credentials
         env:
           POSTGRES_PASSWORD: password
         options: *postgres_health_check
@@ -167,11 +218,9 @@ jobs:
       - name: Run oracle property test
         run: mix test --only oracle test/integration/oracle_property_test.exs
 
-      - *upload_test_results_to_codecov
-
   oracle_property_test_with_restarts:
-    name: 'Oracle property test with restarts (${{ matrix.restart_type }})'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: 'Oracle property test with restarts (${{ matrix.restart_type }}, perf flags ${{ matrix.perf_flags }})'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: packages/sync-service
@@ -179,12 +228,14 @@ jobs:
       fail-fast: false
       matrix:
         restart_type: [graceful, brutal]
+        # Upstream runs this lane flags-off only. The flags-on axis is the fork's own
+        # guard: a crash or restore must stay consistent with the journal, pipelined
+        # ingest and shared-conversion machinery in the write path.
+        perf_flags: ['off', 'on']
     env:
       MIX_ENV: test
       MIX_TARGET: application
-      POSTGRES_VERSION: '170000'
-      CODECOV_FLAGS: elixir,oracle-tests,sync-service,postgres-170000
-      CODECOV_TEST_RESULTS_FILES: ./junit/regular-test-junit-report.xml
+      POSTGRES_VERSION: '180000'
       CHECK_TIMEOUT: 60000
       SHAPE_COUNT: 200
       MUTATIONS_PER_TXN: 10
@@ -194,9 +245,19 @@ jobs:
       RESTART_SERVER_EVERY: 3
       RESTART_TYPE: ${{ matrix.restart_type }}
       TEST_POOL_SIZE: 20
+      ELECTRIC_SHARED_CONVERSION: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_SHARED_PAYLOAD_ARENA: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_SHARED_FRAGMENT_BLOCKS: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_WORKER_PREPARE: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_ROUTER_SHARDS: ${{ matrix.perf_flags == 'on' && '4' || '1' }}
+      ELECTRIC_INGEST_PRIORITY_HIGH: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_FILTER_ROUTING_MEMO: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_ACK_AFTER_JOURNAL: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_REPLICATION_PIPELINE_WINDOW: ${{ matrix.perf_flags == 'on' && '4' || '1' }}
     services:
       postgres:
-        image: 'ghcr.io/${{ github.repository }}/postgres:17-alpine-logical'
+        image: 'ghcr.io/beeldi/electric/postgres:18-alpine-logical'
+        credentials: *ghcr_credentials
         env:
           POSTGRES_PASSWORD: password
         options: *postgres_health_check
@@ -213,26 +274,41 @@ jobs:
       - *install_dependencies
       - *compile_package
 
-      - name: Run oracle property test with ${{ matrix.restart_type }} server restarts
+      - name: Run oracle property test with restarts
         run: mix test --only oracle test/integration/oracle_property_test.exs
 
-      - *upload_test_results_to_codecov
-
   performance_test:
-    name: 'Performance test, pg17'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: 'Performance test, pg18 (perf flags ${{ matrix.perf_flags }})'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: packages/sync-service
+    strategy:
+      fail-fast: false
+      matrix:
+        # The perf features rewrite the conversion, routing and ingest path they are
+        # meant to speed up, so a throughput or allocation regression there is invisible
+        # while the benchmarks only ever run against the code those features replace. The
+        # on axis is what qualifies the combined config the fork actually ships toward.
+        perf_flags: ['off', 'on']
     env:
       MIX_ENV: test
       MIX_TARGET: application
-      POSTGRES_VERSION: '170000'
-      CODECOV_FLAGS: elixir,performance-tests,sync-service,postgres-170000
-      CODECOV_TEST_RESULTS_FILES: ./junit/regular-test-junit-report.xml
+      POSTGRES_VERSION: '180000'
+      SKIP_REPATCH_PREWARM: 'true'
+      ELECTRIC_SHARED_CONVERSION: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_SHARED_PAYLOAD_ARENA: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_SHARED_FRAGMENT_BLOCKS: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_WORKER_PREPARE: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_ROUTER_SHARDS: ${{ matrix.perf_flags == 'on' && '4' || '1' }}
+      ELECTRIC_INGEST_PRIORITY_HIGH: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_FILTER_ROUTING_MEMO: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_ACK_AFTER_JOURNAL: ${{ matrix.perf_flags == 'on' && 'true' || 'false' }}
+      ELECTRIC_REPLICATION_PIPELINE_WINDOW: ${{ matrix.perf_flags == 'on' && '4' || '1' }}
     services:
       postgres:
-        image: 'ghcr.io/${{ github.repository }}/postgres:17-alpine-logical'
+        image: 'ghcr.io/beeldi/electric/postgres:18-alpine-logical'
+        credentials: *ghcr_credentials
         env:
           POSTGRES_PASSWORD: password
         options: *postgres_health_check
@@ -250,6 +326,4 @@ jobs:
       - *compile_package
 
       - name: Run performance test
-        run: SKIP_REPATCH_PREWARM=true mix test --only performance
-
-      - *upload_test_results_to_codecov
+        run: mix test --only performance

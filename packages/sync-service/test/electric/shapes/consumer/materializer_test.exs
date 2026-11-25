@@ -8,6 +8,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
   alias Electric.LogItems
   alias Electric.Replication.Changes
   alias Electric.ShapeCache.Storage
+  alias Electric.ShapeCache.PureFileStorage
   alias Electric.Shapes.ConsumerRegistry
   alias Electric.Replication.LogOffset
   alias Electric.Shapes.Consumer.Materializer
@@ -27,6 +28,23 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     root_pk: ["id"],
     storage: %{compaction: :disabled}
   }
+
+  test "preserves full transaction provenance until fragmented changes commit", ctx do
+    ctx = with_materializer(ctx)
+
+    Materializer.new_changes(ctx, [%Changes.NewRecord{key: "1", record: %{"value" => "10"}}],
+      commit: false,
+      xid: 10,
+      full_xid: 4_294_967_306
+    )
+
+    refute_received {:materializer_changes, _, _}
+
+    Materializer.new_changes(ctx, [], xid: 10)
+
+    assert_receive {:materializer_changes, _,
+                    %{move_in: [{10, "10"}], txids: [10], txids8: [4_294_967_306]}}
+  end
 
   setup %{storage: storage, stack_id: stack_id} = ctx do
     ConsumerRegistry.register_consumer(self(), "test", stack_id)
@@ -342,23 +360,65 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
     @tag snapshot_data: [
            %Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}
          ]
-    test "insert of a PK we've already seen raises", ctx do
+    test "insert of a PK we've already seen stops the materializer with a tagged shutdown", ctx do
       ctx = with_materializer(ctx)
 
       assert Materializer.get_link_values(ctx) == MapSet.new([10])
 
       pid = GenServer.whereis(Materializer.name(ctx))
       Process.unlink(pid)
+      ref = Process.monitor(pid)
 
-      try do
-        Materializer.new_changes(
-          ctx,
-          [%Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}] |> prep_changes()
-        )
-      catch
-        :exit, {{reason, _}, _} ->
-          assert reason.message =~ ~r/Key .* already exists/
-      end
+      log =
+        capture_log(fn ->
+          assert {:error, :duplicate_key} =
+                   Materializer.new_changes(
+                     ctx,
+                     [%Changes.NewRecord{record: %{"id" => "1", "value" => "20"}}]
+                     |> prep_changes()
+                   )
+
+          assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :duplicate_key}}
+        end)
+
+      assert log =~ "received a key it already holds"
+      refute log =~ ~s|"1"|
+    end
+
+    # Under a deferrable primary key, an update can move a row onto a key another row still holds.
+    @tag snapshot_data: {
+           [
+             %Changes.NewRecord{record: %{"id" => "1", "value" => "10"}},
+             %Changes.NewRecord{record: %{"id" => "2", "value" => "20"}}
+           ],
+           [pk_cols: ["id"]]
+         }
+    test "update that moves a row onto a PK we hold stops the materializer", ctx do
+      ctx = with_materializer(ctx)
+
+      assert Materializer.get_link_values(ctx) == MapSet.new([10, 20])
+
+      pid = GenServer.whereis(Materializer.name(ctx))
+      Process.unlink(pid)
+      ref = Process.monitor(pid)
+
+      capture_log(fn ->
+        assert {:error, :duplicate_key} =
+                 Materializer.new_changes(
+                   ctx,
+                   [
+                     %Changes.UpdatedRecord{
+                       record: %{"id" => "2", "value" => "10"},
+                       old_record: %{"id" => "1", "value" => "10"}
+                     }
+                   ]
+                   |> prep_changes()
+                 )
+
+        assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :duplicate_key}}
+      end)
+
+      refute_received {:materializer_changes, _, _}
     end
 
     test "delete of a PK we've not seen throws an error", ctx do
@@ -1049,6 +1109,37 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
 
       assert Materializer.get_link_values(ctx) == MapSet.new()
     end
+
+    test "stored nested move events preserve full transaction provenance",
+         %{writer: writer} = ctx do
+      ctx = with_materializer(ctx)
+
+      Materializer.new_changes(ctx, [
+        %Changes.NewRecord{key: "1", record: %{"value" => "10"}, move_tags: ["tag1"]}
+      ])
+
+      assert_receive {:materializer_changes, _, %{move_in: [{10, "10"}]}}
+
+      {range, _writer} =
+        Storage.append_control_message!(
+          Jason.encode!(%{
+            headers: %{
+              event: "move-out",
+              patterns: [%{pos: 0, value: "tag1"}],
+              txids: [10],
+              txids8: ["8589934602"]
+            }
+          }),
+          writer
+        )
+
+      Materializer.new_changes(ctx, range)
+
+      assert_receive {:materializer_changes, _,
+                      %{move_out: [{10, "10"}], txids: [10], txids8: [8_589_934_602]}}
+
+      assert Materializer.get_link_values(ctx) == MapSet.new()
+    end
   end
 
   describe "DNF: multiple tags per row with active_conditions" do
@@ -1263,6 +1354,62 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
 
       assert Materializer.get_link_values(ctx) == MapSet.new([20])
       assert_receive {:materializer_changes, _, %{move_out: [{10, "10"}]}}
+    end
+  end
+
+  # A move event's string is hashed into the tag the subscriber matches rows against, and
+  # those row tags were produced by Postgres from the column's own text. So the string a
+  # move-out carries has to be the text the row arrived with, byte for byte — anything
+  # re-rendered from the parsed value matches nothing, and the rows stay in the shape.
+  describe "move events carry the text the row arrived with" do
+    @tag snapshot_data: [
+           %Changes.NewRecord{record: %{"id" => "1", "value" => "2025-01-15 14:30:00"}}
+         ]
+    test "for a timestamp, whose Postgres text is space-separated", ctx do
+      ctx = with_materializer(ctx, materialized_type: {:array, :timestamp})
+
+      Materializer.new_changes(
+        ctx,
+        [%Changes.DeletedRecord{old_record: %{"id" => "1", "value" => "2025-01-15 14:30:00"}}]
+        |> prep_changes()
+      )
+
+      assert_receive {:materializer_changes, _, %{move_out: [{_, "2025-01-15 14:30:00"}]}}
+    end
+
+    @tag snapshot_data: [
+           %Changes.NewRecord{record: %{"id" => "1", "value" => "2025-01-15 14:30:00+00"}}
+         ]
+    test "for a timestamptz, whose text Postgres renders in the session time zone", ctx do
+      ctx = with_materializer(ctx, materialized_type: {:array, :timestamptz})
+
+      Materializer.new_changes(
+        ctx,
+        [%Changes.DeletedRecord{old_record: %{"id" => "1", "value" => "2025-01-15 14:30:00+00"}}]
+        |> prep_changes()
+      )
+
+      assert_receive {:materializer_changes, _, %{move_out: [{_, "2025-01-15 14:30:00+00"}]}}
+    end
+
+    @tag snapshot_data: [
+           %Changes.NewRecord{record: %{"id" => "1", "value" => "{a,b}"}},
+           %Changes.NewRecord{record: %{"id" => "2", "value" => "{ab}"}}
+         ]
+    test "for arrays, whose two distinct values must not render the same", ctx do
+      ctx = with_materializer(ctx, materialized_type: {:array, {:array, :text}})
+
+      Materializer.new_changes(
+        ctx,
+        [
+          %Changes.DeletedRecord{old_record: %{"id" => "1", "value" => "{a,b}"}},
+          %Changes.DeletedRecord{old_record: %{"id" => "2", "value" => "{ab}"}}
+        ]
+        |> prep_changes()
+      )
+
+      assert_receive {:materializer_changes, _, %{move_out: move_out}}
+      assert move_out |> Enum.map(&elem(&1, 1)) |> Enum.sort() == ["{a,b}", "{ab}"]
     end
   end
 
@@ -1524,6 +1671,122 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
       # exactly once.
       assert Materializer.get_link_values(mat_ctx) == MapSet.new([10, 20, 30])
     end
+
+    # A replay can catch up with a snapshot still being written: it reads chunk 0, then waits for
+    # chunk 1 or for the record of the snapshot's end, while the log already holds changes made
+    # after the snapshot started. Once the end is recorded, the read streams the log: answered with
+    # nothing, it left the replay to take the end's pointer into the log as read.
+    test "replays the log when the snapshot's end is recorded while the replay waits for it",
+         ctx do
+      log_offset = LogOffset.new(100, 0)
+
+      {shape_handle, snapshot_writer} =
+        start_snapshot_holding_its_end(ctx, log_entry(log_offset, :insert, "2", "99"))
+
+      test_pid = self()
+
+      # The wait checks that the shape still exists before each sleep.
+      pid =
+        start_replay(ctx, shape_handle, log_offset, :shape_gone?, fn _opts ->
+          unless Process.get(:snapshot_end_recorded) do
+            record_held_snapshot_end(snapshot_writer)
+            Process.put(:snapshot_end_recorded, true)
+            send(test_pid, :snapshot_end_recorded_during_wait)
+          end
+
+          false
+        end)
+
+      mat_ctx = %{stack_id: ctx.stack_id, shape_handle: shape_handle}
+      assert Materializer.wait_until_ready(mat_ctx) == :ok
+      assert_received :snapshot_end_recorded_during_wait
+      # An insert of a key the snapshot does not hold: replayed twice, the materializer raises.
+      assert Materializer.get_link_values(mat_ctx) == MapSet.new([10, 99])
+      assert Process.alive?(pid)
+    end
+  end
+
+  # Writes a one-row snapshot (value 10) after the given log entry, and holds it with chunk 0
+  # complete and its end not yet recorded until `record_held_snapshot_end/1`.
+  defp start_snapshot_holding_its_end(ctx, log_entry) do
+    shape_handle = "held-snapshot-#{System.unique_integer()}"
+
+    storage = Storage.for_shape(shape_handle, ctx.storage)
+    Storage.start_link(storage)
+    writer = Storage.init_writer!(storage, @shape)
+    Storage.mark_snapshot_as_started(storage)
+    writer = Storage.append_to_log!([log_entry], writer)
+    Storage.hibernate(writer)
+
+    test_pid = self()
+    rows = make_snapshot_data([%Changes.NewRecord{record: %{"id" => "1", "value" => "10"}}])
+
+    held_end =
+      Stream.resource(
+        fn ->
+          send(test_pid, :snapshot_chunk_written)
+
+          receive do
+            {:record_snapshot_end, from} -> Process.put(:snapshot_end_waiter, from)
+          end
+        end,
+        fn acc -> {:halt, acc} end,
+        fn _ -> :ok end
+      )
+
+    snapshot_writer =
+      spawn_link(fn ->
+        Storage.make_new_snapshot!(Stream.concat([rows, [:chunk_boundary], held_end]), storage)
+        send(Process.get(:snapshot_end_waiter), :snapshot_end_recorded)
+      end)
+
+    assert_receive :snapshot_chunk_written
+    {shape_handle, snapshot_writer}
+  end
+
+  defp record_held_snapshot_end(snapshot_writer) do
+    send(snapshot_writer, {:record_snapshot_end, self()})
+
+    receive do
+      :snapshot_end_recorded -> :ok
+    after
+      5_000 -> raise "the snapshot's end was not recorded"
+    end
+  end
+
+  # Starts a materializer subscribed at `subscribed_offset`, with the storage's private `name/1`
+  # patched for the materializer only.
+  defp start_replay(ctx, shape_handle, subscribed_offset, name, fun) do
+    ConsumerRegistry.register_consumer(self(), shape_handle, ctx.stack_id)
+
+    {:ok, pid} =
+      Materializer.start_link(%{
+        stack_id: ctx.stack_id,
+        shape_handle: shape_handle,
+        storage: ctx.storage,
+        columns: ["value"],
+        materialized_type: {:array, :int8}
+      })
+
+    Repatch.patch(PureFileStorage, name, [mode: :shared], fun)
+    Repatch.allow(self(), pid)
+
+    respond_to_call(:await_snapshot_start, :started)
+    respond_to_call(:subscribe_materializer, {:ok, subscribed_offset})
+    pid
+  end
+
+  defp log_entry(offset, operation, id, value) do
+    key = ~s|"public"."test_table"/"#{id}"|
+
+    json =
+      Jason.encode!(%{
+        "key" => key,
+        "value" => %{"id" => id, "value" => value},
+        "headers" => %{"operation" => Atom.to_string(operation)}
+      })
+
+    {offset, key, operation, json}
   end
 
   describe "startup race condition handling" do
@@ -1593,7 +1856,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
 
       # The Materializer should shut down gracefully when the GenServer.call exits.
       # We accept :shutdown (normal case) or :noproc (if process exited before monitor was set up)
-      assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1000
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason}
       assert reason in [:shutdown, :noproc]
     end
 
@@ -1640,7 +1903,7 @@ defmodule Electric.Shapes.Consumer.MaterializerTest do
       ref = Process.monitor(pid)
 
       # We accept :shutdown (normal case) or :noproc (if process exited before monitor was set up)
-      assert_receive {:DOWN, ^ref, :process, ^pid, reason}, 1000
+      assert_receive {:DOWN, ^ref, :process, ^pid, reason}
       assert reason in [:shutdown, :noproc]
     end
   end

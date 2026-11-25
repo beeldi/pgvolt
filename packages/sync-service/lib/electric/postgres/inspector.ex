@@ -17,7 +17,9 @@ defmodule Electric.Postgres.Inspector do
           type_id: {typid :: non_neg_integer(), typmod :: integer()},
           array_dimensions: non_neg_integer(),
           not_null: boolean(),
-          array_type: String.t()
+          deterministic_collation: boolean() | nil,
+          array_type: String.t(),
+          array_element_kind: type_kind() | nil
         }
 
   @type relation_info :: %{
@@ -56,7 +58,7 @@ defmodule Electric.Postgres.Inspector do
   @callback list_relations_with_stale_cache(opts :: term()) ::
               {:ok, [Electric.oid_relation()]} | :error
 
-  @callback reset(opts :: term()) :: :ok
+  @callback reset(opts :: term()) :: :ok | {:error, term()}
 
   @type inspector :: {module(), opts :: term()}
 
@@ -145,6 +147,9 @@ defmodule Electric.Postgres.Inspector do
   @spec columns_to_expr([column_info(), ...]) :: Parser.refs_map()
   def columns_to_expr(columns) when is_list(columns) do
     Map.new(columns, fn
+      %{name: name, array_type: arr_type, array_element_kind: :enum} when not is_nil(arr_type) ->
+        {[name], {:array, {:enum, arr_type}}}
+
       %{name: name, array_type: arr_type} when not is_nil(arr_type) ->
         {[name], {:array, as_atom(arr_type)}}
 
@@ -169,7 +174,7 @@ defmodule Electric.Postgres.Inspector do
   @doc """
   Drop the entire inspector cache. Inspectors without a cache are a no-op.
   """
-  @spec reset(inspector()) :: :ok
+  @spec reset(inspector()) :: :ok | {:error, term()}
   def reset({module, opts}) do
     module.reset(opts)
   end

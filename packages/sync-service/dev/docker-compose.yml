@@ -4,6 +4,9 @@ name: 'electric_dev'
 services:
   postgres:
     image: postgres:18-alpine
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: electric
       POSTGRES_USER: postgres
@@ -17,6 +20,7 @@ services:
     tmpfs:
       - /var/lib/postgresql
       - /tmp
+      - /var/run/postgresql
     command:
       - -c
       - config_file=/etc/postgresql.conf
@@ -27,6 +31,9 @@ services:
       retries: 5
   postgres2:
     image: postgres:18-alpine
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: electric
       POSTGRES_USER: postgres
@@ -40,11 +47,20 @@ services:
     tmpfs:
       - /var/lib/postgresql
       - /tmp
+      - /var/run/postgresql
     command:
       - -c
       - config_file=/etc/postgresql.conf
   pgbouncer:
     image: bitnamilegacy/pgbouncer:latest
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /opt/bitnami/pgbouncer/conf
+      - /opt/bitnami/pgbouncer/tmp
+      - /opt/bitnami/pgbouncer/logs
     environment:
       PGBOUNCER_AUTH_TYPE: trust
       PGBOUNCER_DATABASE: '*'
@@ -59,9 +75,15 @@ services:
       - postgres
   nginx:
     image: nginx:latest
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/run
     ports:
       - '3002:3002'
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf
+      - /var/cache/nginx
     extra_hosts:
       - 'host.docker.internal:host-gateway'

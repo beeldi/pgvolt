@@ -33,6 +33,13 @@ defmodule Electric.CoreSupervisor do
     Supervisor.init(children, strategy: :one_for_one, auto_shutdown: :any_significant)
   end
 
+  # The publication manager's drains share the admin pool with every other user of it. Sized as
+  # `Connection.Manager` sizes the pool it starts.
+  defp admin_pool_size(nil), do: nil
+
+  defp admin_pool_size(pool_opts),
+    do: Electric.Connection.Manager.pool_sizes(Keyword.get(pool_opts, :pool_size, 2)).admin
+
   @doc """
   This function is supposed to be called from Connection.Manager at the right point in its
   initialization sequence.
@@ -62,6 +69,9 @@ defmodule Electric.CoreSupervisor do
        publication_name: Keyword.fetch!(replication_opts, :publication_name),
        manual_table_publishing?: Keyword.fetch!(opts, :manual_table_publishing?),
        db_pool: Electric.Connection.Manager.admin_pool(stack_id),
+       admin_pool_size: admin_pool_size(Keyword.get(opts, :pool_opts)),
+       persistent_kv: persistent_kv,
+       database_timeline: Keyword.fetch!(opts, :database_timeline),
        update_debounce_timeout: Keyword.get(tweaks, :publication_alter_debounce_ms, 0),
        refresh_period: Keyword.get(tweaks, :publication_refresh_period, 60_000)}
 
@@ -78,6 +88,11 @@ defmodule Electric.CoreSupervisor do
     expiry_manager_spec =
       {Electric.ShapeCache.ExpiryManager, max_shapes: max_shapes, stack_id: stack_id}
 
+    # Never restarted in place: Postgres resends the transactions its consumers had not
+    # flushed only to a new replication connection. So when it stops on its own (on any exit of
+    # a child, which it does not restart), the core stops with it (`significant: true` with
+    # `auto_shutdown: :any_significant`), and so does the stack. `stop_shapes_supervisor/1`
+    # does not count.
     child_spec =
       Supervisor.child_spec(
         {
@@ -90,7 +105,8 @@ defmodule Electric.CoreSupervisor do
           schema_reconciler: schema_reconciler_spec,
           expiry_manager: expiry_manager_spec
         },
-        restart: :transient
+        restart: :temporary,
+        significant: true
       )
 
     Supervisor.start_child(name(opts), child_spec)
@@ -103,9 +119,9 @@ defmodule Electric.CoreSupervisor do
   Returns :ok if the supervisor was stopped or wasn't running.
   """
   def stop_shapes_supervisor(opts) do
+    # A temporary child's spec goes away with the process, so there is nothing to delete.
     case Supervisor.terminate_child(name(opts), Electric.Shapes.Supervisor) do
       :ok ->
-        Supervisor.delete_child(name(opts), Electric.Shapes.Supervisor)
         :ok
 
       {:error, :not_found} ->

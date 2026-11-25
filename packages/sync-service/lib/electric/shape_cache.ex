@@ -9,6 +9,7 @@ defmodule Electric.ShapeCache do
   alias Electric.ShapeCache.ShapeCleaner
   alias Electric.Shapes.Shape
   alias Electric.Telemetry.OpenTelemetry
+  alias Electric.Telemetry.RequestValues
 
   import Electric, only: [is_stack_id: 1, is_shape_handle: 1]
 
@@ -92,12 +93,28 @@ defmodule Electric.ShapeCache do
         else: fetch_handle_by_shape(shape, stack_id)
 
     with {:ok, resolved_handle} <- result,
+         true <- servable_shape?(stack_id, resolved_handle, opts[:read_only?]),
          {:ok, offset} <- fetch_latest_offset(stack_id, resolved_handle, opts) do
       {resolved_handle, offset}
     else
       _ -> nil
     end
   end
+
+  # The connected owner can have completed snapshots whose catalog writes are still buffered.
+  # A standby serves the shapes it loaded as complete, while SQLite still says so: the owner may
+  # have removed one since. A shape completed after that load has no metadata here, so the
+  # snapshot wait and the log stream would both refuse it; like a shape created after the boot,
+  # it waits for takeover. Only SQLite saying incomplete overrides the load. A read that fails,
+  # such as one that meets the owner's lock past the busy timeout, says nothing about the shape:
+  # taken as a removal, it sent a live client to refetch the whole shape.
+  defp servable_shape?(stack_id, shape_handle, true) do
+    Electric.StatusMonitor.status(stack_id).conn == :up or
+      (ShapeStatus.has_shape_handle?(stack_id, shape_handle) and
+         ShapeStatus.ShapeDb.snapshot_complete?(stack_id, shape_handle) != false)
+  end
+
+  defp servable_shape?(_stack_id, _shape_handle, _read_only?), do: true
 
   @spec list_shapes(stack_id()) :: [{shape_handle(), Shape.t()}] | :error
   def list_shapes(stack_id) when is_stack_id(stack_id) do
@@ -249,11 +266,49 @@ defmodule Electric.ShapeCache do
           {:ok, pid()} | {:error, :no_shape}
   def start_consumer_for_handle(shape_handle, stack_id, opts \\ [])
       when is_shape_handle(shape_handle) and is_stack_id(stack_id) do
-    GenServer.call(
-      name(stack_id),
-      {:start_consumer_for_handle, shape_handle, opts[:otel_ctx]},
-      @call_timeout
+    # The wait gets the budget the collector gives a router worker before it restarts the stack.
+    # A collector with one router shard publishes from its own process, where no stall check
+    # runs, so the budget has to be enforced here.
+    wait =
+      Keyword.get_lazy(opts, :shape_db_wait, fn ->
+        Electric.StackConfig.lookup(
+          stack_id,
+          :gather_stall_timeout,
+          Electric.Config.default(:gather_stall_timeout)
+        )
+      end)
+
+    start_consumer_for_handle_until(
+      shape_handle,
+      stack_id,
+      opts[:otel_ctx],
+      System.monotonic_time(:millisecond) + wait
     )
+  end
+
+  defp start_consumer_for_handle_until(shape_handle, stack_id, otel_ctx, deadline) do
+    case GenServer.call(
+           name(stack_id),
+           {:start_consumer_for_handle, shape_handle, otel_ctx},
+           @call_timeout
+         ) do
+      # Asking again from the caller leaves the ShapeCache free to serve shape requests between
+      # two attempts. Past the deadline the caller gets the error, and ConsumerRegistry restarts
+      # the stack as the timeout did before.
+      {:error, :shape_db_busy} = busy ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Logger.warning(
+            "Starting the consumer for shape #{shape_handle} is waiting for the busy ShapeDb connection"
+          )
+
+          start_consumer_for_handle_until(shape_handle, stack_id, otel_ctx, deadline)
+        else
+          busy
+        end
+
+      result ->
+        result
+    end
   end
 
   @impl GenServer
@@ -287,9 +342,8 @@ defmodule Electric.ShapeCache do
     Electric.Replication.PublicationManager.wait_for_restore(state.stack_id)
 
     # Shapes involved in a subquery are dropped rather than restored on restart
-    # (see `ShapeStatus.prune_subquery_shapes/1`, called from ShapeLogCollector's
-    # restore before any routing or consumer state is rebuilt), so there is
-    # nothing to eagerly start here.
+    # (see ShapeLogCollector's restore, which prunes them before any consumer
+    # state is rebuilt), so there is nothing to eagerly start here.
 
     # Let ShapeLogCollector that it can start processing after finishing this function so that
     # we're subscribed to the producer before it starts forwarding its demand.
@@ -320,11 +374,16 @@ defmodule Electric.ShapeCache do
            feature_flags: state.feature_flags
          }) do
       {:ok, {shape_handle, latest_offset}} ->
-        Logger.debug("Returning shape id #{shape_handle} for shape #{inspect(shape)}")
+        Logger.debug(
+          "Returning shape id #{shape_handle} for shape #{Shape.log_description(shape)}"
+        )
+
         {:reply, {shape_handle, latest_offset}, state}
 
       {:error, reason} ->
-        Logger.warning("Failed to create shape for #{inspect(shape)}: #{inspect(reason)}")
+        Logger.warning(
+          "Failed to create shape for #{Shape.log_description(shape)}: #{RequestValues.inspect_error(reason)}"
+        )
 
         {:reply, {:error, reason}, state}
     end
@@ -359,9 +418,12 @@ defmodule Electric.ShapeCache do
       {:error, {:exit, reason}}
 
     :error, exception ->
-      Logger.error(
-        "Failed to create shape #{inspect(shape)}: #{Exception.format(:error, exception, __STACKTRACE__)}"
-      )
+      stacktrace = __STACKTRACE__
+
+      Logger.error(fn ->
+        detail = RequestValues.format_error(:error, exception, stacktrace)
+        "Failed to create shape #{Shape.log_description(shape)}: #{detail}"
+      end)
 
       {:error, exception}
   end
@@ -383,7 +445,9 @@ defmodule Electric.ShapeCache do
 
           {:ok, shape_handle} = ShapeStatus.add_shape(stack_id, shape)
 
-          Logger.info("Creating new shape for #{inspect(shape)} with handle #{shape_handle}")
+          Logger.info(
+            "Creating new shape for #{Shape.log_description(shape)} with handle #{shape_handle}"
+          )
 
           case start_shape(shape_handle, shape, Map.put(opts, :action, :create)) do
             {:ok, _pid} ->
@@ -400,7 +464,7 @@ defmodule Electric.ShapeCache do
   end
 
   # An existing inner shape may have no running consumer: a subquery dependency whose parent
-  # was removed survives `ShapeStatus.prune_subquery_shapes/1` on restart as a plain shape,
+  # was removed survives the prune of subquery shapes on restart as a plain shape,
   # and consumers for restored shapes only start lazily on transaction routing.
   defp ensure_inner_consumer_running(
          shape_handle,
@@ -480,6 +544,12 @@ defmodule Electric.ShapeCache do
       :error ->
         {:error, :no_shape}
     end
+  catch
+    # Readers share the one ShapeDb connection in exclusive mode, and a boot restore or a bulk
+    # shape cleanup can hold it past the read's checkout deadline. Exiting here crashed the
+    # ShapeCache and with it the whole stack. The handle is not :no_shape either: that answer
+    # drops the transaction for a shape that still exists.
+    :exit, {:timeout, {NimblePool, :checkout, _args}} -> {:error, :shape_db_busy}
   end
 
   # start_shape assumes that any dependent shapes already have running consumers
@@ -511,7 +581,7 @@ defmodule Electric.ShapeCache do
       {:error, failed_handle} ->
         if failed_handle != shape_handle do
           Logger.warning(
-            "Failed to start consumer for shape: error starting consumer for inner shape",
+            "Failed to start consumer for shape: error starting consumer for inner shape #{failed_handle}",
             shape_handle: shape_handle,
             failed_handle: failed_handle
           )
@@ -553,7 +623,8 @@ defmodule Electric.ShapeCache do
 
   @spec fetch_latest_offset(stack_id(), shape_handle(), keyword()) ::
           {:ok, LogOffset.t()} | :error
-  defp fetch_latest_offset(stack_id, shape_handle, opts \\ []) do
+  @doc false
+  def fetch_latest_offset(stack_id, shape_handle, opts \\ []) do
     storage =
       Storage.for_shape(shape_handle, Storage.for_stack(stack_id, read_only?: opts[:read_only?]))
 

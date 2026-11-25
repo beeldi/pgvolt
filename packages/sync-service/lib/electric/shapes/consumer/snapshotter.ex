@@ -58,44 +58,55 @@ defmodule Electric.Shapes.Consumer.Snapshotter do
             stack_id,
             fn ->
               try do
-                OpenTelemetry.with_span(
-                  "shape_snapshot.prepare_tables",
-                  span_attrs,
-                  stack_id,
-                  fn ->
-                    Electric.Replication.PublicationManager.add_shape(
-                      stack_id,
-                      shape_handle,
-                      shape
-                    )
-                  end
-                )
+                case prepare_tables(state, span_attrs) do
+                  :ok ->
+                    if not Storage.snapshot_started?(storage) do
+                      start_streaming_snapshot_from_db(consumer, shape_handle, shape, %{
+                        stack_id: stack_id,
+                        storage: storage
+                      })
+                    else
+                      # Let the shape cache know that the snapshot is available. When the
+                      # shape cache starts and restores the shapes from disk, it doesn't
+                      # know about the snapshot status of each shape, and because the
+                      # storage does some clean up on start, e.g. in the case of a format
+                      # upgrade, we only know the actual on-disk state of the shape data
+                      # once things are running.
+                      GenServer.cast(consumer, {:snapshot_exists, shape_handle})
+                    end
 
-                if not Storage.snapshot_started?(state.storage) do
-                  start_streaming_snapshot_from_db(consumer, shape_handle, shape, %{
-                    stack_id: stack_id,
-                    storage: storage
-                  })
-                else
-                  # Let the shape cache know that the snapshot is available. When the
-                  # shape cache starts and restores the shapes from disk, it doesn't
-                  # know about the snapshot status of each shape, and because the
-                  # storage does some clean up on start, e.g. in the case of a format
-                  # upgrade, we only know the actual on-disk state of the shape data
-                  # once things are running.
-                  GenServer.cast(consumer, {:snapshot_exists, shape_handle})
+                  {:error, error} ->
+                    release_name(state)
+                    GenServer.cast(consumer, {:publication_admission_failed, shape_handle, error})
                 end
               rescue
                 error ->
+                  release_name(state)
+
                   GenServer.cast(
                     consumer,
                     {:snapshot_failed, shape_handle, SnapshotError.from_error(error)}
                   )
               catch
                 :exit, {:timeout, {GenServer, :call, _}} ->
+                  release_name(state)
+
                   GenServer.cast(
                     consumer,
                     {:snapshot_failed, shape_handle, SnapshotError.table_lock_timeout()}
+                  )
+
+                # Everything else reaching here is an explicit exit from the wait below — a task that
+                # went down for a reason that was not an exception is the ordinary one. The
+                # consumer reads no failure from this process's exit, so letting the exit through
+                # told it nothing at all: it kept the shape pending a snapshot that would never
+                # arrive, and every waiter sat there until its own call timed out.
+                :exit, reason ->
+                  release_name(state)
+
+                  GenServer.cast(
+                    consumer,
+                    {:snapshot_failed, shape_handle, SnapshotError.exited(reason)}
                   )
               end
             end
@@ -112,6 +123,24 @@ defmodule Electric.Shapes.Consumer.Snapshotter do
       end
 
     result
+  end
+
+  defp prepare_tables(%{stack_id: stack_id, shape_handle: shape_handle, shape: shape}, span_attrs) do
+    OpenTelemetry.with_span("shape_snapshot.prepare_tables", span_attrs, stack_id, fn ->
+      Electric.Replication.PublicationManager.add_shape(stack_id, shape_handle, shape)
+    end)
+  rescue
+    error -> {:error, SnapshotError.from_error(error)}
+  catch
+    :exit, reason -> {:error, SnapshotError.exited(reason)}
+  end
+
+  # The consumer suspends on a transient failure, the next request restores it, and the restored
+  # consumer starts its snapshotter under this one's name, so this one gives the name up before it
+  # reports. The snapshot's task has ended by then, and nothing here writes again.
+  defp release_name(%{stack_id: stack_id, shape_handle: shape_handle}) do
+    {:via, Registry, {registry, key}} = name(stack_id, shape_handle)
+    Registry.unregister(registry, key)
   end
 
   @doc false

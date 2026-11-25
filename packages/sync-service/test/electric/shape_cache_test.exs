@@ -23,7 +23,7 @@ defmodule Electric.ShapeCacheTest do
       patch_shape_status: 1,
       patch_shape_cache: 1,
       complete_txn_fragment: 3,
-      wait_until: 2
+      wait_until: 1
     ]
 
   @stub_inspector Support.StubInspector.new(
@@ -173,9 +173,8 @@ defmodule Electric.ShapeCacheTest do
       {shape_handle, offset} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
       assert offset == @zero_offset
       assert :started = ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
-      Process.sleep(100)
       shape_storage = Storage.for_shape(shape_handle, storage)
-      assert Storage.snapshot_started?(shape_storage)
+      assert wait_until(fn -> Storage.snapshot_started?(shape_storage) end)
     end
 
     test "triggers table prep and snapshot creation only once", ctx do
@@ -272,6 +271,23 @@ defmodule Electric.ShapeCacheTest do
                GenServer.call(link_pid, {:create_or_wait_shape_handle, @shape, nil})
 
       assert_received {:called, :create_snapshot_fn}
+    end
+
+    test "reports a failure when the snapshot exits instead of raising", ctx do
+      # Nothing monitors the snapshotter, so an exit it does not report is an exit nobody hears: the
+      # shape stays pending forever and every waiter parks until its own call times out.
+      Support.TestUtils.patch_snapshotter(fn _consumer, _shape_handle, _shape, _ctx ->
+        exit(:snapshot_task_went_down)
+      end)
+
+      with_shape_cache(ctx)
+
+      {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id)
+
+      assert {:error, %Electric.SnapshotError{type: :unknown, message: message}} =
+               ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id)
+
+      assert message =~ "snapshot_task_went_down"
     end
 
     test "shape gets cleaned up if terminated unexpectedly", %{storage: storage} = ctx do
@@ -505,6 +521,9 @@ defmodule Electric.ShapeCacheTest do
     end
 
     @tag stack_config_seed: [snapshot_timeout_to_first_data: 500]
+    # The timeout drops the slow query's connection. Let the pool replace it, as normal
+    # pools do, instead of shutting down and killing the test process linked to it.
+    @tag connection_opt_overrides: [max_restarts: 1]
     test "crashes when initial snapshot query fails to return data quickly enough", %{
       shape: shape,
       stack_id: stack_id
@@ -1053,7 +1072,7 @@ defmodule Electric.ShapeCacheTest do
       # is stuck waiting on the snapshot start), the consumer process won't handle any other
       # exit reason in a timely manner.
       Process.exit(consumer_pid, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, _}, 1_000
+      assert_receive {:DOWN, ^ref, :process, ^consumer_pid, _}
 
       assert ShapeStatus.has_shape_handle?(ctx.stack_id, shape_handle)
       refute ShapeStatus.snapshot_started?(ctx.stack_id, shape_handle)
@@ -1112,20 +1131,17 @@ defmodule Electric.ShapeCacheTest do
           Electric.ShapeCache.ShapeCleaner.consumer_suspend_reason()
         )
 
-      assert wait_until(
-               fn ->
-                 is_nil(Electric.Shapes.Consumer.whereis(ctx.stack_id, dependency_handle)) and
-                   is_nil(
-                     GenServer.whereis(
-                       Electric.Shapes.Consumer.Materializer.name(
-                         ctx.stack_id,
-                         dependency_handle
-                       )
+      assert wait_until(fn ->
+               is_nil(Electric.Shapes.Consumer.whereis(ctx.stack_id, dependency_handle)) and
+                 is_nil(
+                   GenServer.whereis(
+                     Electric.Shapes.Consumer.Materializer.name(
+                       ctx.stack_id,
+                       dependency_handle
                      )
                    )
-               end,
-               1_000
-             )
+                 )
+             end)
 
       assert ShapeStatus.has_shape_handle?(ctx.stack_id, dependency_handle)
       assert ShapeStatus.snapshot_started?(ctx.stack_id, dependency_handle)
@@ -1225,11 +1241,56 @@ defmodule Electric.ShapeCacheTest do
       Task.await(creation_task)
 
       # We're asserting that the snapshot *eventually* starts once the consumer comes up,
-      # not that it does so within a few seconds. This normally resolves in well under a
-      # second; the generous-but-bounded timeout absorbs CI scheduler/PG load spikes (which
-      # occasionally pushed the old 5.3s bound over the edge) while still failing reasonably
-      # fast on a genuine hang — see https://github.com/electric-sql/electric/issues/4712.
-      assert :started = Task.await(wait_task, 15_000)
+      # not that it does so within a few seconds — so this waits on the suite's own per-test
+      # timeout rather than carrying a second, smaller, arbitrary one. A real hang still
+      # fails, at the ExUnit timeout, and names this test instead of surfacing as a
+      # Task.await EXIT.
+      assert :started = Task.await(wait_task, :infinity)
+    end
+
+    test "answers a waiter that reaches the consumer before its shape is initialized", ctx do
+      Support.TestUtils.patch_snapshotter(fn parent, shape_handle, _, _ ->
+        GenServer.cast(parent, {:pg_snapshot_known, shape_handle, @pg_snapshot_xmin_100})
+        GenServer.cast(parent, {:snapshot_started, shape_handle})
+      end)
+
+      test_pid = self()
+
+      # The consumer is registered as soon as it starts, but only learns its shape from the
+      # {:initialize_shape, ...} message ShapeCache sends after the start returns. Hold
+      # ShapeCache in between so a waiter can get in first.
+      Repatch.patch(
+        Electric.Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn stack_id, config ->
+          {:ok, consumer_pid} =
+            Repatch.real(
+              Electric.Shapes.DynamicConsumerSupervisor.start_shape_consumer(stack_id, config)
+            )
+
+          send(test_pid, {:consumer_started, consumer_pid, self()})
+
+          receive do
+            :initialize_consumer -> {:ok, consumer_pid}
+          end
+        end
+      )
+
+      creation_task =
+        Task.async(fn -> ShapeCache.get_or_create_shape_handle(@shape, ctx.stack_id) end)
+
+      assert_receive {:consumer_started, consumer_pid, shape_cache_pid}
+      {:ok, shape_handle} = ShapeCache.fetch_handle_by_shape(@shape, ctx.stack_id)
+
+      wait_task =
+        Task.async(fn -> ShapeCache.await_snapshot_start(shape_handle, ctx.stack_id) end)
+
+      await_for_consumer_to_have_waiters(consumer_pid)
+      send(shape_cache_pid, :initialize_consumer)
+
+      assert {^shape_handle, _} = Task.await(creation_task)
+      assert :started = Task.await(wait_task)
     end
 
     test "should not loop forever waiting for consumer to come up", ctx do
@@ -1318,7 +1379,7 @@ defmodule Electric.ShapeCacheTest do
       stop_supervised(ctx[:shape_status_owner])
 
       assert {:error, %RuntimeError{message: "Shape meta tables not found"}} =
-               Task.await(wait_task, 500)
+               Task.await(wait_task)
     end
   end
 
@@ -1435,10 +1496,9 @@ defmodule Electric.ShapeCacheTest do
       # outer shape and its dependency materializers) from ShapeStatus + storage,
       # at the start of the ShapeLogCollector's restore, and let clients
       # re-request them from scratch. The plain shape is untouched.
-      assert wait_until(
-               fn -> match?([{^plain_handle, _}], ShapeCache.list_shapes(ctx.stack_id)) end,
-               500
-             )
+      assert wait_until(fn ->
+               match?([{^plain_handle, _}], ShapeCache.list_shapes(ctx.stack_id))
+             end)
 
       # The ShapeLogCollector rebuilds its routing indexes independently from
       # ShapeStatus. Because it prunes the subquery hierarchy before building
@@ -1467,7 +1527,7 @@ defmodule Electric.ShapeCacheTest do
 
       restart_shape_cache(ctx)
 
-      assert wait_until(fn -> ShapeCache.list_shapes(ctx.stack_id) == [] end, 500)
+      assert wait_until(fn -> ShapeCache.list_shapes(ctx.stack_id) == [] end)
     end
 
     defp restart_shape_cache(ctx, opts \\ []) do
@@ -1536,6 +1596,130 @@ defmodule Electric.ShapeCacheTest do
                GenServer.whereis(Electric.Shapes.Consumer.Materializer.name(stack_id, dep_handle))
              )
     end
+
+    # The log formatter prints `shape_handle` metadata only, so the inner shape's handle has to
+    # be in the message.
+    test "names the inner shape that failed to start", ctx do
+      %{stack_id: stack_id} = ctx
+
+      {outer_handle, _} = ShapeCache.get_or_create_shape_handle(@shape_with_subquery, stack_id)
+      :started = ShapeCache.await_snapshot_start(outer_handle, stack_id)
+
+      {:ok, %Shape{shape_dependencies_handles: [inner_handle]}} =
+        ShapeCache.fetch_shape_by_handle(outer_handle, stack_id)
+
+      :ok = ShapeDb.WriteBuffer.flush_sync(stack_id)
+
+      # As if neither consumer were running, so the next start restores both shapes.
+      Repatch.patch(Shapes.ConsumerRegistry, :whereis, [mode: :shared], fn
+        _stack_id, handle when handle in [outer_handle, inner_handle] -> nil
+        stack_id, handle -> Repatch.real(Shapes.ConsumerRegistry.whereis(stack_id, handle))
+      end)
+
+      Repatch.patch(
+        Shapes.DynamicConsumerSupervisor,
+        :start_shape_consumer,
+        [mode: :shared],
+        fn
+          _stack_id, %{shape_handle: ^inner_handle} ->
+            {:error, :test_failure}
+
+          stack_id, args ->
+            Repatch.real(Shapes.DynamicConsumerSupervisor.start_shape_consumer(stack_id, args))
+        end
+      )
+
+      Repatch.allow(self(), GenServer.whereis(ShapeCache.name(stack_id)))
+
+      log = capture_log(fn -> ShapeCache.start_consumer_for_handle(outer_handle, stack_id) end)
+
+      assert [warning] =
+               log |> String.split("\n") |> Enum.filter(&(&1 =~ "for inner shape"))
+
+      assert warning =~ inner_handle
+    end
+
+    test "waits for a busy ShapeDb connection instead of crashing the ShapeCache", ctx do
+      %{stack_id: stack_id} = ctx
+
+      %{shape_handle: shape_handle, shape_cache_pid: shape_cache_pid, holder: holder} =
+        hold_shape_db_read_connection(ctx)
+
+      ref = Process.monitor(shape_cache_pid)
+
+      log =
+        capture_log(fn ->
+          task =
+            Task.async(fn -> ShapeCache.start_consumer_for_handle(shape_handle, stack_id) end)
+
+          assert_receive :read_checkout_timed_out
+          send(holder, :release)
+
+          assert {:ok, consumer_pid} = Task.await(task)
+          assert consumer_pid == Shapes.ConsumerRegistry.whereis(stack_id, shape_handle)
+        end)
+
+      assert log =~ "waiting for the busy ShapeDb connection"
+      refute_received {:DOWN, ^ref, :process, ^shape_cache_pid, _reason}
+      assert Process.alive?(shape_cache_pid)
+    end
+
+    test "stops waiting for a ShapeDb connection that never frees up", ctx do
+      %{stack_id: stack_id} = ctx
+
+      %{shape_handle: shape_handle, shape_cache_pid: shape_cache_pid} =
+        hold_shape_db_read_connection(ctx)
+
+      capture_log(fn ->
+        assert {:error, :shape_db_busy} =
+                 ShapeCache.start_consumer_for_handle(shape_handle, stack_id, shape_db_wait: 200)
+      end)
+
+      assert Process.alive?(shape_cache_pid)
+    end
+  end
+
+  # Stores a shape, then holds the only ShapeDb read connection from another process until it
+  # receives :release. The ShapeCache's read checkout gives up after 50 ms instead of 10 s and
+  # tells the test each time it does.
+  defp hold_shape_db_read_connection(%{stack_id: stack_id}) do
+    parent = self()
+
+    {shape_handle, _} = ShapeCache.get_or_create_shape_handle(@shape, stack_id)
+    :started = ShapeCache.await_snapshot_start(shape_handle, stack_id)
+    :ok = ShapeDb.WriteBuffer.flush_sync(stack_id)
+
+    shape_cache_pid = GenServer.whereis(ShapeCache.name(stack_id))
+
+    Repatch.patch(ShapeDb.Connection, :checkout!, [mode: :shared], fn stack_id, label, fun ->
+      try do
+        Repatch.real(ShapeDb.Connection.checkout!(stack_id, label, fun, 50))
+      catch
+        :exit, reason ->
+          send(parent, :read_checkout_timed_out)
+          exit(reason)
+      end
+    end)
+
+    Repatch.allow(self(), shape_cache_pid)
+
+    holder =
+      spawn(fn ->
+        ShapeDb.Connection.checkout!(
+          stack_id,
+          :test_hold,
+          fn _conn ->
+            send(parent, :read_pool_held)
+            receive(do: (:release -> :ok))
+          end,
+          30_000
+        )
+      end)
+
+    on_exit(fn -> send(holder, :release) end)
+    assert_receive :read_pool_held
+
+    %{shape_handle: shape_handle, shape_cache_pid: shape_cache_pid, holder: holder}
   end
 
   defp stream_to_list(stream, sort_col \\ "value") do
@@ -1545,7 +1729,7 @@ defmodule Electric.ShapeCacheTest do
     |> Enum.sort_by(fn %{"value" => value} -> value[sort_col] end)
   end
 
-  defp await_for_consumer_to_have_waiters(consumer, num_attempts \\ 3)
+  defp await_for_consumer_to_have_waiters(consumer, num_attempts \\ 100)
 
   defp await_for_consumer_to_have_waiters(_consumer, 0) do
     raise "No process started waiting on shape in time"

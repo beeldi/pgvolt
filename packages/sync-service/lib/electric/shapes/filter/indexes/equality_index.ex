@@ -16,6 +16,7 @@ defmodule Electric.Shapes.Filter.Indexes.EqualityIndex do
 
   alias Electric.Replication.Eval.Env
   alias Electric.Shapes.Filter
+  alias Electric.Shapes.Filter.Indexes.IndexValue
   alias Electric.Shapes.Filter.WhereCondition
 
   @env Env.new()
@@ -28,7 +29,7 @@ defmodule Electric.Shapes.Filter.Indexes.EqualityIndex do
         branch_key
       ) do
     %{field: field, type: type, value: value, and_where: and_where} = optimisation
-    key = {condition_id, field, value}
+    key = {condition_id, field, IndexValue.index_value(type, value)}
 
     next_condition_id =
       case :ets.lookup(table, key) do
@@ -55,8 +56,8 @@ defmodule Electric.Shapes.Filter.Indexes.EqualityIndex do
         optimisation,
         branch_key
       ) do
-    %{field: field, value: value, and_where: and_where} = optimisation
-    key = {condition_id, field, value}
+    %{field: field, type: type, value: value, and_where: and_where} = optimisation
+    key = {condition_id, field, IndexValue.index_value(type, value)}
 
     case :ets.lookup(table, key) do
       [] ->
@@ -96,16 +97,20 @@ defmodule Electric.Shapes.Filter.Indexes.EqualityIndex do
   defp affected_shapes_for_type(filter, table, condition_id, field, record, type) do
     case value_from_record(record, field, type) do
       {:ok, value} ->
-        affected_shapes_for_value(filter, table, condition_id, field, value, record)
+        affected_shapes_for_value(filter, table, condition_id, field, type, value, record)
 
+      # Postgres emits values this evaluator cannot read on types it accepts, so this is a data
+      # condition. Raising reaches WhereCondition.affected_shapes's rescue, which formats a
+      # stacktrace per change and widens to every shape under the condition, discarding the exact
+      # answers of the other indexes on it.
       :error ->
-        raise RuntimeError,
-          message: "Could not parse value for field #{inspect(field)} of type #{inspect(type)}"
+        Filter.mark_routing_inexact()
+        all_shape_ids(filter, condition_id, field)
     end
   end
 
-  defp affected_shapes_for_value(filter, table, condition_id, field, value, record) do
-    case :ets.lookup(table, {condition_id, field, value}) do
+  defp affected_shapes_for_value(filter, table, condition_id, field, type, value, record) do
+    case :ets.lookup(table, {condition_id, field, IndexValue.index_value(type, value)}) do
       [] ->
         MapSet.new()
 

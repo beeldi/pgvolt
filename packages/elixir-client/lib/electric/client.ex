@@ -224,6 +224,7 @@ defmodule Electric.Client do
   @type replica :: :default | :full
   @type column :: %{
           required(:type) => String.t(),
+          optional(:dims) => non_neg_integer(),
           optional(:pk_index) => non_neg_integer(),
           optional(:not_null) => boolean(),
           optional(:max_length) => non_neg_integer(),
@@ -682,7 +683,8 @@ defmodule Electric.Client do
   Delete shape only works if Electric is configured to `allow_shape_deletion`.
   """
   def delete_shape(%Client{} = client, %ShapeDefinition{} = shape) do
-    request = request(client, method: :delete, shape: shape)
+    client = for_shape(client, shape)
+    request = request(client, method: :delete)
     Electric.Client.Fetch.request(client, request, [])
   end
 end

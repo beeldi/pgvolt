@@ -55,6 +55,16 @@
   [invoke curl_shape "http://localhost:3000/v1/shape?table=items&handle=$handle&offset=$offset&subset__where=val%20%3D%20%273%27"]
   ??HTTP/1.1 200 OK
   ??"metadata"
+  ?$PS1
+
+  # The insert reaches the shape log through replication, some time after psql has returned.
+  # A live request returns as soon as it is there, or empty after the 1 s long poll.
+  [loop attempt 1..15]
+    @"value":\{"val":"3"\}
+    [invoke curl_shape "http://localhost:3000/v1/shape?table=items&handle=$handle&offset=$offset&live"]
+    ?$PS1
+  [endloop]
+  ?$PS1
 
   [invoke curl_shape "http://localhost:3000/v1/shape?table=items&handle=$handle&offset=$offset"]
   ??HTTP/1.1 200 OK

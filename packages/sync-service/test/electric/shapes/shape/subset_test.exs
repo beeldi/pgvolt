@@ -39,6 +39,18 @@ defmodule Electric.Shapes.Shape.SubsetTest do
 
     @tag with_sql: [
            "CREATE TABLE IF NOT EXISTS item (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE IF NOT EXISTS doc_item (id INT PRIMARY KEY, metas jsonb[] NOT NULL)"
+         ]
+    test "where clause comparing jsonb arrays, which only Postgres evaluates", ctx do
+      shape_def = Shape.new!("doc_item", inspector: ctx.inspector)
+      where = ~S|metas @> '{"{\"a\": 1}"}'|
+
+      assert {:ok, %Subset{}} = Subset.new(shape_def, [where: where], inspector: ctx.inspector)
+      assert {:error, _} = Shape.new("doc_item", where: where, inspector: ctx.inspector)
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE IF NOT EXISTS item (id INT PRIMARY KEY, value INT NOT NULL)",
            "CREATE TYPE my_enum AS ENUM ('value1', 'value2', 'value3')",
            "CREATE TABLE IF NOT EXISTS enum_item (id INT PRIMARY KEY, my_enum my_enum NOT NULL)"
          ]

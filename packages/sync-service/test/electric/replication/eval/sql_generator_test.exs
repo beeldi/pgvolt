@@ -381,6 +381,14 @@ defmodule Electric.Replication.Eval.SqlGeneratorTest do
   end
 
   describe "column references" do
+    test "doubles a double quote inside a column name" do
+      assert SqlGenerator.to_sql(%Ref{path: [~s|na"me|]}) == ~s|"na""me"|
+    end
+
+    test "doubles a double quote in every part of a qualified name" do
+      assert SqlGenerator.to_sql(%Ref{path: [~s|t"1|, ~s|c"2|]}) == ~s|"t""1"."c""2"|
+    end
+
     test "simple column" do
       assert SqlGenerator.to_sql(%Ref{path: ["status"]}) == ~s|"status"|
     end
@@ -456,6 +464,10 @@ defmodule Electric.Replication.Eval.SqlGeneratorTest do
     test "empty array" do
       ast = %Array{elements: []}
       assert SqlGenerator.to_sql(ast) == "ARRAY[]"
+    end
+
+    test "constant-folded empty typed array keeps its element type" do
+      assert SqlGenerator.to_sql(%Const{type: {:array, :text}, value: []}) == "ARRAY[]::text[]"
     end
   end
 

@@ -51,9 +51,16 @@ defmodule Electric.Client.Fetch.Pool do
   defp return_existing({:error, {:already_started, pid}}), do: {:ok, pid}
   defp return_existing(error), do: error
 
-  defp request_id(%Client{fetch: {fetch_impl, _}}, %Fetch.Request{} = request) do
+  @doc false
+  def request_id(
+        %Client{fetch: {fetch_impl, fetch_opts}, authenticator: authenticator},
+        %Fetch.Request{} = request
+      ) do
     {
       fetch_impl,
+      fetch_opts,
+      authenticator,
+      request.method,
       URI.to_string(request.endpoint),
       request.headers,
       Fetch.Request.params(request)

@@ -79,6 +79,45 @@ defmodule PgInterop.Interval do
   """
   def zero(), do: %Interval{}
 
+  @microseconds_per_day 86_400_000_000
+  @days_per_month 30
+
+  @doc """
+  Compare two intervals the way Postgres does, by the total each one spans with a month taken as
+  thirty days and a day as twenty-four hours.
+
+  ## Examples
+
+      iex> compare(parse!("1 day"), parse!("24 hours"))
+      :eq
+
+      iex> compare(parse!("1 month"), parse!("31 days"))
+      :lt
+  """
+  @spec compare(t(), t()) :: :lt | :eq | :gt
+  def compare(%Interval{} = left, %Interval{} = right) do
+    case {span(left), span(right)} do
+      {left, right} when left < right -> :lt
+      {left, right} when left > right -> :gt
+      _ -> :eq
+    end
+  end
+
+  defp span(%Interval{months: months, days: days, microseconds: microseconds}),
+    do: (months * @days_per_month + days) * @microseconds_per_day + microseconds
+
+  @doc """
+  A canonical integer that two intervals share exactly when Postgres considers them equal
+  (see `compare/2`), suitable as a map or index key.
+
+  ## Examples
+
+      iex> comparable(parse!("1 month")) == comparable(parse!("30 days"))
+      true
+  """
+  @spec comparable(t()) :: integer()
+  def comparable(%Interval{} = interval), do: span(interval)
+
   @doc """
   Add two intervals together
   """

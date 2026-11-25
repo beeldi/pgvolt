@@ -159,9 +159,9 @@ defmodule Electric.Client.Message do
         value_mapping_fun.(raw_value)
       rescue
         exception ->
-          Logger.error(
-            "Unable to cast field values: #{Exception.format(:error, exception, __STACKTRACE__)}"
-          )
+          # A cast error carries the raw row value, in its message and its stacktrace.
+          # Only the kind of failure is logged; the mapper logs the column and its type.
+          Logger.error("Unable to cast field values: #{inspect(exception.__struct__)}")
 
           reraise exception, __STACKTRACE__
       end

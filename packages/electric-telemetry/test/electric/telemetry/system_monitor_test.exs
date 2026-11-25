@@ -27,4 +27,19 @@ defmodule ElectricTelemetry.SystemMonitorTest do
     assert is_reference(next_timer)
     assert next_timer != first_timer
   end
+
+  test "prunes dead pids from the tracked message-queue set on recheck" do
+    {:ok, pid} = start_supervised({ElectricTelemetry.SystemMonitor, @opts})
+
+    dead_pid = spawn(fn -> :ok end)
+    ref = Process.monitor(dead_pid)
+    assert_receive {:DOWN, ^ref, :process, ^dead_pid, _reason}
+
+    send(pid, {:monitor, dead_pid, :long_message_queue, true})
+    assert MapSet.member?(:sys.get_state(pid).long_message_queue_pids, dead_pid)
+
+    send(pid, :recheck_message_queues)
+
+    refute MapSet.member?(:sys.get_state(pid).long_message_queue_pids, dead_pid)
+  end
 end

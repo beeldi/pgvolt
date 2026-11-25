@@ -121,8 +121,11 @@ describe(`HTTP Sync`, () => {
       //console.log("urlsRequested", urlsRequested)
 
       if (liveSse) {
-        // We expect 3 requests: 2 requests for the initial fetch and the live request (which is 1 request streaming all updates)
-        expect(numRequests).toBe(3)
+        // One live request, streaming every update. The catch-up requests before it vary: a
+        // response served before the snapshot has finished ends short of up-to-date.
+        expect(
+          urlsRequested.filter((url) => url.searchParams.has(`live`))
+        ).toHaveLength(1)
       } else {
         // We expect more than 2 requests: the initial fetch + 1 request per live update
         expect(numRequests).toBeGreaterThan(2)

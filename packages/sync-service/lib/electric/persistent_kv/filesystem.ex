@@ -1,6 +1,8 @@
 defmodule Electric.PersistentKV.Filesystem do
   require Logger
 
+  alias Electric.Utils
+
   defstruct root: "."
 
   @schema NimbleOptions.new!(root: [type: :string, required: true])
@@ -15,15 +17,22 @@ defmodule Electric.PersistentKV.Filesystem do
       path = join(fs, key)
 
       case File.read(path) do
-        {:ok, data} ->
+        # A damaged term and a plain string written before this module encoded at all both fail
+        # `binary_to_term/1` with the same `ArgumentError`. The version byte tells them apart: 131
+        # leads every encoded term and no UTF-8 string, 0x83 being a continuation byte. Nothing
+        # here writes an empty file, so one of those is damage too.
+        {:ok, <<131, _::binary>> = data} ->
           try do
             {:ok, :erlang.binary_to_term(data)}
           rescue
-            ArgumentError ->
-              # This was before we added `term_to_binary` to the filesystem.
-              # We can treat data as a plain string
-              {:ok, data}
+            ArgumentError -> {:error, :corrupted}
           end
+
+        {:ok, ""} ->
+          {:error, :corrupted}
+
+        {:ok, data} ->
+          {:ok, data}
 
         {:error, :enoent} ->
           {:error, :not_found}
@@ -41,18 +50,30 @@ defmodule Electric.PersistentKV.Filesystem do
       end
     end
 
-    # rename is atomic if files are on same fs
-    # removes chance of reading partial write
+    # Rename on one filesystem is atomic: no reader ever sees a half-written file. It is not
+    # durable, and it makes that promise about an in-memory directory -- without `:sync` the new
+    # name can reach the disk ahead of the bytes it points at, and without the directory sync the
+    # name need not reach the disk at all. Either way `set/3` returned `:ok` for a value that is
+    # not there afterwards, which the read side can only report as never written.
     defp atomic_write(final_path, data) do
+      dir = Path.dirname(final_path)
+
       tmp_file =
-        final_path
-        |> Path.dirname()
-        |> Path.join(
+        Path.join(
+          dir,
           "." <> (:crypto.strong_rand_bytes(10) |> Base.encode32(case: :lower, padding: false))
         )
 
-      with :ok <- File.write(tmp_file, :erlang.term_to_binary(data), [:binary]) do
-        File.rename(tmp_file, final_path)
+      # A failed write or rename otherwise leaves the temp file behind as a hidden dotfile no later
+      # call reaches -- on the fork's per-cache-fill writer, one orphan per failed fill on the disk
+      # whose free space already ran short. The success path renamed it away.
+      with :ok <- File.write(tmp_file, :erlang.term_to_binary(data), [:binary, :sync]),
+           :ok <- File.rename(tmp_file, final_path) do
+        Utils.sync_dir!(dir)
+      else
+        error ->
+          _ = File.rm(tmp_file)
+          error
       end
     end
 

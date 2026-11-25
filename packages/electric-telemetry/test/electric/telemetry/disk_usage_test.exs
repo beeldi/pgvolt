@@ -21,6 +21,11 @@ defmodule ElectricTelemetry.DiskUsageTest do
     end)
   end
 
+  defp write_cache_file(%{tmp_dir: storage_dir}, data) do
+    File.mkdir_p!(storage_dir)
+    File.write!(Path.join(storage_dir, ".disk-usage"), data, [:binary, :raw])
+  end
+
   setup(ctx) do
     stack_id = "#{inspect(__MODULE__)}#{System.monotonic_time()}"
 
@@ -62,12 +67,49 @@ defmodule ElectricTelemetry.DiskUsageTest do
   end
 
   @tag start_usage: false
+  test "recovers from a cache file torn mid-timestamp instead of crashing on boot", ctx do
+    write_cache_file(ctx, "1|1024|2026-08-17T12:34")
+
+    {:ok, usage_pid} =
+      DiskUsage.start_link(
+        stack_id: ctx.stack_id,
+        storage_dir: ctx.tmp_dir,
+        manual_refresh: true
+      )
+
+    Process.link(usage_pid)
+    assert eventually_read_usage(ctx, 0)
+  end
+
+  @tag start_usage: false
+  test "recovers from a cache file with a non-UTC offset instead of crashing on boot", ctx do
+    write_cache_file(ctx, "1|1024|2026-08-17T12:34:56+02:00")
+
+    {:ok, usage_pid} =
+      DiskUsage.start_link(
+        stack_id: ctx.stack_id,
+        storage_dir: ctx.tmp_dir,
+        manual_refresh: true
+      )
+
+    Process.link(usage_pid)
+    assert eventually_read_usage(ctx, 0)
+  end
+
+  @tag start_usage: false
   test "ensures storage_dir exists before writing to it", ctx do
     ctx =
       start_usage(%{ctx | tmp_dir: Path.join(ctx.tmp_dir, "dir#{System.monotonic_time()}-#{}")})
 
     Process.link(ctx.usage)
     :ok = DiskUsage.update(ctx.usage)
+  end
+
+  @tag start_usage: false
+  test "waits longer between walks when a walk is slow" do
+    assert DiskUsage.next_update_delay(60_000, 0) == 60_000
+    assert DiskUsage.next_update_delay(60_000, 5_000) == 60_000
+    assert DiskUsage.next_update_delay(60_000, 12_000) == 120_000
   end
 
   defp stop_usage(ctx) do

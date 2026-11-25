@@ -17,7 +17,6 @@ export default [
       `**/.vitepress/dist-markdown/**`,
       `**/sst-env.d.ts`,
       `**/sst.config.ts`,
-      `website/src/partials/**`,
       `**/routeTree.gen.ts`,
     ],
   },
@@ -54,13 +53,6 @@ export default [
   },
   {
     files: [`**/*.d.ts`],
-    rules: {
-      quotes: `off`,
-    },
-  },
-  {
-    // Node ESM: `import` specifiers must use " or ' (not `), so relax quotes here.
-    files: [`website/scripts/**`],
     rules: {
       quotes: `off`,
     },

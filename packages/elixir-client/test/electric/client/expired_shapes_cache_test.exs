@@ -29,6 +29,27 @@ defmodule Electric.Client.ExpiredShapesCacheTest do
     end
   end
 
+  describe "clear_handle/2" do
+    test "clears the entry while it holds the given handle" do
+      ExpiredShapesCache.mark_expired("shape-key-1", "handle-1")
+
+      assert :ok = ExpiredShapesCache.clear_handle("shape-key-1", "handle-1")
+      assert ExpiredShapesCache.get_expired_handle("shape-key-1") == nil
+    end
+
+    test "keeps a newer handle recorded for the same shape key" do
+      ExpiredShapesCache.mark_expired("shape-key-1", "handle-1")
+      ExpiredShapesCache.mark_expired("shape-key-1", "handle-2")
+
+      assert :ok = ExpiredShapesCache.clear_handle("shape-key-1", "handle-1")
+      assert ExpiredShapesCache.get_expired_handle("shape-key-1") == "handle-2"
+    end
+
+    test "is a no-op for an unknown shape key" do
+      assert :ok = ExpiredShapesCache.clear_handle("unknown-key", "handle-1")
+    end
+  end
+
   describe "mark_expired/2" do
     test "stores expired handle for shape key" do
       assert :ok = ExpiredShapesCache.mark_expired("shape-key-1", "expired-handle-1")

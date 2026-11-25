@@ -31,6 +31,7 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
   alias Electric.Shapes.DnfPlan
   alias Electric.Shapes.Filter
   alias Electric.Shapes.Filter.WhereCondition
+  alias PgInterop.Sublink
 
   @type t :: :ets.tid() | atom()
   @type node_id :: {Filter.condition_id(), term()}
@@ -99,6 +100,7 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
     sid = handle_id(table, shape_handle)
 
     delete_by_key_prefix(table, {:membership, sid, :_, :_})
+    delete_by_key_prefix(table, {:null_row_membership, sid, :_, :_})
     delete_by_key_prefix(table, {:polarity, sid, :_})
     delete_by_key_prefix(table, {:shape_node, sid, :_, :_})
     delete_by_key_prefix(table, {:shape_dep_node, sid, :_, :_, :_})
@@ -255,14 +257,15 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
   @spec add_value(t(), term(), [String.t()], non_neg_integer(), term()) :: :ok
   def add_value(table, shape_handle, _subquery_ref, dep_index, value) do
     sid = intern_handle(table, shape_handle)
+    member = node_member_value(value)
 
     for {node_int, polarity, next_condition_id, _branch_key} <-
           nodes_for_shape_dependency(table, sid, dep_index) do
       tag = if polarity == :positive, do: :node_positive_member, else: :node_negated_member
-      :ets.insert(table, {{tag, node_int, value, sid, next_condition_id}, true})
+      :ets.insert(table, {{tag, node_int, member, sid, next_condition_id}, true})
     end
 
-    :ets.insert(table, {{:membership, sid, dep_index, value}, true})
+    :ets.insert(table, {{membership_key(value), sid, dep_index, value}, true})
     :ok
   end
 
@@ -272,16 +275,38 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
   @spec remove_value(t(), term(), [String.t()], non_neg_integer(), term()) :: :ok
   def remove_value(table, shape_handle, _subquery_ref, dep_index, value) do
     sid = handle_id(table, shape_handle)
+    member = node_member_value(value)
 
     for {node_int, polarity, next_condition_id, _branch_key} <-
           nodes_for_shape_dependency(table, sid, dep_index) do
       tag = if polarity == :positive, do: :node_positive_member, else: :node_negated_member
-      :ets.delete(table, {tag, node_int, value, sid, next_condition_id})
+      :ets.delete(table, {tag, node_int, member, sid, next_condition_id})
     end
 
-    :ets.delete(table, {:membership, sid, dep_index, value})
+    :ets.delete(table, {membership_key(value), sid, dep_index, value})
     :ok
   end
+
+  defp membership_key(value) do
+    if is_tuple(value) and Sublink.null_key?(value), do: :null_row_membership, else: :membership
+  end
+
+  # A match spec reads a map in its pattern as a pattern, and an ordered_set can only narrow a
+  # select to a key range when the key is bound, so a `Decimal` key (a numeric subquery value)
+  # would make `members_for/4` scan the whole table. Node-member rows hold it as a tuple, and an
+  # array with lower bounds (a struct, so a map too) the same way, down to its elements.
+  defp node_member_value(%Decimal{sign: sign, coef: coef, exp: exp}),
+    do: {Decimal, sign, coef, exp}
+
+  defp node_member_value(%PgInterop.Array.Bounded{} = array),
+    do: {PgInterop.Array.Bounded, array.lower_bounds, node_member_value(array.elements)}
+
+  defp node_member_value(value) when is_list(value), do: Enum.map(value, &node_member_value/1)
+
+  defp node_member_value(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&node_member_value/1) |> List.to_tuple()
+
+  defp node_member_value(value), do: value
 
   @doc """
   Get affected shape handles for a specific subquery node.
@@ -293,21 +318,39 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
     candidates =
       case evaluate_node_lhs(table, node_id, record) do
         {:ok, typed_value, node_int} ->
-          positive = members_for(table, :node_positive_member, node_int, typed_value)
+          null_key? = Sublink.null_key?(typed_value)
+
+          positive =
+            if null_key?,
+              do: MapSet.new(),
+              else: members_for(table, :node_positive_member, node_int, typed_value)
 
           negated =
             MapSet.difference(
               negated_shapes_for(table, node_id),
-              members_for(table, :node_negated_member, node_int, typed_value)
+              if(null_key?,
+                do: MapSet.new(),
+                else: members_for(table, :node_negated_member, node_int, typed_value)
+              )
             )
 
           fallback = fallback_for(table, node_id)
+
+          # Only `positive` is an exact membership. `negated` (a NOT IN over a possibly-NULL view)
+          # and `fallback` (a shape whose consumer has not seeded its view yet) are supersets, so a
+          # caller that shares a converted row across the group must re-evaluate — mark the decision
+          # inexact when either contributes, as every other routing path does.
+          unless Enum.empty?(negated) and Enum.empty?(fallback) do
+            Filter.mark_routing_inexact()
+          end
 
           positive
           |> MapSet.union(negated)
           |> MapSet.union(fallback)
 
         :error ->
+          # The subquery LHS did not evaluate, so every shape on the node is routed — a superset.
+          Filter.mark_routing_inexact()
           all_node_shapes(table, node_id)
       end
 
@@ -332,20 +375,81 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
   end
 
   @doc """
-  Check if a specific shape has a value in its current dependency view
-  for a canonical subquery ref.
+  Three-valued membership of a value in a shape's current dependency view for a
+  canonical subquery ref.
+
+  Mirrors `PgInterop.Sublink.member?/2` for the view the index materialises for
+  one shape. An exact match wins, followed by any unknown comparison. A
+  composite comparison is unknown only if it has a NULL and no unequal fields.
   """
-  @spec member?(t(), term(), [String.t()], term()) :: boolean()
+  @spec member?(t(), term(), [String.t()], term()) :: boolean() | nil
   def member?(table, shape_handle, subquery_ref, typed_value) do
     sid = handle_id(table, shape_handle)
-    :ets.member(table, {:membership, sid, dep_index_for_ref(subquery_ref), typed_value})
+    dep_index = dep_index_for_ref(subquery_ref)
+
+    member_for_dependency?(table, sid, dep_index, typed_value)
+  end
+
+  defp member_for_dependency?(table, sid, dep_index, value) when is_tuple(value) do
+    incomplete? = Sublink.null_key?(value)
+
+    cond do
+      not incomplete? and :ets.member(table, {:membership, sid, dep_index, value}) -> true
+      unknown_row_match?(table, :null_row_membership, sid, dep_index, value) -> nil
+      incomplete? and unknown_row_match?(table, :membership, sid, dep_index, value) -> nil
+      true -> false
+    end
+  end
+
+  defp member_for_dependency?(table, sid, dep_index, typed_value) do
+    cond do
+      not is_nil(typed_value) and
+          :ets.member(table, {:membership, sid, dep_index, typed_value}) ->
+        true
+
+      view_empty?(table, sid, dep_index) ->
+        false
+
+      is_nil(typed_value) ->
+        nil
+
+      :ets.member(table, {:membership, sid, dep_index, nil}) ->
+        nil
+
+      true ->
+        false
+    end
+  end
+
+  # Each known field must equal the corresponding RHS field or meet a NULL.
+  # One side already has a NULL, so any such row gives an unknown comparison.
+  defp unknown_row_match?(table, key, sid, dep_index, value) do
+    guards =
+      for {field, idx} <- value |> Tuple.to_list() |> Enum.with_index(1), not is_nil(field) do
+        rhs = {:element, idx, :"$1"}
+        {:orelse, {:"=:=", rhs, {:const, field}}, {:"=:=", rhs, nil}}
+      end
+
+    case :ets.select(table, [{{{key, sid, dep_index, :"$1"}, :_}, guards, [true]}], 1) do
+      :"$end_of_table" -> false
+      _ -> true
+    end
+  end
+
+  # Probe the scalar view before the NULL checks. Even a NULL key is absent from
+  # an empty subquery result.
+  defp view_empty?(table, sid, dep_index) do
+    case :ets.select(table, [{{{:membership, sid, dep_index, :_}, :_}, [], [true]}], 1) do
+      :"$end_of_table" -> true
+      _ -> false
+    end
   end
 
   @doc """
   Check subquery membership for exact evaluation, falling back to the shape's
   dependency polarity while the shape is still unseeded.
   """
-  @spec membership_or_fallback?(t(), term(), [String.t()], term()) :: boolean()
+  @spec membership_or_fallback?(t(), term(), [String.t()], term()) :: boolean() | nil
   def membership_or_fallback?(table, shape_handle, subquery_ref, typed_value) do
     if shape_ready?(table, shape_handle) do
       member?(table, shape_handle, subquery_ref, typed_value)
@@ -448,7 +552,7 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
       ])
 
     for value <- values do
-      :ets.delete(table, {tag, node_int, value, shape_id, next_condition_id})
+      :ets.delete(table, {tag, node_int, node_member_value(value), shape_id, next_condition_id})
     end
 
     :ok
@@ -456,7 +560,7 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
 
   defp members_for(table, tag, node_id, value) do
     :ets.select(table, [
-      {{{tag, node_id, value, :"$1", :"$2"}, :_}, [], [{{:"$1", :"$2"}}]}
+      {{{tag, node_id, node_member_value(value), :"$1", :"$2"}, :_}, [], [{{:"$1", :"$2"}}]}
     ])
     |> MapSet.new()
   end
@@ -518,15 +622,11 @@ defmodule Electric.Shapes.Filter.Indexes.SubqueryIndex do
       [{_, %{testexpr: testexpr, node_int: node_int}}] ->
         expr = Expr.wrap_parser_part(testexpr)
 
-        case Runner.record_to_ref_values(expr.used_refs, record) do
-          {:ok, ref_values} ->
-            case Runner.execute(expr, ref_values) do
-              {:ok, value} -> {:ok, value, node_int}
-              _ -> :error
-            end
+        {:ok, ref_values} = Runner.record_to_ref_values(expr.used_refs, record)
 
-          _ ->
-            :error
+        case Runner.execute_sublink_lhs(expr, ref_values) do
+          {:ok, value} -> {:ok, value, node_int}
+          _ -> :error
         end
 
       [] ->

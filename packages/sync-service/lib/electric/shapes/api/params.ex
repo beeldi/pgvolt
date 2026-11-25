@@ -50,16 +50,14 @@ defmodule Electric.Shapes.Api.Params do
 
     def type, do: {:map, :string}
 
+    # Decoded as an ordered object, since a plain decode keeps the last of a repeated key while
+    # a proxy that checked the params may have read the first.
     def cast(params) when is_binary(params) do
-      case Jason.decode(params) do
-        {:ok, decoded} when is_map(decoded) ->
-          # Ensure all values are strings
-          string_map =
-            Enum.into(decoded, %{}, fn {k, v} ->
-              {to_string(k), to_string(v)}
-            end)
-
-          {:ok, string_map}
+      case Jason.decode(params, objects: :ordered_objects) do
+        {:ok, %Jason.OrderedObject{values: pairs}} ->
+          if length(Enum.uniq_by(pairs, &elem(&1, 0))) == length(pairs),
+            do: stringify_values(pairs),
+            else: {:error, message: "params must not repeat a key"}
 
         {:ok, _} ->
           {:error, message: "params must be a JSON object"}
@@ -71,15 +69,24 @@ defmodule Electric.Shapes.Api.Params do
 
     def cast(params) when is_map(params) do
       # Backwards compatibility: accept map directly
-      string_map =
-        Enum.into(params, %{}, fn {k, v} ->
-          {to_string(k), to_string(v)}
-        end)
-
-      {:ok, string_map}
+      stringify_values(params)
     end
 
     def cast(_), do: :error
+
+    # A JSON object value can itself be an object or an array, and `to_string/1` raises on those
+    # rather than answering with something a changeset can carry — so casting them turned a
+    # malformed request into a crash instead of a 400.
+    defp stringify_values(params) do
+      Enum.reduce_while(params, {:ok, %{}}, fn
+        {key, value}, {:ok, acc}
+        when is_binary(value) or is_number(value) or is_boolean(value) or is_nil(value) ->
+          {:cont, {:ok, Map.put(acc, to_string(key), to_string(value))}}
+
+        _pair, _acc ->
+          {:halt, {:error, message: "params values must be strings, numbers, booleans or null"}}
+      end)
+    end
 
     def load(data) when is_map(data), do: {:ok, data}
     def load(_), do: :error
@@ -153,12 +160,16 @@ defmodule Electric.Shapes.Api.Params do
     field(:where, :string)
     field(:columns, ColumnList)
     field(:queryable_columns, ColumnList)
+    field(:locale, :string)
+    field(:localized_columns, ColumnList)
     field(:shape_definition, :string)
     field(:replica, Ecto.Enum, values: [:default, :full], default: :default)
     field(:params, {:map, :string}, default: %{})
     field(@tmp_compaction_flag, :boolean, default: false)
     field(:live_sse, :boolean, default: false)
     field(:log, Ecto.Enum, values: [:changes_only, :full], default: :full)
+    field(:source_positions, Ecto.Enum, values: [:legacy, :full_xid], default: :legacy)
+    field(:wait_for_lsn, :integer)
 
     embeds_one(:subset, SubsetParams)
   end
@@ -169,7 +180,26 @@ defmodule Electric.Shapes.Api.Params do
     Map.fetch!(params, @tmp_compaction_flag)
   end
 
-  def validate(%Electric.Shapes.Api{} = api, params) do
+  def validate(%Api{subset_max_rows: max_rows} = api, params) when is_integer(max_rows) do
+    case Ecto.Type.cast(:integer, subset_limit(params)) do
+      {:ok, limit} when is_integer(limit) and limit > max_rows ->
+        errors = %{subset: %{limit: ["must be at most #{max_rows}"]}}
+        {:error, Api.Response.invalid_request(api, errors: errors)}
+
+      _ ->
+        validate_params(api, params)
+    end
+  end
+
+  def validate(%Api{} = api, params), do: validate_params(api, params)
+
+  defp subset_limit(%{"subset" => subset}) when is_map(subset), do: subset_limit_value(subset)
+  defp subset_limit(%{subset: subset}) when is_map(subset), do: subset_limit_value(subset)
+  defp subset_limit(_params), do: nil
+
+  defp subset_limit_value(subset), do: Map.get(subset, "limit", Map.get(subset, :limit))
+
+  defp validate_params(api, params) do
     params
     |> cast_params()
     |> validate_required([:offset])
@@ -177,7 +207,10 @@ defmodule Electric.Shapes.Api.Params do
     |> validate_handle_with_offset()
     |> validate_live_with_offset()
     |> validate_live_sse()
+    |> validate_source_positions(api)
     |> cast_root_table(api)
+    |> validate_source_positions(api)
+    |> validate_wait_for_lsn()
     |> cast_subset(api)
     |> apply_action(:validate)
     |> SubsetParams.extract_result(from: :subset)
@@ -222,7 +255,12 @@ defmodule Electric.Shapes.Api.Params do
     reason =
       traverse_errors(changeset, fn {msg, opts} ->
         Regex.replace(~r"%{(\w+)}", msg, fn _, key ->
-          opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
+          # A message can carry text the request supplied — an unknown column echoed back is one —
+          # so the placeholder name is not ours to trust. Resolving it through `to_existing_atom`
+          # raised on anything that was not already an atom, turning a rejected request into a 500.
+          opts
+          |> Enum.find_value(key, fn {opt, value} -> if Atom.to_string(opt) == key, do: value end)
+          |> to_string()
         end)
       end)
 
@@ -230,6 +268,9 @@ defmodule Electric.Shapes.Api.Params do
       case reason do
         %{connection_not_available: [msg]} ->
           Api.Response.error(api, msg, status: 503, retry_after: 1)
+
+        %{source_positions: [msg]} ->
+          Api.Response.error(api, msg, status: 426)
 
         _ ->
           Api.Response.invalid_request(api, errors: reason)
@@ -300,6 +341,33 @@ defmodule Electric.Shapes.Api.Params do
     end
   end
 
+  def validate_wait_for_lsn(%Ecto.Changeset{valid?: false} = changeset), do: changeset
+
+  # An empty value casts to nil, which would read as a request that does not wait. A shape with
+  # subqueries buffers transactions behind its move-ins, past the position they were fanned out
+  # at, so no position can vouch for its log.
+  def validate_wait_for_lsn(%Ecto.Changeset{} = changeset) do
+    case {get_field(changeset, :wait_for_lsn), get_field(changeset, :shape_definition)} do
+      {nil, _shape} ->
+        if Map.has_key?(changeset.params, "wait_for_lsn"),
+          do: add_error(changeset, :wait_for_lsn, "is invalid"),
+          else: changeset
+
+      {_lsn, %Shape{shape_dependencies: [_ | _]}} ->
+        add_error(changeset, :wait_for_lsn, "can't be used on a shape with subqueries")
+
+      {_lsn, _shape} ->
+        changeset
+        |> validate_number(:wait_for_lsn,
+          greater_than_or_equal_to: 0,
+          less_than_or_equal_to: 0xFFFFFFFFFFFFFFFF
+        )
+        |> validate_exclusion(:live_sse, [true],
+          message: "can't be true together with wait_for_lsn"
+        )
+    end
+  end
+
   def cast_root_table(%Ecto.Changeset{valid?: false} = changeset, _), do: changeset
 
   def cast_root_table(%Ecto.Changeset{} = changeset, %Api{shape: nil} = api) do
@@ -309,7 +377,64 @@ defmodule Electric.Shapes.Api.Params do
   end
 
   def cast_root_table(%Ecto.Changeset{} = changeset, %Api{shape: %Shape{} = shape}) do
-    put_change(changeset, :shape_definition, shape)
+    if get_field(changeset, :source_positions) == :full_xid and
+         Map.get(shape, :source_positions, :legacy) != :full_xid do
+      add_error(changeset, :source_positions, "does not match the configured shape")
+    else
+      changeset
+      |> put_change(:shape_definition, shape)
+      |> put_change(:source_positions, Map.get(shape, :source_positions, :legacy))
+    end
+  end
+
+  defp validate_source_positions(%Ecto.Changeset{valid?: false} = changeset, _api), do: changeset
+
+  defp validate_source_positions(changeset, api) do
+    if get_field(changeset, :source_positions) == :full_xid do
+      cond do
+        get_field(changeset, @tmp_compaction_flag) ->
+          add_error(
+            changeset,
+            @tmp_compaction_flag,
+            "cannot be enabled with full transaction source positions"
+          )
+
+        "full_xid_source_positions" not in api.feature_flags ->
+          add_error(
+            changeset,
+            :source_positions,
+            "full transaction source positions are not enabled"
+          )
+
+        not Electric.StackConfig.lookup(api.stack_id, :full_xid_source_positions_ready, false) ->
+          add_error(
+            changeset,
+            :connection_not_available,
+            "full transaction source provenance is not ready"
+          )
+
+        not is_binary(Electric.StackConfig.lookup(api.stack_id, :full_xid_source_generation)) ->
+          add_error(
+            changeset,
+            :connection_not_available,
+            "full transaction source generation is not ready"
+          )
+
+        match?(%Shape{}, get_field(changeset, :shape_definition)) and
+            get_field(changeset, :shape_definition).source_generation !=
+              Electric.StackConfig.lookup(api.stack_id, :full_xid_source_generation) ->
+          add_error(
+            changeset,
+            :connection_not_available,
+            "the shape belongs to an earlier source generation"
+          )
+
+        true ->
+          changeset
+      end
+    else
+      changeset
+    end
   end
 
   defp define_shape(%Ecto.Changeset{valid?: false} = changeset, _api) do
@@ -321,9 +446,12 @@ defmodule Electric.Shapes.Api.Params do
     where = fetch_field!(changeset, :where)
     columns = get_change(changeset, :columns, nil)
     queryable_columns = get_change(changeset, :queryable_columns, nil)
+    locale = fetch_field!(changeset, :locale)
+    localized_columns = get_change(changeset, :localized_columns, [])
     replica = fetch_field!(changeset, :replica)
     params = fetch_field!(changeset, :params)
     compaction_enabled? = fetch_field!(changeset, @tmp_compaction_flag)
+    source_positions = fetch_field!(changeset, :source_positions)
 
     case Shape.new(
            table,
@@ -331,11 +459,25 @@ defmodule Electric.Shapes.Api.Params do
            params: params,
            columns: columns,
            queryable_columns: queryable_columns,
+           locale: locale,
+           localized_columns: localized_columns,
            replica: replica,
            inspector: api.inspector,
            feature_flags: api.feature_flags,
-           storage: %{compaction: if(compaction_enabled?, do: :enabled, else: :disabled)},
-           log_mode: fetch_field!(changeset, :log)
+           storage: %{
+             compaction:
+               if(compaction_enabled? and source_positions == :legacy,
+                 do: :enabled,
+                 else: :disabled
+               )
+           },
+           log_mode: fetch_field!(changeset, :log),
+           source_positions: source_positions,
+           source_generation:
+             if(source_positions == :full_xid,
+               do: Electric.StackConfig.lookup(api.stack_id, :full_xid_source_generation),
+               else: nil
+             )
          ) do
       {:ok, shape} ->
         case DnfPlan.compile(shape) do

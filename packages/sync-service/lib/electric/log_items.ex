@@ -7,9 +7,38 @@ defmodule Electric.LogItems do
   Defines the structure and how to create the items in the log that the electric client reads.
 
   The log_item() data structure is a map for ease of consumption in the Elixir code,
-  however when JSON encoded (not done in this module) it's the format that the electric
+  however when JSON encoded it's the format that the electric
   client accepts.
   """
+
+  def encode_changes(changes, xid, full_xid, shape) do
+    if Map.get(shape, :source_positions, :legacy) == :full_xid and is_nil(full_xid) do
+      raise ArgumentError, "full_xid shapes require full transaction provenance before appending"
+    end
+
+    Enum.flat_map_reduce(changes, 0, fn
+      %Changes.PreparedChange{log_items: log_items, total_size: size}, total_size ->
+        {log_items, total_size + size}
+
+      %Changes.FramedBlock{} = block, total_size ->
+        {[block], total_size + block.payload_size}
+
+      change, total_size ->
+        change
+        |> from_change(xid, Shape.pk(shape, change.relation), shape.replica)
+        |> Enum.map_reduce(total_size, fn {offset,
+                                           %{key: key, headers: %{operation: operation}} = item},
+                                          size ->
+          item =
+            if full_xid,
+              do: put_in(item.headers[:txids8], [Integer.to_string(full_xid)]),
+              else: item
+
+          json = Jason.encode!(item)
+          {{offset, key, operation, json}, size + byte_size(json)}
+        end)
+    end)
+  end
 
   defp put_if_true(map, key, value) do
     if value, do: Map.put(map, key, value), else: map

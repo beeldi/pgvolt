@@ -57,7 +57,7 @@ defmodule Electric.Shapes.Consumer.SetupEffects do
             state.shape_handle,
             ref,
             dep_index,
-            view
+            PgInterop.Sublink.keys(view)
           )
         end
 

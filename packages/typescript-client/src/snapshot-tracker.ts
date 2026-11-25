@@ -28,6 +28,24 @@ export class SnapshotTracker {
   private snapshotsByDatabaseLsn: Map<bigint, Set<number>> = new Map()
 
   /**
+   * A copy to read a batch against, so that a batch that fails halfway leaves
+   * this tracker as it was.
+   */
+  clone(): SnapshotTracker {
+    const copy = new SnapshotTracker()
+    copy.activeSnapshots = new Map(this.activeSnapshots)
+    copy.xmaxSnapshots = this.#copyIndex(this.xmaxSnapshots)
+    copy.snapshotsByDatabaseLsn = this.#copyIndex(this.snapshotsByDatabaseLsn)
+    return copy
+  }
+
+  #copyIndex(index: Map<bigint, Set<number>>): Map<bigint, Set<number>> {
+    const copy = new Map<bigint, Set<number>>()
+    index.forEach((marks, key) => copy.set(key, new Set(marks)))
+    return copy
+  }
+
+  /**
    * Add a new snapshot for tracking
    */
   addSnapshot(metadata: SnapshotMetadata, keys: Set<string>): void {

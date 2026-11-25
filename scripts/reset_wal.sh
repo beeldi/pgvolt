@@ -23,5 +23,6 @@ pg_ctl stop -D $PGDATA
 echo "Resetting WAL to $wal_pos"
 pg_resetwal -l $wal_pos $PGDATA
 
-# Restart PostgreSQL
-pg_ctl start -D $PGDATA
+# Restart PostgreSQL on the Unix socket only, like the entrypoint's temporary server, so that
+# no client reaches it over TCP before initialisation has finished.
+pg_ctl start -D $PGDATA -o "-c listen_addresses=''"

@@ -29,10 +29,13 @@
 [invoke resume_pg]
 
 [shell electric]
-  -$fail_pattern
-
   # Increase the timeout before the next match to give Electric time to reconnect
   [timeout 15]
+
+  # A retry that ran while Postgres was down or still booting has logged an error, and that
+  # output may still be unread, so only watch for errors once the lock is held again.
+  ??[notice] Lock acquired from postgres
+  -$fail_pattern
 
   ??[notice] Starting replication from postgres
 

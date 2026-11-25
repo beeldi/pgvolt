@@ -26,6 +26,11 @@ defmodule Support.OracleHarness.StandardSchema do
   @level_4_ids Enum.map(1..20, &"l4-#{&1}")
   @tags ["alpha", "beta", "gamma", "delta"]
 
+  # Text values that carry the characters the LIKE, collation and case-folding evaluator classes
+  # turn on. Without them in the stored universe the differential oracle can never produce a
+  # counter-example to those classes (see WhereClauseGenerator's adversarial corpus).
+  @adversarial_values ["UPPER", "café", "line1\nline2", "back\\slash", "MiXeD"]
+
   # ----------------------------------------------------------------------------
   # Standard Schema
   # ----------------------------------------------------------------------------
@@ -303,11 +308,27 @@ defmodule Support.OracleHarness.StandardSchema do
   end
 
   defp update_level_4_value_gen do
-    bind({member_of(@level_4_ids), integer(1..1000)}, fn {id, val} ->
+    bind({member_of(@level_4_ids), value_gen()}, fn {id, val} ->
       constant(%{
         name: "update_l4_#{id}",
-        sql: "UPDATE level_4 SET value = 'v#{val}' WHERE id = '#{id}'"
+        sql: "UPDATE level_4 SET value = '#{sql_escape(val)}' WHERE id = '#{id}'"
       })
     end)
   end
+
+  @doc "Adversarial stored values mixed into the mutation corpus (see the module note)."
+  def adversarial_values, do: @adversarial_values
+
+  # Most mutations keep the plain `v<int>` universe; a minority inject an adversarial value so the
+  # oracle's stored rows actually contain the characters the tricky evaluator classes turn on.
+  defp value_gen do
+    frequency([
+      {5, map(integer(1..1000), &"v#{&1}")},
+      {1, member_of(@adversarial_values)}
+    ])
+  end
+
+  # Single quotes are the only character that breaks a single-quoted SQL literal here; backslash,
+  # newline and non-ASCII bytes are literal under standard_conforming_strings.
+  defp sql_escape(value), do: String.replace(value, "'", "''")
 end

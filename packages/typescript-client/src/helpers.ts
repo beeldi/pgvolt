@@ -71,6 +71,84 @@ export function getOffset(message: ControlMessage): Offset | undefined {
   return lsn ? (`${lsn}_0` as Offset) : undefined
 }
 
+/**
+ * Compares two log offsets of the form `LSN_op`: negative when `a` is before
+ * `b`, zero when equal, positive when `a` is after `b`. Returns `null` when
+ * either one is not a concrete log offset (`-1`, `now`, or malformed).
+ *
+ * Offsets are ordered by LSN first and then by op position. Both parts are
+ * compared as integers because LSNs can exceed the safe integer range. The op
+ * position `inf` is the boundary after every finite op at that LSN (notably
+ * `0_inf`, the end of the initial snapshot) and so sorts after them.
+ */
+export function compareLogOffsets(a: Offset, b: Offset): number | null {
+  const left = parseLogOffset(a)
+  const right = parseLogOffset(b)
+  if (!left || !right) return null
+  if (left.lsn !== right.lsn) return left.lsn < right.lsn ? -1 : 1
+  if (left.op === right.op) return 0
+  if (left.op === `inf`) return 1
+  if (right.op === `inf`) return -1
+  return left.op < right.op ? -1 : 1
+}
+
+function parseLogOffset(
+  offset: Offset
+): { lsn: bigint; op: bigint | `inf` } | null {
+  const parts = offset.split(`_`)
+  if (parts.length !== 2) return null
+  try {
+    return {
+      lsn: BigInt(parts[0]),
+      op: parts[1] === `inf` ? `inf` : BigInt(parts[1]),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Returns true when `candidate` is strictly ahead of `current`.
+ *
+ * See `compareLogOffsets` for how offsets are ordered. The `-1` and `now`
+ * offsets are initial values that any concrete offset supersedes.
+ *
+ * Used to avoid moving the offset backwards when an SSE `up-to-date` control
+ * message only carries the LSN (`${lsn}_0`), which regresses behind a header
+ * offset from the same LSN when that LSN carries multiple ops.
+ */
+export function isOffsetAhead(candidate: Offset, current: Offset): boolean {
+  if (current === `-1` || current === `now`) return true
+  const order = compareLogOffsets(candidate, current)
+  return order !== null && order > 0
+}
+
+/**
+ * Returns `value` if it is an `Error`, otherwise wraps it in one with the
+ * original value kept as `cause`. A custom `fetchClient` (or code it calls) can
+ * reject with anything: a string, a plain object, or an `Error` from another
+ * realm that fails `instanceof Error`.
+ */
+export function toError(value: unknown): Error {
+  if (value instanceof Error) return value
+
+  let message: string
+  try {
+    message = String(value)
+  } catch {
+    message = `Non-Error value thrown`
+  }
+  const error = new Error(message)
+  // Set explicitly rather than through the Error constructor options, which
+  // older runtimes ignore.
+  Object.defineProperty(error, `cause`, {
+    value,
+    configurable: true,
+    writable: true,
+  })
+  return error
+}
+
 function bigintReplacer(_key: string, value: unknown): unknown {
   return typeof value === `bigint` ? value.toString() : value
 }

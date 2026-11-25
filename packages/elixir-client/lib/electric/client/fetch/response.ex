@@ -1,6 +1,19 @@
 defmodule Electric.Client.Fetch.Response do
   alias Electric.Client
 
+  @column_keys %{
+    "type" => :type,
+    "dims" => :dims,
+    "pk_index" => :pk_index,
+    "not_null" => :not_null,
+    "max_length" => :max_length,
+    "length" => :length,
+    "precision" => :precision,
+    "scale" => :scale,
+    "fields" => :fields,
+    "type_mod" => :type_mod
+  }
+
   defstruct [
     :status,
     :last_offset,
@@ -66,10 +79,15 @@ defmodule Electric.Client.Fetch.Response do
   defp decode_offset(_headers), do: nil
 
   defp decode_schema(%{"electric-schema" => schema}) do
-    schema |> unlist() |> Jason.decode!(keys: :atoms)
+    schema |> unlist() |> Jason.decode!() |> Map.new(&decode_column/1)
   end
 
   defp decode_schema(_headers), do: nil
+
+  defp decode_column({column_name, info}) do
+    {column_name,
+     for({key, atom} <- @column_keys, is_map_key(info, key), into: %{}, do: {atom, info[key]})}
+  end
 
   defp unlist([elem | _]), do: elem
   defp unlist([]), do: nil

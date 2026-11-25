@@ -130,4 +130,25 @@ defmodule Electric.Client.ValueMapperTest do
                "not_in_schema" => "some value"
              })
   end
+
+  test "leaves numeric array columns as raw text instead of parsing them as scalars" do
+    schema = %{
+      id: %{type: "int4", pk_index: 0, not_null: true},
+      ints: %{type: "int4", dims: 1},
+      floats: %{type: "float8", dims: 1}
+    }
+
+    value_mapper = Client.ValueMapper.for_schema(schema, [])
+
+    assert %{
+             "id" => 1,
+             "ints" => "{1,2,3}",
+             "floats" => "{1.5,2.5}"
+           } =
+             value_mapper.(%{
+               "id" => "1",
+               "ints" => "{1,2,3}",
+               "floats" => "{1.5,2.5}"
+             })
+  end
 end

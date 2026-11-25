@@ -194,10 +194,22 @@ defmodule Electric.ShapeCache.PureFileStorage.ChunkIndex do
         size
 
       {:ok, size} ->
-        FileInfo.truncate(chunk_file_path, size - rem(size, @half_record_width))
+        truncate!(chunk_file_path, size - rem(size, @half_record_width))
         size - rem(size, @half_record_width)
     end
     |> trim(chunk_file_path, last_persisted_offset)
+  end
+
+  # Unless a later cut takes its bytes off, a cut that fails leaves a closing boundary past the
+  # log, which the writer's next chunk follows, an opening past it, which the writer keeps as its
+  # current chunk, or a partial record. The next read of the last boundary at the file's size
+  # fails on that record: the written-boundary check's coverage read when the reopen reaches it,
+  # or, after a trim to the durable boundary, the check that the index reaches the log.
+  defp truncate!(path, size) do
+    case FileInfo.truncate(path, size) do
+      :ok -> :ok
+      {:error, reason} -> raise File.Error, reason: reason, action: "truncate", path: path
+    end
   end
 
   defp trim(0, _, _), do: {0, 0}
@@ -209,7 +221,7 @@ defmodule Electric.ShapeCache.PureFileStorage.ChunkIndex do
         {start_pos, key_file_start_pos}
 
       {:incomplete, _, _, _} ->
-        FileInfo.truncate(chunk_file_path, file_size - @half_record_width)
+        truncate!(chunk_file_path, file_size - @half_record_width)
         trim(file_size - @half_record_width, chunk_file_path, last_persisted_offset)
 
       {:complete, last_chunk_offset, end_pos, key_file_end_pos}
@@ -218,7 +230,7 @@ defmodule Electric.ShapeCache.PureFileStorage.ChunkIndex do
 
       {:complete, last_chunk_offset, _, _}
       when is_log_offset_lt(last_persisted_offset, last_chunk_offset) ->
-        FileInfo.truncate(chunk_file_path, file_size - @half_record_width)
+        truncate!(chunk_file_path, file_size - @half_record_width)
         trim(file_size - @half_record_width, chunk_file_path, last_persisted_offset)
 
       {:complete, ^last_persisted_offset, _, _} ->
@@ -330,6 +342,35 @@ defmodule Electric.ShapeCache.PureFileStorage.ChunkIndex do
   end
 
   defp do_binary_search(_file, _left, _right, _target), do: nil
+
+  @doc """
+  Where the chunk index of a finished log ends: its last offset, and the log and key file
+  positions after it. `:empty` for an empty index, `:error` for one that does not end on a
+  complete chunk.
+  """
+  @spec finished_log_ends(String.t()) ::
+          {LogOffset.t(), non_neg_integer(), non_neg_integer()} | :empty | :error
+  def finished_log_ends(path) do
+    case FileInfo.file_size(path) do
+      {:ok, 0} ->
+        :empty
+
+      {:ok, size} when rem(size, @full_record_width) == 0 ->
+        {:complete, {_, end_offset}, {_, log_end}, {_, key_end}} = get_nth_chunk(path, -1)
+        {end_offset, log_end, key_end}
+
+      _ ->
+        :error
+    end
+  end
+
+  @doc """
+  The number of complete chunks in a chunk index, from its size alone.
+  """
+  @spec complete_chunk_count(String.t()) :: {:ok, non_neg_integer()} | {:error, File.posix()}
+  def complete_chunk_count(path) do
+    with {:ok, size} <- FileInfo.file_size(path), do: {:ok, div(size, @full_record_width)}
+  end
 
   @doc """
   Read all chunks from the chunk index file.

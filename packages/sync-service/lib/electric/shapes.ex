@@ -86,6 +86,16 @@ defmodule Electric.Shapes do
   end
 
   @doc """
+  Check that a shape handle is the shape of the given definition, without
+  looking up or creating any other shape for that definition.
+  """
+  @spec validate_shape_handle(stack_id(), shape_handle(), Shape.t()) :: :ok | :error
+  def validate_shape_handle(stack_id, shape_handle, %Shape{} = shape)
+      when is_shape_handle(shape_handle) and is_stack_id(stack_id) do
+    ShapeStatus.validate_shape_handle(stack_id, shape_handle, shape)
+  end
+
+  @doc """
   Get or create a shape handle and return it along with the latest offset of the shape
   """
   @spec get_or_create_shape_handle(stack_id(), Shape.t()) ::
@@ -121,6 +131,16 @@ defmodule Electric.Shapes do
   @spec has_shape?(stack_id(), shape_handle()) :: boolean()
   def has_shape?(stack_id, shape_handle) do
     ShapeCache.has_shape?(shape_handle, stack_id)
+  end
+
+  @doc false
+  @spec fetch_latest_offset(stack_id(), shape_handle()) :: {:ok, LogOffset.t()} | :error
+  def fetch_latest_offset(stack_id, shape_handle) do
+    if ShapeCache.has_shape?(shape_handle, stack_id) do
+      ShapeCache.fetch_latest_offset(stack_id, shape_handle)
+    else
+      :error
+    end
   end
 
   @doc """

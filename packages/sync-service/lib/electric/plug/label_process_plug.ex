@@ -9,6 +9,9 @@ defmodule Electric.Plug.LabelProcessPlug do
     plug Electric.Plug.LabelProcessPlug
   """
 
+  alias Electric.Plug.Utils
+  alias Electric.Telemetry.RequestValues
+
   def init(opts), do: opts
 
   def call(conn, _opts) do
@@ -46,5 +49,10 @@ defmodule Electric.Plug.LabelProcessPlug do
   end
 
   defp query_suffix(%{query_string: ""}), do: ""
-  defp query_suffix(%{query_string: query_string}), do: "?#{query_string}"
+
+  defp query_suffix(%{query_string: query_string}) do
+    if RequestValues.enabled?(),
+      do: "?[#{RequestValues.query_summary(query_string)}]",
+      else: "?#{Utils.redact_query_string(query_string)}"
+  end
 end

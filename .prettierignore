@@ -14,18 +14,8 @@ pnpm-lock.yaml
 sst-env.d.ts
 sst.config.ts
 
-# Ignore website markdown files to prevent underscore escaping issues
-website/**/*.md
-
-# Ignore internal Vitepress files
-website/.vitepress
-
-# Ignore website partials (documentation code snippets)
-website/src/partials/**
-
-# Ignore static files used by website
-website/public
-website/static
+# Ignore the docs pages kept from the website, to prevent underscore escaping issues
+fork/docs/**/*.md
 
 # Ignore Elixir projects
 packages/electric-telemetry

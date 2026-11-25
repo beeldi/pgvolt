@@ -27,6 +27,7 @@
  *   Any state ─markMustRefetch─► Initial (offset reset)
  */
 import { Offset, Schema } from './types'
+import { isOffsetAhead } from './helpers'
 import {
   OFFSET_QUERY_PARAM,
   SHAPE_HANDLE_QUERY_PARAM,
@@ -62,6 +63,7 @@ type ResponseBaseInput = {
   responseCursor: string | null
   responseSchema?: Schema
   expiredHandle?: string | null
+  isSse: boolean
   now: number
 }
 
@@ -96,7 +98,12 @@ export interface MessageBatchTransition {
 
 export interface SseCloseInput {
   connectionDuration: number
+  /** The client closed it itself, so it says nothing about the server or a proxy. */
   wasAborted: boolean
+  /** The body ended with messages that no up-to-date had flushed. */
+  hadUnflushedMessages: boolean
+  /** Messages arrived and the offset moved from where the request started. */
+  advancedOffset: boolean
   minConnectionDuration: number
   maxShortConnections: number
 }
@@ -280,7 +287,12 @@ abstract class ActiveState extends ShapeStreamState {
       responseHandle && responseHandle !== input.expiredHandle
         ? responseHandle
         : this.#shared.handle
-    const offset = input.responseOffset ?? this.#shared.offset
+    // An SSE response's messages are applied only when its up-to-date arrives,
+    // so its offset header waits for that too (`pendingSseOffset`). Taking it
+    // now would skip the chunk if the body ends first.
+    const offset = input.isSse
+      ? this.#shared.offset
+      : (input.responseOffset ?? this.#shared.offset)
     const liveCacheBuster = input.responseCursor ?? this.#shared.liveCacheBuster
     const schema = this.#shared.schema ?? input.responseSchema
     const lastSyncedAt =
@@ -328,8 +340,14 @@ abstract class ActiveState extends ShapeStreamState {
 
     // Has up-to-date message — compute shared fields for the transition
     let offset = this.#shared.offset
-    if (input.isSse && input.upToDateOffset) {
-      offset = input.upToDateOffset
+    if (input.isSse) {
+      offset = this.pendingSseOffset ?? offset
+      // The up-to-date carries only the LSN (`${lsn}_0`), so it can sit behind
+      // the header offset. Take it only when strictly ahead, so operations
+      // already seen are not replayed.
+      if (input.upToDateOffset && isOffsetAhead(input.upToDateOffset, offset)) {
+        offset = input.upToDateOffset
+      }
     }
 
     const shared: SharedStateFields = {
@@ -341,6 +359,11 @@ abstract class ActiveState extends ShapeStreamState {
     }
 
     return this.onUpToDate(shared, input)
+  }
+
+  /** The open SSE response's offset header, applied at its up-to-date. */
+  protected get pendingSseOffset(): Offset | undefined {
+    return undefined
   }
 
   /** Override point for up-to-date handling. Default → LiveState. */
@@ -479,18 +502,28 @@ export class LiveState extends ActiveState {
   readonly kind = `live` as const
   readonly #consecutiveShortSseConnections: number
   readonly #sseFallbackToLongPolling: boolean
+  readonly #longPollUntilUpToDate: boolean
+  readonly #sseResponseOffset: Offset | undefined
 
   constructor(
     shared: SharedStateFields,
     sseState?: {
       consecutiveShortSseConnections?: number
       sseFallbackToLongPolling?: boolean
+      longPollUntilUpToDate?: boolean
+      sseResponseOffset?: Offset
     }
   ) {
     super(shared)
     this.#consecutiveShortSseConnections =
       sseState?.consecutiveShortSseConnections ?? 0
     this.#sseFallbackToLongPolling = sseState?.sseFallbackToLongPolling ?? false
+    this.#longPollUntilUpToDate = sseState?.longPollUntilUpToDate ?? false
+    this.#sseResponseOffset = sseState?.sseResponseOffset
+  }
+
+  protected get pendingSseOffset(): Offset | undefined {
+    return this.#sseResponseOffset
   }
 
   get isUpToDate(): boolean {
@@ -524,6 +557,8 @@ export class LiveState extends ActiveState {
     return {
       consecutiveShortSseConnections: this.#consecutiveShortSseConnections,
       sseFallbackToLongPolling: this.#sseFallbackToLongPolling,
+      longPollUntilUpToDate: this.#longPollUntilUpToDate,
+      sseResponseOffset: this.#sseResponseOffset,
     }
   }
 
@@ -536,7 +571,12 @@ export class LiveState extends ActiveState {
     const shared = this.parseResponseFields(input)
     return {
       action: `accepted`,
-      state: new LiveState(shared, this.sseState),
+      state: new LiveState(shared, {
+        ...this.sseState,
+        sseResponseOffset: input.isSse
+          ? (input.responseOffset ?? undefined)
+          : undefined,
+      }),
     }
   }
 
@@ -545,7 +585,11 @@ export class LiveState extends ActiveState {
     _input: MessageBatchInput
   ): MessageBatchTransition {
     return {
-      state: new LiveState(shared, this.sseState),
+      state: new LiveState(shared, {
+        ...this.sseState,
+        longPollUntilUpToDate: false,
+        sseResponseOffset: undefined,
+      }),
       suppressUpToDate: false,
       becameUpToDate: true,
     }
@@ -560,7 +604,8 @@ export class LiveState extends ActiveState {
       opts.liveSseEnabled &&
       !opts.isRefreshing &&
       !opts.resumingFromPause &&
-      !this.#sseFallbackToLongPolling
+      !this.#sseFallbackToLongPolling &&
+      !this.#longPollUntilUpToDate
     )
   }
 
@@ -570,9 +615,17 @@ export class LiveState extends ActiveState {
     let fellBackToLongPolling = false
     let wasShortConnection = false
 
+    // A response that moved the offset, or ended inside a catch-up chunk
+    // before its up-to-date, was streamed through even if it was short: the
+    // server closes a live SSE request that is behind the log end as soon as
+    // it has sent the catch-up. One that left the offset where it started with
+    // nothing buffered still counts, or a replay at one offset would loop
+    // without backoff.
     if (
       input.connectionDuration < input.minConnectionDuration &&
-      !input.wasAborted
+      !input.wasAborted &&
+      !input.advancedOffset &&
+      !input.hadUnflushedMessages
     ) {
       wasShortConnection = true
       nextConsecutiveShort = nextConsecutiveShort + 1
@@ -589,6 +642,11 @@ export class LiveState extends ActiveState {
       state: new LiveState(this.currentFields, {
         consecutiveShortSseConnections: nextConsecutiveShort,
         sseFallbackToLongPolling: nextFallback,
+        // The offset is still where those messages started and their header
+        // was dropped (see `parseResponseFields`). Asking again over SSE could
+        // get the same catch-up chunk forever; a long poll reads the whole
+        // body and takes the chunk's end from its header, so it moves on.
+        longPollUntilUpToDate: input.hadUnflushedMessages,
       }),
       fellBackToLongPolling,
       wasShortConnection,

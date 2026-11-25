@@ -8,6 +8,8 @@ defmodule Electric.Shapes.SubqueryTags do
   @value_prefix "v:"
   @null_sentinel "NULL"
 
+  @type encoding() :: :legacy | :length_prefixed
+
   def value_prefix, do: @value_prefix
   def null_sentinel, do: @null_sentinel
 
@@ -56,6 +58,22 @@ defmodule Electric.Shapes.SubqueryTags do
   @spec namespace_value(nil | binary()) :: binary()
   def namespace_value(nil), do: @null_sentinel
   def namespace_value(value), do: @value_prefix <> value
+
+  def composite_tag_input(fields, :legacy) do
+    Enum.map_join(fields, fn {column, value} -> column <> ":" <> namespace_value(value) end)
+  end
+
+  def composite_tag_input(fields, :length_prefixed) do
+    # The columns and their order are fixed within a tag slot.
+    Enum.map_join(fields, fn {_column, value} ->
+      value = namespace_value(value)
+      "#{byte_size(value)}:" <> value
+    end)
+  end
+
+  def make_composite_hash(stack_id, shape_handle, fields, encoding) do
+    make_value_hash_raw(stack_id, shape_handle, composite_tag_input(fields, encoding))
+  end
 
   @spec make_value_hash(binary(), binary(), nil | binary()) :: binary()
   def make_value_hash(stack_id, shape_handle, value) do

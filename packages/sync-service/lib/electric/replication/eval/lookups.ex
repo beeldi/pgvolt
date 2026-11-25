@@ -53,6 +53,14 @@ defmodule Electric.Replication.Eval.Lookups do
               not Env.can_implicitly_coerce_types?(env, [type], [candidate]) ->
             {:cont, {:ok, type}}
 
+          # And the same in the other direction. Without this the fallback below took the type
+          # last seen and dropped the one already chosen, so `ARRAY[1.5, 2]` resolved to int4 and
+          # was rejected while `ARRAY[2, 1.5]` resolved to numeric and was accepted -- the same
+          # array, decided by the order it was written in.
+          Env.can_implicitly_coerce_types?(env, [type], [candidate]) and
+              not Env.can_implicitly_coerce_types?(env, [candidate], [type]) ->
+            {:cont, {:ok, candidate}}
+
           true ->
             {:cont, {:ok, type}}
         end

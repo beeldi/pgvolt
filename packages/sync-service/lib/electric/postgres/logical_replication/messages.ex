@@ -5,12 +5,13 @@ defmodule Electric.Postgres.LogicalReplication.Messages do
   @type relation_id() :: non_neg_integer
 
   defmodule Begin do
-    defstruct([:final_lsn, :commit_timestamp, :xid])
+    defstruct([:final_lsn, :commit_timestamp, :xid, :full_xid])
 
     @type t() :: %__MODULE__{
             final_lsn: Lsn.t(),
             commit_timestamp: DateTime.t(),
-            xid: Lsn.int32()
+            xid: Lsn.int32(),
+            full_xid: pos_integer() | nil
           }
   end
 

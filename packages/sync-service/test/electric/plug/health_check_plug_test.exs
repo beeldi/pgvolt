@@ -11,7 +11,7 @@ defmodule Electric.Plug.HealthCheckPlugTest do
 
   setup :with_stack_id_from_test
 
-  def conn(ctx) do
+  def conn(ctx, path \\ "/") do
     config = [stack_id: ctx[:stack_id]]
 
     Repatch.patch(StatusMonitor, :status, [mode: :shared], fn stack_id ->
@@ -19,7 +19,7 @@ defmodule Electric.Plug.HealthCheckPlugTest do
       ctx.connection_status
     end)
 
-    Plug.Test.conn("GET", "/")
+    Plug.Test.conn("GET", path)
     |> assign(:config, config)
   end
 
@@ -95,6 +95,43 @@ defmodule Electric.Plug.HealthCheckPlugTest do
 
       assert conn.status == 200
       assert Jason.decode!(conn.resp_body) == %{"status" => "active"}
+    end
+  end
+
+  describe "HealthCheckPlug with require=read_only" do
+    for {status, code, text} <- [
+          # shape metadata loaded, the shape pipeline still restoring: existing shapes are served
+          {%{conn: :up, shape: :read_only}, 200, "starting"},
+          {%{conn: :starting, shape: :read_only}, 200, "starting"},
+          {%{conn: :waiting_on_lock, shape: :read_only}, 200, "waiting"},
+          {%{conn: :up, shape: :up}, 200, "active"},
+          {%{conn: :sleeping, shape: :up}, 200, "active"},
+          # shape metadata not loaded yet
+          {%{conn: :up, shape: :starting}, 202, "starting"},
+          {%{conn: :waiting_on_lock, shape: :starting}, 202, "starting"},
+          # the connection subsystem is down after the shape pipeline came up: the API holds
+          # requests, as it does for an active stack's connection loss
+          {%{conn: :starting, shape: :up}, 202, "starting"}
+        ] do
+      @tag connection_status: status
+      test "returns #{code} #{text} for #{inspect(status)}", ctx do
+        conn =
+          conn(ctx, "/?require=read_only")
+          |> HealthCheckPlug.call([])
+
+        assert conn.status == unquote(code)
+        assert Jason.decode!(conn.resp_body) == %{"status" => unquote(text)}
+      end
+    end
+
+    @tag connection_status: %{conn: :up, shape: :read_only}
+    test "keeps 202 without the parameter, as the plain endpoint's contract", ctx do
+      conn =
+        conn(ctx)
+        |> HealthCheckPlug.call([])
+
+      assert conn.status == 202
+      assert Jason.decode!(conn.resp_body) == %{"status" => "starting"}
     end
   end
 end

@@ -44,6 +44,25 @@ defmodule ElectricTelemetry.ApplicationTelemetryTest do
     end)
   end
 
+  describe "cpu_utilization_metrics" do
+    test "builds one gauge per logical processor when the count is known" do
+      metrics = ApplicationTelemetry.cpu_utilization_metrics(4)
+
+      assert length(metrics) == 4
+
+      assert Enum.map(metrics, & &1.name) == [
+               [:system, :cpu, :utilization, :core_0],
+               [:system, :cpu, :utilization, :core_1],
+               [:system, :cpu, :utilization, :core_2],
+               [:system, :cpu, :utilization, :core_3]
+             ]
+    end
+
+    test "yields no gauges when the VM cannot report the processor count" do
+      assert ApplicationTelemetry.cpu_utilization_metrics(:unknown) == []
+    end
+  end
+
   describe "get_system_memory_usage" do
     test "returns calculated memory stats" do
       case :os.type() do

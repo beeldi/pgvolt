@@ -5,13 +5,14 @@ defmodule Electric.Shapes.Api do
   alias Electric.DbConnectionError
   alias Electric.SnapshotError
   alias Electric.Telemetry.OpenTelemetry
+  alias Electric.Telemetry.RequestValues
 
   alias __MODULE__
   alias __MODULE__.Request
   alias __MODULE__.Response
   alias __MODULE__.SseState
 
-  import Electric.Replication.LogOffset, only: [is_log_offset_lt: 2]
+  import Electric.Replication.LogOffset, only: [is_log_offset_lt: 2, is_log_offset_lte: 2]
 
   require Logger
 
@@ -27,6 +28,7 @@ defmodule Electric.Shapes.Api do
     stack_ready_timeout: [type: :integer],
     stale_age: [type: :integer],
     send_cache_headers?: [type: :boolean],
+    subset_max_rows: [type: {:custom, Electric.Config, :validate_subset_max_rows, []}],
     encoder: [type: :atom],
     max_concurrent_requests: [
       type: :map,
@@ -50,6 +52,7 @@ defmodule Electric.Shapes.Api do
     :stack_id,
     :feature_flags,
     :max_concurrent_requests,
+    :subset_max_rows,
     allow_shape_deletion: false,
     keepalive_interval: 21_000,
     long_poll_timeout: 20_000,
@@ -68,7 +71,9 @@ defmodule Electric.Shapes.Api do
 
   # Aliasing for pattern matching
   @before_all_offset LogOffset.before_all()
-  @offset_out_of_bounds %{offset: ["out of bounds for this shape"]}
+
+  # A consumer busy past this answers a wait_for_lsn request's check too late to vouch for it.
+  @consumer_answer_timeout 1_000
 
   # Need to implement Access behaviour because we use that to extract config
   # when using shapes api
@@ -145,6 +150,16 @@ defmodule Electric.Shapes.Api do
     with {:ok, _mode} <- hold_until_stack_ready(api),
          {:ok, params} <- normalise_shape_params(shape_params),
          opts = Keyword.merge(params, inspector: api.inspector, feature_flags: api.feature_flags),
+         opts =
+           if(Keyword.get(opts, :source_positions) == :full_xid,
+             do:
+               Keyword.put(
+                 opts,
+                 :source_generation,
+                 Electric.StackConfig.lookup(api.stack_id, :full_xid_source_generation)
+               ),
+             else: opts
+           ),
          {:ok, shape} <- Shapes.Shape.new(opts) do
       {:ok, %{api | shape: shape}}
     end
@@ -211,7 +226,68 @@ defmodule Electric.Shapes.Api do
   @spec load_shape_info(Request.t()) :: {:ok, Request.t()} | {:error, Response.t()}
   def load_shape_info(%Request{} = request) do
     with {:ok, request} <- do_load_shape_info(request) do
-      {:ok, seek(request)}
+      {:ok, request |> vouch_for_covered_lsn() |> seek()}
+    end
+  end
+
+  defp vouch_for_covered_lsn(%Request{params: %{wait_for_lsn: nil}} = request), do: request
+
+  defp vouch_for_covered_lsn(%Request{api: %{stack_id: stack_id}} = request) do
+    {covered_lsn, replay_generation} = covered_lsn(stack_id)
+
+    case vouch(request, replay_generation) do
+      :vouched -> %{request | covered_lsn: covered_lsn}
+      _unvouched_or_moved -> %{request | covered_lsn: 0}
+    end
+  end
+
+  # The broadcast position is either a commit already fanned out to the shapes' consumers or the
+  # WAL end of a server keepalive, which no later commit can start below, so every transaction
+  # before it was fanned out. On an idle database the keepalive that follows a commit carries the
+  # end of that commit's record. The last processed LSN is not one of these: the replication
+  # client sets it from the slot's position before anything is fanned out. It comes with the
+  # replay generation, read first, for `vouch/2`.
+  defp covered_lsn(stack_id) do
+    replay_generation = Electric.LsnTracker.replay_generation(stack_id)
+    {max(Electric.LsnTracker.get_last_broadcast_lsn(stack_id) - 1, 0), replay_generation}
+  end
+
+  # Called after reading the covered LSN. Every transaction at or below it that changes the shape
+  # was handed to the shape's consumer, so once the consumer holds what it was handed, its log
+  # has them all, and an offset that has not moved since the request read it ends past them.
+  # A stack that does not run the consumers here only reads what another instance synced to disk.
+  # A shape subsystem stopped and started again since the covered LSN was read replays from the
+  # slot what a stopped writer may have lost below it, and its consumer holds the log at the same
+  # offset until the replay delivers that.
+  defp vouch(%Request{} = request, replay_generation) do
+    %{
+      handle: shape_handle,
+      last_offset: last_offset,
+      params: %{shape_definition: shape_def},
+      api: %{stack_id: stack_id}
+    } = request
+
+    cond do
+      Electric.StatusMonitor.status(stack_id).shape != :up ->
+        :unvouched
+
+      not Shapes.Consumer.holds_handled_transactions?(
+        stack_id,
+        shape_handle,
+        @consumer_answer_timeout
+      ) ->
+        :unvouched
+
+      Shapes.resolve_shape_handle(stack_id, shape_handle, shape_def) !=
+          {shape_handle, last_offset} ->
+        :moved
+
+      is_nil(replay_generation) or
+          Electric.LsnTracker.replay_generation(stack_id) != replay_generation ->
+        :unvouched
+
+      true ->
+        :vouched
     end
   end
 
@@ -470,19 +546,31 @@ defmodule Electric.Shapes.Api do
     %{request | new_changes_pid: self(), new_changes_ref: ref}
   end
 
-  # When the LsnTracker is populated (active mode), use the global last
-  # processed LSN. Otherwise fall back to the shape's own latest offset —
-  # the Postgres LSN of the last transaction persisted for this shape.
-  # This covers read-only mode (no replication connection) and transient
-  # states where the LsnTracker has been reset (e.g. process restarts).
   defp determine_global_last_seen_lsn(%Request{} = request) do
+    stack_id = request.api.stack_id
+    lsn = Electric.LsnTracker.get_last_processed_lsn(stack_id)
+
+    # The slot can seed the tracker after a read-only request has been admitted.
+    # Check journal state after reading the tracker: the slot sets it before seeding.
     offset =
-      case Electric.LsnTracker.get_last_processed_lsn(request.api.stack_id) do
-        nil -> request.last_offset.tx_offset
-        lsn -> Electric.Postgres.Lsn.to_integer(lsn)
+      if is_nil(lsn) or journal_ahead_of_shape?(request) do
+        request.last_offset.tx_offset
+      else
+        Electric.Postgres.Lsn.to_integer(lsn)
       end
 
     %{request | global_last_seen_lsn: offset}
+  end
+
+  # Until the replay is done, the seeded tracker is past journaled rows the shape may not have
+  # yet, also for a request admitted read-only that now reads from the writer. After it,
+  # disk-only requests may still miss replayed rows that are buffered by the writer.
+  defp journal_ahead_of_shape?(%Request{api: %{stack_id: stack_id}} = request) do
+    case Electric.StatusMonitor.journal_replay(stack_id) do
+      :pending -> true
+      :settled -> request.read_only?
+      nil -> false
+    end
   end
 
   # If the requested offset is out of bounds, we are beyond the end of any chunk
@@ -504,6 +592,8 @@ defmodule Electric.Shapes.Api do
         read_only?: request.read_only?
       ) ||
         last_offset
+
+    chunk_end_offset = LogOffset.min(chunk_end_offset, last_offset)
 
     Request.update_response(
       %{request | chunk_end_offset: chunk_end_offset},
@@ -576,24 +666,47 @@ defmodule Electric.Shapes.Api do
   defp do_serve_subset_response(%Request{} = request) do
     %{
       response: response,
-      params: %{subset: subset, shape_definition: shape_definition, handle: handle}
+      params: %{subset: subset},
+      handle: handle
     } = request
 
-    case Shapes.query_subset(handle, shape_definition, subset, request.api) do
-      {:ok, {metadata, data_stream}} ->
-        %{
-          response
-          | chunked: true,
-            body: encode(request.api, :subset, {metadata, data_stream}),
-            response_type: :subset
-        }
-        |> Response.final()
+    with {:ok, shape_definition} <- subset_shape_definition(request),
+         {:ok, {metadata, data_stream}} <-
+           Shapes.query_subset(handle, shape_definition, subset, request.api) do
+      %{
+        response
+        | chunked: true,
+          body: encode(request.api, :subset, {metadata, data_stream}),
+          response_type: :subset
+      }
+      |> Response.final()
+    else
+      :error ->
+        error = Api.Error.must_refetch()
+        Response.error(request, error.message, status: error.status)
 
       {:error, {key, message}} when is_atom(key) ->
         Response.invalid_request(request, errors: %{subset: %{key => message}})
 
       {:error, reason} ->
         Response.error(request, inspect(reason), status: 500)
+    end
+  end
+
+  defp subset_shape_definition(%Request{
+         params: %{shape_definition: %{shape_dependencies: []} = shape}
+       }),
+       do: {:ok, shape}
+
+  # Subquery tags use the encoding of the resolved handle's log.
+  defp subset_shape_definition(%Request{
+         params: %{shape_definition: shape},
+         handle: handle,
+         api: %{stack_id: stack_id}
+       }) do
+    with {:ok, stored_shape} <- Shapes.fetch_shape_by_handle(stack_id, handle) do
+      encoding = Shapes.Shape.composite_tag_encoding(stored_shape)
+      {:ok, %{shape | composite_tag_encoding: encoding}}
     end
   end
 
@@ -674,7 +787,7 @@ defmodule Electric.Shapes.Api do
       response
       | status: 200,
         no_changes: true,
-        body: encode_log(request, [up_to_date_ctl(global_last_seen_lsn)]),
+        body: encode_log(request, [up_to_date_ctl(request, global_last_seen_lsn)]),
         finalized?: true
     }
   end
@@ -730,6 +843,7 @@ defmodule Electric.Shapes.Api do
               max(global_last_seen_lsn, chunk_end_offset.tx_offset)
             end
 
+          request = cover_chunk_end(request)
           log_stream = Stream.concat(log, maybe_up_to_date(request, up_to_date_lsn))
 
           %{response | chunked: true, body: encode_log(request, log_stream)}
@@ -754,13 +868,18 @@ defmodule Electric.Shapes.Api do
         Response.error(request, error.message, status: error.status)
 
       {:error, %SnapshotError{} = error} ->
-        Logger.warning("Failed to create snapshot for shape: #{error.message}",
+        detail = if RequestValues.enabled?(), do: error.type, else: error.message
+
+        Logger.warning("Failed to create snapshot for shape: #{detail}",
           shape_handle: shape_handle
         )
 
         if error.type == :unknown &&
              DbConnectionError.from_error(error.original_error).type == :unknown do
-          Logger.error("Unknown error while creating snapshot: #{inspect(error.original_error)}")
+          Logger.error(
+            "Unknown error while creating snapshot: #{RequestValues.inspect_error(error.original_error)}"
+          )
+
           message = "Unexpected error while creating snapshot: " <> error.message
           Response.error(request, message, status: 500)
         else
@@ -796,11 +915,18 @@ defmodule Electric.Shapes.Api do
     |> stream_sse_events()
   end
 
-  defp handle_live_request(%Request{} = request) do
+  defp handle_live_request(%Request{params: %{wait_for_lsn: nil}} = request) do
     request
     |> update_attrs(%{ot_is_immediate_response: false})
     |> notify_changes_since_request_start()
     |> hold_until_change()
+  end
+
+  defp handle_live_request(%Request{} = request) do
+    request
+    |> update_attrs(%{ot_is_immediate_response: false})
+    |> notify_changes_since_request_start()
+    |> hold_until_change_or_covered()
   end
 
   # Between loading the shape info and registering as a listener for new changes,
@@ -869,7 +995,84 @@ defmodule Electric.Shapes.Api do
     |> handle_live_change_result(request)
   end
 
-  defp wait_for_live_change(ref, long_poll_timeout) do
+  # A request with `wait_for_lsn` also ends without a change once every transaction at or below
+  # that LSN is covered. Each new broadcast position wakes it to check again.
+  defp hold_until_change_or_covered(%Request{} = request) do
+    %{api: %{stack_id: stack_id, long_poll_timeout: long_poll_timeout}} = request
+
+    case Electric.LsnTracker.subscribe_to_global_lsn_updates(stack_id) do
+      {:ok, _} ->
+        deadline = System.monotonic_time(:millisecond) + long_poll_timeout
+
+        try do
+          request |> covered_without_change() |> await_covered(request, deadline)
+        after
+          Electric.LsnTracker.unsubscribe_from_global_lsn_updates(stack_id)
+          flush_global_lsn_updates()
+        end
+
+      {:error, _reason} ->
+        hold_until_change(request)
+    end
+  end
+
+  defp await_covered({:covered, covered_lsn}, request, _deadline) do
+    request
+    |> update_attrs(%{ot_is_covered_response: true})
+    |> Map.put(:covered_lsn, covered_lsn)
+    |> no_change_response()
+  end
+
+  defp await_covered(:waiting, request, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    case wait_for_live_change(request.new_changes_ref, remaining, true) do
+      :covered_lsn_advanced ->
+        request |> covered_without_change() |> await_covered(request, deadline)
+
+      result ->
+        handle_live_change_result(result, request)
+    end
+  end
+
+  # A client ahead of this instance's log waits for it as any out-of-bounds request does: the
+  # no-change answer would carry this log's lower offset. A moved offset is posted to this process
+  # as a change, read from the writer as a request starting now would, and served by the usual
+  # path.
+  defp covered_without_change(%Request{} = request) do
+    {covered_lsn, replay_generation} = covered_lsn(request.api.stack_id)
+
+    cond do
+      covered_lsn < request.params.wait_for_lsn ->
+        :waiting
+
+      is_out_of_bounds(request) ->
+        :waiting
+
+      true ->
+        case vouch(request, replay_generation) do
+          :vouched ->
+            {:covered, covered_lsn}
+
+          :moved ->
+            notify_changes_since_request_start(%{request | read_only?: false})
+            :waiting
+
+          :unvouched ->
+            :waiting
+        end
+    end
+  end
+
+  defp flush_global_lsn_updates do
+    receive do
+      {:global_last_seen_lsn, _lsn} -> flush_global_lsn_updates()
+    after
+      0 -> :ok
+    end
+  end
+
+  defp wait_for_live_change(ref, long_poll_timeout, covered_updates? \\ false) do
     # Bandit reuses handler processes across requests. Entering this narrow helper before
     # collecting keeps the parked receive from retaining the larger request-handling frame.
     :erlang.garbage_collect()
@@ -877,6 +1080,9 @@ defmodule Electric.Shapes.Api do
     receive do
       {^ref, :new_changes, latest_log_offset} ->
         {:new_changes, latest_log_offset}
+
+      {:global_last_seen_lsn, _lsn} when covered_updates? ->
+        :covered_lsn_advanced
 
       {^ref, :shape_rotation, new_handle} ->
         {:shape_rotation, new_handle}
@@ -898,6 +1104,18 @@ defmodule Electric.Shapes.Api do
       # Bandit.TransportError at send time, handled in Electric.Plug.ServeShapePlug.
       {:bandit, {:rst_stream, _error_code}} ->
         :client_disconnect
+
+      # The server is stopping this connection. Its handler process traps exits, so the
+      # supervisor's shutdown arrives here as a message and would otherwise wait out the long
+      # poll. ThousandIsland stops its acceptors one after another, each waiting for its
+      # connections, so on a busy server those waits add up to minutes. Answer now and put the
+      # signal back for the handler's loop, which closes the connection. A stopping stack's
+      # registry, linked to this process while it is subscribed, sends the same signal; the
+      # stack is going away then too, and the loop ignores exits from processes other than its
+      # parent.
+      {:EXIT, _from, :shutdown} = shutdown ->
+        send(self(), shutdown)
+        :shutdown
     after
       long_poll_timeout ->
         :long_poll_timeout
@@ -905,12 +1123,30 @@ defmodule Electric.Shapes.Api do
   end
 
   defp handle_live_change_result({:new_changes, latest_log_offset}, request) do
-    # Stream new log since currently "held" offset
-    %{request | last_offset: latest_log_offset}
+    # Stream new log since currently "held" offset.
+    #
+    # A request that parked while the stack was read-only reads the disk alone, where only synced
+    # bytes count. Once the stack is no longer read-only, this node's consumers write the shape:
+    # read through the writer, as a request starting now would. On the disk alone it would miss
+    # the changes the writer still buffers, park again, and the check on parking would take the
+    # disk's older offset for a regression and answer 409 must-refetch. See read_disk_only?/1.
+    %{request | last_offset: latest_log_offset, read_only?: read_disk_only?(request)}
     |> determine_global_last_seen_lsn()
     |> determine_log_chunk_offset()
     |> determine_up_to_date()
     |> do_serve_shape_log()
+  end
+
+  # A client ahead of this instance's log (see do_serve_shape_log/1 for out-of-bounds requests)
+  # must not get the timeout's answer: it carries this log's lower offset, which the client
+  # would adopt, then apply again rows it already has. It retries later from its own offset.
+  defp handle_live_change_result(:shutdown, request) when is_out_of_bounds(request) do
+    Response.error(request, "The server is shutting down", status: 503, retry_after: 5)
+  end
+
+  # Otherwise answer as at the timeout: the client is at this log's tip.
+  defp handle_live_change_result(:shutdown, request) do
+    handle_live_change_result(:long_poll_timeout, request)
   end
 
   defp handle_live_change_result(:client_disconnect, request) do
@@ -934,7 +1170,7 @@ defmodule Electric.Shapes.Api do
   end
 
   defp handle_live_change_result(:out_of_bounds_timeout, request) do
-    %{api: api, handle: shape_handle} = request
+    %{handle: shape_handle} = request
 
     Logger.debug(fn ->
       "Client #{inspect(self())} timed out waiting for " <>
@@ -950,7 +1186,27 @@ defmodule Electric.Shapes.Api do
         |> do_serve_shape_log()
 
       _ ->
-        Response.invalid_request(api, errors: @offset_out_of_bounds)
+        if Electric.StatusMonitor.status(request.api.stack_id).shape == :read_only or
+             read_disk_only?(request) do
+          # Read-only, this node sees only the bytes synced to disk, and a client can be ahead
+          # of them: after a stop that killed the writer, by what it had not synced yet. Once
+          # the stack is active, the replay writes those transactions again at the same offsets,
+          # so ask the client to come back then, at the same offset, rather than refetch.
+          Response.error(request, "The shape log is not fully restored yet",
+            handle: shape_handle,
+            status: 503,
+            retry_after: 5
+          )
+        else
+          # The client holds an offset this shape's log does not reach and waiting did not close
+          # the gap, so it is asking for a position that no longer exists here. A 4xx other than
+          # 409 ends the stream: the client treats it as unactionable, does not back off, and
+          # re-presents the same offset on every restart. Refetching is the only way out of that
+          # state, so say so. The handle is still valid -- only the offset is not.
+          error = Api.Error.must_refetch()
+
+          Response.error(request, error.message, handle: shape_handle, status: error.status)
+        end
     end
   end
 
@@ -992,6 +1248,22 @@ defmodule Electric.Shapes.Api do
         Response.error(request, message, status: 503, retry_after: 10)
     end
   end
+
+  # A live request that started read-only keeps to the disk until this node writes the shape:
+  # until then another instance may write it, or this one is restoring, and a read-only storage
+  # handle leaves to the writer a shape whose files the read finds damaged. This node writes the
+  # shape once the stack reports up, and before that once the shape's consumer runs here, which
+  # only an instance holding the replication lock starts: the consumer can write a change and
+  # announce it before the status monitor hears that the log collector is ready, and the disk
+  # does not have that change yet. A status monitor that restarts reports the stack starting.
+  defp read_disk_only?(%Request{read_only?: true} = request) do
+    %{api: %{stack_id: stack_id}, handle: shape_handle} = request
+
+    Electric.StatusMonitor.status(stack_id).shape != :up and
+      is_nil(Shapes.ConsumerRegistry.whereis(stack_id, shape_handle))
+  end
+
+  defp read_disk_only?(%Request{}), do: false
 
   # Check if the latest offset on disk has advanced beyond what the request
   # last saw. This is useful in read-only mode where no consumer process is
@@ -1061,64 +1333,22 @@ defmodule Electric.Shapes.Api do
 
   defp next_sse_event(%SseState{mode: :receive} = state) do
     %{
-      keepalive_ref: keepalive_ref,
       last_message_time: last_message_time,
-      request:
-        %{
-          api: %{
-            stack_id: stack_id,
-            keepalive_interval: keepalive_interval
-          },
-          handle: shape_handle,
-          new_changes_ref: ref
-        } = request,
+      request: %{
+        api: %{keepalive_interval: keepalive_interval},
+        new_changes_ref: ref
+      },
       since_offset: since_offset
     } = state
 
     receive do
+      # An earlier segment already read up to or past this change.
+      {^ref, :new_changes, latest_log_offset}
+      when is_log_offset_lte(latest_log_offset, since_offset) ->
+        {[], state}
+
       {^ref, :new_changes, latest_log_offset} ->
-        updated_request =
-          %{request | last_offset: latest_log_offset}
-          |> determine_global_last_seen_lsn()
-          |> determine_log_chunk_offset()
-          |> determine_up_to_date()
-
-        # This is usually but not always the `latest_log_offset`
-        # as per `determine_log_chunk_offset/1`.
-        end_offset = updated_request.chunk_end_offset
-
-        case Shapes.get_merged_log_stream(
-               stack_id,
-               shape_handle,
-               since: since_offset,
-               up_to: end_offset,
-               live_sse: true
-             ) do
-          {:ok, log} ->
-            Process.cancel_timer(keepalive_ref)
-
-            control_messages = maybe_up_to_date(updated_request, end_offset.tx_offset)
-            message_stream = Stream.concat(log, control_messages)
-            encoded_stream = encode_log(updated_request, message_stream)
-
-            current_time = System.monotonic_time(:millisecond)
-
-            new_keepalive_ref =
-              Process.send_after(self(), {:sse_keepalive, ref}, keepalive_interval)
-
-            {[],
-             %{
-               state
-               | mode: :emit,
-                 stream: encoded_stream,
-                 since_offset: end_offset,
-                 last_message_time: current_time,
-                 keepalive_ref: new_keepalive_ref
-             }}
-
-          {:error, _error} ->
-            {[], state}
-        end
+        stream_new_changes(state, latest_log_offset)
 
       {^ref, :shape_rotation} ->
         {[], %{state | mode: :done}}
@@ -1146,11 +1376,16 @@ defmodule Electric.Shapes.Api do
 
       {:sse_timeout, ^ref} ->
         {[], %{state | mode: :done}}
+
+      # As in wait_for_live_change/2: the server is stopping this connection.
+      {:EXIT, _from, :shutdown} = shutdown ->
+        send(self(), shutdown)
+        {[], %{state | mode: :done}}
     end
   end
 
   defp next_sse_event(%SseState{mode: :emit} = state) do
-    %{stream: stream} = state
+    %{stream: stream, catch_up_offset: catch_up_offset} = state
 
     # Can change the number taken to adjust the grouping. Currently three
     # because there's typically 3 elements per SSE -- the actual message
@@ -1159,8 +1394,15 @@ defmodule Electric.Shapes.Api do
     # The JSON encoder groups stream elements by 500. So perhaps this
     # could be a larger number for more efficiency?
     case StreamSplit.take_and_drop(stream, 3) do
-      {[], _tail} ->
+      {[], _tail} when is_nil(catch_up_offset) ->
         {[], %{state | mode: :receive, stream: nil}}
+
+      {[], _tail} ->
+        state = %{state | mode: :receive, stream: nil, catch_up_offset: nil}
+
+        if sse_stop_pending?(state.request.new_changes_ref),
+          do: {[], %{state | mode: :done}},
+          else: stream_new_changes(state, catch_up_offset)
 
       {head, tail} ->
         {head, %{state | stream: tail}}
@@ -1168,6 +1410,97 @@ defmodule Electric.Shapes.Api do
   end
 
   defp next_sse_event(%SseState{mode: :done} = state), do: {:halt, state}
+
+  # A catch-up goes from one segment to the next without waiting, so a timeout or a shutdown
+  # that came meanwhile is looked for between segments, and ends the response as it would
+  # while waiting for changes.
+  defp sse_stop_pending?(ref) do
+    receive do
+      {:sse_timeout, ^ref} ->
+        true
+
+      {:EXIT, _from, :shutdown} = shutdown ->
+        send(self(), shutdown)
+        true
+    after
+      0 -> false
+    end
+  end
+
+  defp stream_new_changes(%SseState{} = state, latest_log_offset) do
+    %{
+      keepalive_ref: keepalive_ref,
+      request:
+        %{
+          api: %{stack_id: stack_id, keepalive_interval: keepalive_interval},
+          handle: shape_handle,
+          new_changes_ref: ref
+        } = request,
+      since_offset: since_offset
+    } = state
+
+    # As for a long poll's new changes: a stream that started read-only reads the disk alone until
+    # this node writes the shape.
+    read_only? = read_disk_only?(request)
+
+    # The chunk end and up-to-date are worked out from where this segment
+    # starts, not from the request's original offset, which the log may
+    # already have passed.
+    updated_request =
+      %{
+        request
+        | last_offset: latest_log_offset,
+          read_only?: read_only?,
+          params: %{request.params | offset: since_offset}
+      }
+      |> determine_global_last_seen_lsn()
+      |> determine_log_chunk_offset()
+      |> determine_up_to_date()
+
+    # This is usually but not always the `latest_log_offset`
+    # as per `determine_log_chunk_offset/1`.
+    end_offset = updated_request.chunk_end_offset
+
+    case Shapes.get_merged_log_stream(
+           stack_id,
+           shape_handle,
+           since: since_offset,
+           up_to: end_offset,
+           live_sse: true,
+           read_only?: read_only?
+         ) do
+      {:ok, log} ->
+        Process.cancel_timer(keepalive_ref)
+
+        control_messages = maybe_up_to_date(updated_request, end_offset.tx_offset)
+        message_stream = Stream.concat(log, control_messages)
+        encoded_stream = encode_log(updated_request, message_stream)
+
+        current_time = System.monotonic_time(:millisecond)
+
+        new_keepalive_ref =
+          Process.send_after(self(), {:sse_keepalive, ref}, keepalive_interval)
+
+        # A segment that stops at a chunk boundary carries no up-to-date, so
+        # the rest of the log follows it at once rather than on the next change.
+        catch_up_offset =
+          if updated_request.response.up_to_date, do: nil, else: latest_log_offset
+
+        {[],
+         %{
+           state
+           | mode: :emit,
+             stream: encoded_stream,
+             since_offset: end_offset,
+             catch_up_offset: catch_up_offset,
+             last_message_time: current_time,
+             keepalive_ref: new_keepalive_ref
+         }}
+
+      {:error, _error} ->
+        {[], state}
+    end
+  end
 
   defp no_change_response(%Request{} = request) do
     %{response: response, global_last_seen_lsn: global_last_seen_lsn} =
@@ -1177,7 +1510,7 @@ defmodule Electric.Shapes.Api do
       response
       | status: 200,
         no_changes: true,
-        body: encode_log(request, [up_to_date_ctl(global_last_seen_lsn)])
+        body: encode_log(request, [up_to_date_ctl(request, global_last_seen_lsn)])
     }
   end
 
@@ -1187,17 +1520,33 @@ defmodule Electric.Shapes.Api do
     end)
   end
 
-  defp maybe_up_to_date(%Request{response: %{up_to_date: true}}, up_to_date_lsn) do
-    [up_to_date_ctl(up_to_date_lsn)]
+  defp maybe_up_to_date(%Request{response: %{up_to_date: true}} = request, up_to_date_lsn) do
+    [up_to_date_ctl(request, up_to_date_lsn)]
   end
 
   defp maybe_up_to_date(%Request{response: %{up_to_date: false}}, _) do
     []
   end
 
-  defp up_to_date_ctl(up_to_date_lsn) do
+  defp up_to_date_ctl(%Request{covered_lsn: nil}, up_to_date_lsn) do
     %{headers: %{control: "up-to-date", global_last_seen_lsn: to_string(up_to_date_lsn)}}
   end
+
+  defp up_to_date_ctl(%Request{covered_lsn: covered_lsn}, up_to_date_lsn) do
+    %{
+      headers: %{
+        control: "up-to-date",
+        global_last_seen_lsn: to_string(up_to_date_lsn),
+        covered_lsn: to_string(covered_lsn)
+      }
+    }
+  end
+
+  # A response that reaches the chunk end holds every change of the transactions up to it.
+  defp cover_chunk_end(%Request{covered_lsn: nil} = request), do: request
+
+  defp cover_chunk_end(%Request{covered_lsn: covered_lsn, chunk_end_offset: chunk_end} = request),
+    do: %{request | covered_lsn: max(covered_lsn, chunk_end.tx_offset)}
 
   defp with_span(%Request{} = request, name, attributes \\ [], fun) do
     OpenTelemetry.with_span(name, attributes, stack_id(request), fn ->
@@ -1267,7 +1616,9 @@ defmodule Electric.Shapes.Api do
     # version if it's invalidated in ETS or server is restarted.
     case Inspector.load_column_info(shape.root_table_id, inspector) do
       {:ok, columns} ->
-        Electric.Schema.from_column_info(columns, shape.selected_columns)
+        shape
+        |> Shapes.Shape.projected_column_info(columns)
+        |> Electric.Schema.from_column_info(shape.selected_columns)
 
       {:error, :connection_not_available} ->
         # TODO: we currently only convert DBConnection errors to proper 503s, we should

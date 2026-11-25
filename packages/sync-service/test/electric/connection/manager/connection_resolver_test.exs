@@ -6,6 +6,7 @@ defmodule Electric.Connection.Manager.ConnectionResolverTest do
 
   import Support.ComponentSetup, only: [with_stack_id_from_test: 1]
   import Support.DbSetup
+  import ExUnit.CaptureLog
 
   defp start_connection_resolver!(ctx, connection_mod \\ nil) do
     opts = [stack_id: ctx.stack_id]
@@ -116,6 +117,7 @@ defmodule Electric.Connection.Manager.ConnectionResolverTest do
     assert_obfuscated_password(resolved_db_config)
   end
 
+  @tag :public_dns
   test "fallback to ipv4 works", ctx do
     start_connection_resolver!(ctx)
 
@@ -169,6 +171,89 @@ defmodule Electric.Connection.Manager.ConnectionResolverTest do
     end
 
     assert_obfuscated_password(resolved_db_config)
+  end
+
+  test "verify-full builds verifying ssl opts with system roots when no CA file is given", ctx do
+    ssl_opts = resolved_ssl_opts(ctx, sslmode: :"verify-full")
+
+    assert Keyword.get(ssl_opts, :verify) == :verify_peer
+    assert Keyword.has_key?(ssl_opts, :customize_hostname_check)
+    assert Keyword.has_key?(ssl_opts, :cacerts) or Keyword.has_key?(ssl_opts, :cacertfile)
+  end
+
+  test "verify-ca verifies the chain but not the hostname", ctx do
+    ssl_opts = resolved_ssl_opts(ctx, sslmode: :"verify-ca", cacertfile: "/tmp/ca.crt")
+
+    assert Keyword.get(ssl_opts, :verify) == :verify_peer
+    assert Keyword.get(ssl_opts, :cacertfile) == "/tmp/ca.crt"
+    refute Keyword.has_key?(ssl_opts, :customize_hostname_check)
+  end
+
+  test "require without a CA file encrypts but does not verify the certificate", ctx do
+    ssl_opts = resolved_ssl_opts(ctx, sslmode: :require)
+
+    assert Keyword.get(ssl_opts, :verify) == :verify_none
+  end
+
+  test "verify-full does not downgrade to an unencrypted connection", ctx do
+    start_connection_resolver!(ctx, {ErrorConnection, :start_link, [ssl_unavailable_fun()]})
+
+    db_config = Keyword.put(ctx.db_config, :sslmode, :"verify-full")
+
+    assert {:error, %Postgrex.Error{message: "ssl not available"}} =
+             ConnectionResolver.validate(ctx.stack_id, db_config)
+  end
+
+  test "an unspecified sslmode logs when it downgrades to an unencrypted connection", ctx do
+    start_connection_resolver!(ctx, {ErrorConnection, :start_link, [ssl_unavailable_fun()]})
+
+    db_config = Keyword.delete(ctx.db_config, :sslmode)
+
+    log =
+      capture_log(fn ->
+        assert {:ok, resolved_db_config} = ConnectionResolver.validate(ctx.stack_id, db_config)
+        assert Keyword.get(resolved_db_config, :ssl) == false
+      end)
+
+    assert log =~ "using an unencrypted connection"
+  end
+
+  defp resolved_ssl_opts(ctx, overrides) do
+    test_pid = self()
+    conn = spawn(fn -> Process.sleep(:infinity) end)
+
+    start_connection_resolver!(
+      ctx,
+      {ErrorConnection, :start_link,
+       [
+         fn conn_opts ->
+           send(test_pid, {:ssl_opts, Keyword.get(conn_opts, :ssl)})
+           {:ok, conn}
+         end
+       ]}
+    )
+
+    db_config =
+      ctx.db_config
+      |> Keyword.delete(:sslmode)
+      |> Keyword.delete(:cacertfile)
+      |> Keyword.merge(overrides)
+
+    assert {:ok, _} = ConnectionResolver.validate(ctx.stack_id, db_config)
+    assert_receive {:ssl_opts, ssl_opts}
+    ssl_opts
+  end
+
+  defp ssl_unavailable_fun do
+    conn = spawn(fn -> Process.sleep(:infinity) end)
+
+    fn conn_opts ->
+      if Keyword.get(conn_opts, :ssl) do
+        {:error, %Postgrex.Error{message: "ssl not available"}}
+      else
+        {:ok, conn}
+      end
+    end
   end
 
   defp ipv6_error_message(hostname) do

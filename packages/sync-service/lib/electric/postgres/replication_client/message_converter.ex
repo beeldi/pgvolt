@@ -69,9 +69,22 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
           | {:buffering, t()}
           | {:error, {:replica_not_full, String.t()}}
           | {:error, {:exceeded_max_tx_size, String.t()}}
+          | {:error, {:unexpected_transaction_start, String.t()}}
   def convert(%LR.Message{} = msg, state) do
     Logger.notice("Got a message from PG via logical replication: #{inspect(msg)}")
     {:buffering, state}
+  end
+
+  # A transaction start while a previous transaction is still buffered would overwrite the
+  # pending fragment and drop its changes with no error, log, or counter — the only silent-drop
+  # path in the converter. Postgres does not interleave transactions on a logical replication
+  # slot, so two consecutive starts mean a decoding desync; fail loudly instead of losing data.
+  def convert(%LR.Begin{}, %__MODULE__{txn_fragment: fragment}) when not is_nil(fragment) do
+    {:error,
+     {:unexpected_transaction_start,
+      "Received a transaction start from PG while a previous transaction was still open " <>
+        "(#{fragment.change_count} change(s) buffered). Postgres does not interleave " <>
+        "transactions on a logical replication slot, so this indicates a decoding desync."}}
   end
 
   def convert(%LR.Begin{} = msg, %__MODULE__{} = state) do
@@ -84,6 +97,7 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
          tx_started_at: System.monotonic_time(),
          txn_fragment: %TransactionFragment{
            xid: msg.xid,
+           full_xid: msg.full_xid,
            lsn: msg.final_lsn,
            has_begin?: true
          }
@@ -92,6 +106,17 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
 
   def convert(%LR.Origin{} = _msg, state), do: {:buffering, state}
   def convert(%LR.Type{}, state), do: {:buffering, state}
+
+  # The decoder maps any frame it does not recognise to %LR.Unsupported{}. Reachable only if the
+  # protocol version is raised or streaming/two-phase options are enabled on the slot, and this
+  # client requests neither (logical-message frames decode to %LR.Message{}). Skip it with a
+  # loud log rather than crash: an unhandled struct raises FunctionClauseError with no rescue in
+  # the data handler, and the reconnect replays the same bytes into the same crash, a
+  # deterministic loop that never drains the slot.
+  def convert(%LR.Unsupported{} = msg, state) do
+    Logger.error("Skipping an unrecognised Postgres replication message: #{inspect(msg)}")
+    {:buffering, state}
+  end
 
   def convert(%{bytes: bytes} = _msg, %__MODULE__{
         max_tx_size: max,
@@ -257,12 +282,22 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
   defp data_tuple_to_map(columns, tuple_data, value_fun) do
     columns
     |> Enum.zip(tuple_data)
-    |> Map.new(fn {%{name: column_name}, value} ->
-      {column_name, value_fun.(column_name, value)}
+    |> Map.new(fn {%{name: column_name, type_oid: type_oid}, value} ->
+      {column_name, value_fun.(column_name, as_cast_to_text(type_oid, value))}
     end)
   end
 
   defp column_value(_column_name, value), do: value
+
+  @bool_oid 16
+
+  # Snapshots read columns as `column::text`, which writes booleans as `true`/`false`; logical
+  # replication sends `t`/`f`. A boolean in the primary key would give a row two keys, so
+  # replicated booleans are written as the cast writes them. `bool[]::text` writes `{t,f}` in
+  # both paths, so arrays are left alone.
+  defp as_cast_to_text(@bool_oid, "t"), do: "true"
+  defp as_cast_to_text(@bool_oid, "f"), do: "false"
+  defp as_cast_to_text(_type_oid, value), do: value
 
   defp current_offset(state) do
     LogOffset.new(state.txn_fragment.lsn, state.tx_op_index)
@@ -328,6 +363,7 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverter do
         state
         | txn_fragment: %TransactionFragment{
             xid: fragment.xid,
+            full_xid: fragment.full_xid,
             lsn: fragment.lsn
           }
       }

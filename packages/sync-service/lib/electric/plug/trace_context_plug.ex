@@ -14,11 +14,14 @@ defmodule Electric.Plug.TraceContextPlug do
   letting tracing backends that understand sampling weights scale aggregates by the upstream
   sampling rate (see `sample_rate_attrs/2`);
 
-  Hints that are missing, unparseable or have a rate below 1 are ignored.
+  Hints that are missing, unparseable, below 1 or above the largest signed 64-bit integer (the
+  largest an OpenTelemetry integer attribute holds) are ignored. When
+  `ELECTRIC_OTEL_TRUSTED_SAMPLE_RATES` is set, only listed rates are used.
   """
 
   @behaviour Plug
 
+  alias Electric.Config
   alias Electric.Telemetry.OpenTelemetry
 
   @private_key :electric_trace_context
@@ -102,8 +105,11 @@ defmodule Electric.Plug.TraceContextPlug do
     with value when is_binary(value) <-
            OpenTelemetry.tracestate_value(span_ctx, @tracestate_key),
          "rate:" <> rate_str <- value,
-         {rate, ""} when rate >= 1 <- Integer.parse(rate_str) do
-      rate
+         rate when is_integer(rate) <- Config.parse_otel_sample_rate(rate_str) do
+      case Config.get_env(:otel_trusted_sample_rates) do
+        nil -> rate
+        rates -> if MapSet.member?(rates, rate), do: rate
+      end
     else
       _ -> nil
     end

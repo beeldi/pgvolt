@@ -355,7 +355,7 @@ defmodule Electric.ShapeCache.InMemoryStorage do
     Stream.unfold({initial_offset, {:movein, {name, nil}}}, fn {offset, last_key} ->
       case :ets.next_lookup(log_table, last_key) do
         {{:movein, {^name, _}} = ets_key, [{{:movein, {^name, key}}, {tags, json}}]} ->
-          if skip_row?.(key, tags) do
+          if skip_row?.(key, tags, json) do
             {[], {offset, ets_key}}
           else
             offset = LogOffset.increment(offset)

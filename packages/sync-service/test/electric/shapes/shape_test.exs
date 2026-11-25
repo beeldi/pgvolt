@@ -1015,6 +1015,42 @@ defmodule Electric.Shapes.ShapeTest do
                ["$sublink", "1"] => {:array, :text}
              }
     end
+
+    test "keeps a composite subquery's select list in the order it names its columns" do
+      inspector =
+        Support.StubInspector.new(%{
+          "item" => [
+            %{name: "id", pk_position: 0},
+            %{name: "x", type: "int4", type_id: {23, -1}},
+            %{name: "y"}
+          ],
+          "rel" => [
+            %{name: "a", pk_position: 0},
+            %{name: "z", type: "int4", type_id: {23, -1}}
+          ]
+        })
+
+      assert {:ok, %Shape{where: where, shape_dependencies: dependencies}} =
+               Shape.new("item",
+                 inspector: inspector,
+                 where: "(x, y) IN (SELECT z, a FROM rel) OR (y, x) IN (SELECT a, z FROM rel)"
+               )
+
+      assert Enum.map(dependencies, & &1.explicitly_selected_columns) == [["z", "a"], ["a", "z"]]
+
+      assert where.query ==
+               "(x, y) IN (SELECT z, a FROM public.rel) OR (y, x) IN (SELECT a, z FROM public.rel)"
+
+      assert where.used_refs == %{
+               ["x"] => :int4,
+               ["y"] => :text,
+               ["$sublink", "0"] => {:array, {:row, [:int4, :text]}},
+               ["$sublink", "1"] => {:array, {:row, [:text, :int4]}}
+             }
+
+      assert {:error, {:where, _}} =
+               Shape.new("item", inspector: inspector, where: "(x, y) IN (SELECT a, z FROM rel)")
+    end
   end
 
   describe "new!/2" do
@@ -1148,6 +1184,7 @@ defmodule Electric.Shapes.ShapeTest do
           root_column_count: 4,
           selected_columns: ["first", "second", "third", "fourth"],
           queryable_columns: nil,
+          composite_tag_encoding: :legacy,
           flags: %{selects_all_columns: true},
           where: nil
         }
@@ -1166,9 +1203,66 @@ defmodule Electric.Shapes.ShapeTest do
 
       assert {:ok, json} = Jason.encode(shape)
       assert {:ok, decoded} = Jason.decode!(json) |> Shape.from_json_safe()
+      assert Shape.composite_tag_encoding(decoded) == :length_prefixed
+
+      assert {:ok, legacy} =
+               json
+               |> Jason.decode!()
+               |> Map.delete("composite_tag_encoding")
+               |> Shape.from_json_safe()
+
+      assert Shape.composite_tag_encoding(legacy) == :legacy
+      assert Shape.comparable(legacy) == Shape.comparable(shape)
 
       # Locations change between serialization and deserialization, but that shouldn't affect equality
       assert Shape.comparable(shape) == Shape.comparable(decoded)
+    end
+  end
+
+  describe "is_affected_by_relation_change?/2" do
+    setup do
+      [
+        inspector:
+          Support.StubInspector.new(
+            tables: ["the_table"],
+            columns: [
+              %{name: "id", type: "int8", pk_position: 0},
+              %{name: "value", type: "int8", pk_position: nil}
+            ]
+          )
+      ]
+    end
+
+    # Filter.affected_shapes/2 narrows relation events to the shapes indexed under
+    # the relation's OID or under its qualified name, and only then evaluates this
+    # predicate. A clause that answers true when neither matches would be
+    # unreachable there, silently dropping relation changes for those shapes.
+    test "is false when the relation shares neither the OID nor the qualified name", %{
+      inspector: inspector
+    } do
+      assert {:ok, %Shape{} = shape} = Shape.new("the_table", inspector: inspector)
+
+      Enum.each(
+        [
+          %{schema: "public", table: "other_table"},
+          %{schema: "other_schema", table: "the_table"}
+        ],
+        fn %{schema: schema, table: table} ->
+          Enum.each([[], ["id"], ["id", "value"]], fn affected_columns ->
+            Enum.each([[], ["id"], ["id", "value"], ["id", "value", "extra"]], fn columns ->
+              relation = %Changes.Relation{
+                id: shape.root_table_id + 1,
+                schema: schema,
+                table: table,
+                columns: columns,
+                affected_columns: affected_columns
+              }
+
+              refute Shape.is_affected_by_relation_change?(shape, relation)
+            end)
+          end)
+        end
+      )
     end
   end
 

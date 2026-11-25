@@ -1283,7 +1283,7 @@ defmodule Electric.ClientTest do
                %ResumeMessage{
                  shape_handle: "my-shape",
                  offset: "2_0",
-                 schema: %{id: %{type: "text"}}
+                 schema: %{"id" => %{type: "text"}}
                }
              ] = events
     end
@@ -1332,7 +1332,7 @@ defmodule Electric.ClientTest do
       resume = %ResumeMessage{
         shape_handle: "my-shape",
         offset: "2_0",
-        schema: %{id: %{type: "text"}}
+        schema: %{"id" => %{type: "text"}}
       }
 
       events = stream(ctx, 3, resume: resume)
@@ -1451,7 +1451,7 @@ defmodule Electric.ClientTest do
                %ResumeMessage{
                  shape_handle: "my-shape",
                  offset: "3_0",
-                 schema: %{id: %{type: "text"}}
+                 schema: %{"id" => %{type: "text"}}
                }
              ] = events
     end
@@ -1534,7 +1534,7 @@ defmodule Electric.ClientTest do
                %ResumeMessage{
                  shape_handle: "my-shape",
                  offset: "3_0",
-                 schema: %{id: %{type: "text"}}
+                 schema: %{"id" => %{type: "text"}}
                }
              ] = events
     end
@@ -2904,10 +2904,9 @@ defmodule Electric.ClientTest do
 
       schema = Jason.encode!(%{"id" => %{type: "text"}})
 
-      # Always return the stale handle (simulating broken CDN). After
-      # self-healing clears the expired entry, this same handle is accepted as
-      # fresh, but offset never advances — so fast-loop detection eventually
-      # fires.
+      # Always return the stale handle (simulating broken CDN). Self-healing
+      # stops sending the expired handle, but the client still knows it is
+      # expired, so the same handle coming back ends in the self-heal error.
       Bypass.expect(ctx.bypass, fn conn ->
         bypass_resp(conn, "[]",
           shape_handle: "permanently-stale-handle",
@@ -2916,8 +2915,43 @@ defmodule Electric.ClientTest do
         )
       end)
 
-      assert_raise Client.Error, ~r/stale cached responses|fast retry loop/, fn ->
+      assert_raise Client.Error, ~r/one self-heal attempt/, fn ->
         stream(ctx) |> Enum.take(1)
+      end
+    end
+
+    test "does not emit rows from a response that carries the expired handle after self-healing",
+         ctx do
+      alias Electric.Client.ShapeKey
+      alias Electric.Client.ExpiredShapesCache
+
+      shape_params = ShapeDefinition.params(ctx.shape)
+      shape_key = ShapeKey.canonical(ctx.client.endpoint, shape_params)
+      ExpiredShapesCache.mark_expired(shape_key, "permanently-stale-handle")
+
+      schema = Jason.encode!(%{"id" => %{type: "text"}})
+
+      # The cached response is a snapshot that the earlier must-refetch invalidated.
+      stale_body =
+        Jason.encode!([
+          %{
+            "headers" => %{"operation" => "insert"},
+            "offset" => "1_0",
+            "value" => %{"id" => "revoked"}
+          },
+          %{"headers" => %{"control" => "up-to-date", "global_last_seen_lsn" => 9999}}
+        ])
+
+      Bypass.stub(ctx.bypass, "GET", "/v1/shape", fn conn ->
+        bypass_resp(conn, stale_body,
+          shape_handle: "permanently-stale-handle",
+          last_offset: "1_0",
+          schema: schema
+        )
+      end)
+
+      assert_raise Client.Error, ~r/one self-heal attempt/, fn ->
+        stream(ctx) |> Enum.take(3)
       end
     end
 

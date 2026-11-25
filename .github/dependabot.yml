@@ -1,0 +1,36 @@
+# Security updates only. `open-pull-requests-limit: 0` disables routine version bumps while
+# leaving security advisories enabled, so the fork gets told about a vulnerable dependency it
+# carries without a standing stream of upgrade PRs for a tree it tracks from upstream.
+version: 2
+updates:
+  - package-ecosystem: mix
+    directory: /packages/sync-service
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: npm
+    directory: /packages/typescript-client
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: docker
+    directory: /packages/sync-service
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 0

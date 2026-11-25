@@ -1,5 +1,10 @@
 import { ColumnInfo, GetExtensions, Row, Schema, Value } from './types'
-import { ParserNullValueError } from './error'
+import {
+  ParserArrayBoundsError,
+  ParserArrayDepthError,
+  ParserArrayShapeError,
+  ParserNullValueError,
+} from './error'
 
 type Token = string
 type NullableToken = Token | null
@@ -26,7 +31,42 @@ export type TransformFunction<Extensions = never> = (
 const parseNumber = (value: string) => Number(value)
 const parseBool = (value: string) => value === `true` || value === `t`
 const parseBigInt = (value: string) => BigInt(value)
-const parseJson = (value: string) => JSON.parse(value)
+
+// JSON.parse rounds any integer past 2^53 to a double before a reviver sees the
+// value; `context.source` (JSON source-text access) exposes the original literal
+// so json/jsonb carry large integers as the exact bigints int8 already yields.
+type JsonSourceContext = { source: string }
+
+const integerLiteral = /^-?\d+$/
+
+const reviveLosslessBigInt = (
+  _key: string,
+  value: unknown,
+  context?: JsonSourceContext
+): unknown =>
+  typeof value === `number` &&
+  !Number.isSafeInteger(value) &&
+  context !== undefined &&
+  integerLiteral.test(context.source)
+    ? BigInt(context.source)
+    : value
+
+// A reviver makes JSON.parse walk the parsed value recursively, which overflows the call stack
+// on a document nested a few thousand levels deep, though JSON.parse alone reads it and Postgres
+// stores it. Only a run of 16 digits can be an integer past 2^53, so a document without one
+// skips the reviver. One with such a run that is nested too deep keeps its numbers as doubles.
+const unsafeIntegerCandidate = /\d{16}/
+
+const parseJson = (value: string) => {
+  if (!unsafeIntegerCandidate.test(value)) return JSON.parse(value)
+
+  try {
+    return JSON.parse(value, reviveLosslessBigInt)
+  } catch (error) {
+    if (error instanceof RangeError) return JSON.parse(value)
+    throw error
+  }
+}
 const identityParser: ParseFunction = (v: string) => v
 
 export const defaultParser: Parser = {
@@ -40,17 +80,45 @@ export const defaultParser: Parser = {
   jsonb: parseJson,
 }
 
+// Types whose default parser silently coerces an unexpected shape (a numeric
+// literal to NaN, a boolean to false) instead of failing. A Postgres array
+// literal can never be a scalar value of one of these, so its arrival under a
+// scalar schema entry is a schema/wire mismatch we surface loudly.
+const scalarTypesRejectingArrayLiterals = new Set([
+  `int2`,
+  `int4`,
+  `int8`,
+  `float4`,
+  `float8`,
+  `bool`,
+])
+
+const looksLikePgArrayLiteral = (value: string) =>
+  value.startsWith(`{`) || value.startsWith(`[`)
+
+// Postgres refuses an array of more than 6 dimensions (MAXDIM), so a literal
+// nested deeper is not from Postgres and is refused before it can exhaust the
+// stack of the recursive parser.
+const MAX_ARRAY_DIMENSIONS = 6
+
+const explicitArrayBoundsPrefix = /^(\[-?\d+:-?\d+\])+=/
+
 // Taken from: https://github.com/electric-sql/pglite/blob/main/packages/pglite/src/types.ts#L233-L279
 export function pgArrayParser<Extensions>(
   value: Token,
   parser?: NullableParseFunction<Extensions>
 ): Value<Extensions> {
+  if (explicitArrayBoundsPrefix.test(value)) {
+    throw new ParserArrayBoundsError(value)
+  }
+
   let i = 0
   let char = null
   let str = ``
   let quoted = false
   let last = 0
   let p: string | undefined = undefined
+  let depth = 0
 
   function extractValue(x: Token, start: number, end: number) {
     let val: Token | null = x.slice(start, end)
@@ -77,7 +145,11 @@ export function pgArrayParser<Extensions>(
         quoted = true
       } else if (char === `{`) {
         last = ++i
+        if (++depth > MAX_ARRAY_DIMENSIONS) {
+          throw new ParserArrayDepthError(MAX_ARRAY_DIMENSIONS)
+        }
         xs.push(loop(x))
+        depth--
       } else if (char === `}`) {
         quoted = false
         last < i && xs.push(extractValue(x, last, i))
@@ -89,7 +161,7 @@ export function pgArrayParser<Extensions>(
       }
       p = char
     }
-    last < i && xs.push(xs.push(extractValue(x, last, i + 1)))
+    last < i && xs.push(extractValue(x, last, i + 1))
     return xs
   }
 
@@ -195,13 +267,30 @@ export class MessageParser<T extends Row<unknown>> {
     const parser = makeNullableParser(typeParser, columnInfo, key)
 
     if (dimensions && dimensions > 0) {
-      // It's an array
+      // It's an array. A NOT NULL constraint applies to the array value, never
+      // to its elements: `int[] NOT NULL` still permits `{1,NULL,3}`. So the
+      // element parser is always nullable and only the array value itself is
+      // held to `not_null`.
+      const elementParser = makeNullableParser(
+        typeParser,
+        { ...columnInfo, not_null: false },
+        key
+      )
       const nullablePgArrayParser = makeNullableParser(
-        (value, _) => pgArrayParser(value, parser),
+        (value, _) => pgArrayParser(value, elementParser),
         columnInfo,
         key
       )
       return nullablePgArrayParser(value)
+    }
+
+    if (
+      value !== null &&
+      typeParser === defaultParser[typ] &&
+      scalarTypesRejectingArrayLiterals.has(typ) &&
+      looksLikePgArrayLiteral(value)
+    ) {
+      throw new ParserArrayShapeError(key, typ)
     }
 
     return parser(value, additionalInfo)

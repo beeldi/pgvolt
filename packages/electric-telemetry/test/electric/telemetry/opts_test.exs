@@ -8,6 +8,43 @@ defmodule ElectricTelemetry.OptsTest do
     ElectricTelemetry.validate_options(opts)
   end
 
+  describe "disk usage scan" do
+    test "runs every minute by default" do
+      assert {:ok, opts} = validate(stack_id: "stack", storage_dir: "/tmp/storage")
+      assert opts.intervals_and_thresholds.disk_usage_scan_period == 60_000
+
+      assert [{ElectricTelemetry.DiskUsage, child_opts}] =
+               ElectricTelemetry.StackTelemetry.disk_usage_child_specs(opts)
+
+      assert Keyword.fetch!(child_opts, :update_period) == 60_000
+    end
+
+    test "uses the configured period" do
+      assert {:ok, opts} =
+               validate(
+                 stack_id: "stack",
+                 storage_dir: "/tmp/storage",
+                 intervals_and_thresholds: [disk_usage_scan_period: 600_000]
+               )
+
+      assert [{ElectricTelemetry.DiskUsage, child_opts}] =
+               ElectricTelemetry.StackTelemetry.disk_usage_child_specs(opts)
+
+      assert Keyword.fetch!(child_opts, :update_period) == 600_000
+    end
+
+    test "is off with a period of 0" do
+      assert {:ok, opts} =
+               validate(
+                 stack_id: "stack",
+                 storage_dir: "/tmp/storage",
+                 intervals_and_thresholds: [disk_usage_scan_period: 0]
+               )
+
+      assert [] = ElectricTelemetry.StackTelemetry.disk_usage_child_specs(opts)
+    end
+  end
+
   describe "top_process_limit validation" do
     test "accepts {:count, N}" do
       assert {:ok, %{intervals_and_thresholds: %{top_process_limit: {:count, 10}}}} =

@@ -4,6 +4,7 @@ defmodule Electric.Client.EmbeddedTest do
   alias Electric.Client
   alias Electric.Client.Message.{ChangeMessage, ControlMessage}
   alias Electric.Client.ShapeDefinition
+  alias Electric.Client.ShapeState
 
   import Support.DbSetup
   import Support.ClientHelpers
@@ -191,6 +192,99 @@ defmodule Electric.Client.EmbeddedTest do
 
     # 1 timestamp for the snapshot, 1 for the up-to-date response
     assert length(Enum.uniq_by(msgs, & &1.request_timestamp)) == 2
+  end
+
+  describe "parameterised where clauses" do
+    test "streams a shape whose params are given as a map", ctx do
+      %{tablename: table} = ctx
+
+      {:ok, id1} = insert_item(ctx, title: "wanted")
+      {:ok, id2} = insert_item(ctx, title: "wanted too")
+      {:ok, _id3} = insert_item(ctx, title: "unwanted")
+
+      shape =
+        ShapeDefinition.new!(table,
+          where: "id IN ($1::uuid, $2::uuid) AND value = $3::int8",
+          params: %{1 => id1, 2 => id2, 3 => 0}
+        )
+
+      assert [
+               %ChangeMessage{value: %{"id" => ^id1, "title" => "wanted"}},
+               %ChangeMessage{value: %{"id" => ^id2, "title" => "wanted too"}},
+               up_to_date()
+             ] = stream(%{ctx | shape: shape}, 3)
+    end
+
+    test "streams a shape whose params are given as a list", ctx do
+      %{tablename: table} = ctx
+
+      {:ok, id1} = insert_item(ctx, title: "wanted")
+      {:ok, _id2} = insert_item(ctx, title: "unwanted")
+
+      shape = ShapeDefinition.new!(table, where: "title = $1", params: ["wanted"])
+
+      assert [
+               %ChangeMessage{value: %{"id" => ^id1, "title" => "wanted"}},
+               up_to_date()
+             ] = stream(%{ctx | shape: shape}, 2)
+    end
+
+    test "polls a shape with params", ctx do
+      %{tablename: table, client: client} = ctx
+
+      {:ok, id1} = insert_item(ctx, title: "wanted")
+      {:ok, id2} = insert_item(ctx, title: "wanted too")
+      {:ok, _id3} = insert_item(ctx, title: "unwanted")
+
+      shape =
+        ShapeDefinition.new!(table,
+          where: "id IN ($1::uuid, $2::uuid)",
+          params: %{1 => id1, 2 => id2}
+        )
+
+      on_exit(fn ->
+        ExUnit.CaptureLog.capture_log(fn -> Client.delete_shape(client, shape) end)
+      end)
+
+      assert {:ok, messages, %ShapeState{}} =
+               Client.poll(client, shape, ShapeState.new())
+
+      ids = for %ChangeMessage{value: %{"id" => id}} <- messages, do: id
+      assert Enum.sort(ids) == Enum.sort([id1, id2])
+    end
+
+    test "deletes a shape that has params", ctx do
+      %{tablename: table} = ctx
+      {:ok, client} = Client.embedded(allow_shape_deletion?: true)
+
+      {:ok, id1} = insert_item(ctx)
+
+      shape = ShapeDefinition.new!(table, where: "id = $1::uuid", params: [id1])
+
+      assert {:ok, [_ | _], %ShapeState{shape_handle: handle}} =
+               Client.poll(client, shape, ShapeState.new())
+
+      assert %Electric.Client.Fetch.Response{status: 202} =
+               Client.delete_shape(client, shape)
+
+      assert {:ok, [_ | _], %ShapeState{shape_handle: new_handle}} =
+               Client.poll(client, shape, ShapeState.new())
+
+      assert new_handle != handle
+
+      Client.delete_shape(client, shape)
+    end
+
+    test "reports a missing param as a request error", ctx do
+      %{tablename: table, client: client} = ctx
+
+      shape = ShapeDefinition.new!(table, where: "title = $1")
+
+      assert {:error, %Electric.Client.Error{message: message}} =
+               Client.poll(client, shape, ShapeState.new())
+
+      assert inspect(message) =~ "parameter $1 was not provided"
+    end
   end
 
   test "rejects zero-length columns", ctx do

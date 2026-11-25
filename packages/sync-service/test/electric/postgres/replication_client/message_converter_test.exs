@@ -512,6 +512,65 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverterTest do
                )
     end
 
+    test "writes booleans the way a text cast does, as snapshots do" do
+      relation = %LR.Relation{
+        id: 3,
+        namespace: "public",
+        name: "flags",
+        replica_identity: :full,
+        columns: [
+          %LR.Relation.Column{name: "id", flags: [:key], type_oid: 16, type_modifier: -1},
+          %LR.Relation.Column{name: "done", flags: [], type_oid: 16, type_modifier: -1},
+          %LR.Relation.Column{name: "history", flags: [], type_oid: 1000, type_modifier: -1},
+          %LR.Relation.Column{name: "note", flags: [], type_oid: 25, type_modifier: -1}
+        ]
+      }
+
+      converter = MessageConverter.new(max_batch_size: @max_batch_size)
+      {:ok, %Relation{}, converter} = MessageConverter.convert(relation, converter)
+
+      messages = [
+        %LR.Begin{final_lsn: @test_lsn, commit_timestamp: DateTime.utc_now(), xid: 456},
+        %LR.Insert{relation_id: 3, tuple_data: ["t", nil, "{t,f}", "t"], bytes: 4},
+        %LR.Update{
+          relation_id: 3,
+          old_tuple_data: ["t", nil, "{t,f}", "t"],
+          tuple_data: ["t", "f", "{t,f}", "f"],
+          bytes: 4
+        },
+        %LR.Delete{relation_id: 3, old_tuple_data: ["t", "f", "{t,f}", "f"], bytes: 4}
+      ]
+
+      converter =
+        Enum.reduce(messages, converter, fn msg, converter ->
+          {:buffering, converter} = MessageConverter.convert(msg, converter)
+          converter
+        end)
+
+      assert {:ok, %TransactionFragment{changes: [insert, update, delete]}, _converter} =
+               MessageConverter.convert(
+                 %LR.Commit{
+                   lsn: @test_lsn,
+                   end_lsn: @test_end_lsn,
+                   commit_timestamp: ~U[2024-01-01 00:00:00Z]
+                 },
+                 converter
+               )
+
+      # booleans only: an array of them is written `{t,f}` by the cast too, and text stays text
+      assert %NewRecord{
+               record: %{"id" => "true", "done" => nil, "history" => "{t,f}", "note" => "t"}
+             } =
+               insert
+
+      assert %UpdatedRecord{
+               old_record: %{"id" => "true", "done" => nil, "note" => "t"},
+               record: %{"id" => "true", "done" => "false", "history" => "{t,f}", "note" => "f"}
+             } = update
+
+      assert %DeletedRecord{old_record: %{"id" => "true", "done" => "false"}} = delete
+    end
+
     test "flushes batch when max_batch_size is reached mid-transaction", %{converter: _converter} do
       converter = MessageConverter.new(max_batch_size: 3)
       {:ok, %Relation{}, converter} = MessageConverter.convert(@relation, converter)
@@ -756,6 +815,45 @@ defmodule Electric.Postgres.ReplicationClient.MessageConverterTest do
                )
 
       assert MapSet.equal?(affected, MapSet.new([]))
+    end
+
+    test "skips an unrecognised replication message instead of crash-looping", %{
+      converter: converter
+    } do
+      message = %LR.Unsupported{data: <<255, 1, 2, 3>>}
+
+      {result, log} = with_log(fn -> MessageConverter.convert(message, converter) end)
+
+      assert {:buffering, ^converter} = result
+      assert log =~ "Skipping an unrecognised Postgres replication message"
+    end
+
+    test "errors on a transaction start while a previous transaction is still open", %{
+      converter: converter
+    } do
+      {:buffering, converter} =
+        MessageConverter.convert(
+          %LR.Begin{final_lsn: @test_lsn, commit_timestamp: DateTime.utc_now(), xid: 456},
+          converter
+        )
+
+      {:buffering, converter} =
+        MessageConverter.convert(
+          %LR.Insert{relation_id: 1, tuple_data: ["123"], bytes: 3},
+          converter
+        )
+
+      assert {:error, {:unexpected_transaction_start, message}} =
+               MessageConverter.convert(
+                 %LR.Begin{
+                   final_lsn: @test_end_lsn,
+                   commit_timestamp: DateTime.utc_now(),
+                   xid: 789
+                 },
+                 converter
+               )
+
+      assert message =~ "transaction start"
     end
   end
 end

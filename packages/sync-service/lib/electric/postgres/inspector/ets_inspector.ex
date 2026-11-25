@@ -43,7 +43,7 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
           {:ok, Electric.oid_relation()} | :table_not_found | {:error, term()}
   def load_relation_oid(relation, opts) when is_relation(relation) do
     with :not_in_cache <- fetch_normalized_relation_from_ets(relation, opts) do
-      GenServer.call(opts[:server], {:load_relation_oid, relation}, :infinity)
+      GenServer.call(opts[:server], {:load_relation_oid, relation, asked_at()}, :infinity)
     end
   end
 
@@ -52,7 +52,7 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
           {:ok, Inspector.relation_info()} | :table_not_found | {:error, term()}
   def load_relation_info(oid, opts) when is_relation_id(oid) do
     with :not_in_cache <- fetch_relation_info_from_ets(oid, opts) do
-      GenServer.call(opts[:server], {:load_relation_info, oid}, :infinity)
+      GenServer.call(opts[:server], {:load_relation_info, oid, asked_at()}, :infinity)
     end
   end
 
@@ -61,7 +61,7 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
           {:ok, [Inspector.column_info()]} | :table_not_found | {:error, term()}
   def load_column_info(oid, opts) when is_relation_id(oid) do
     with :not_in_cache <- fetch_column_info_from_ets(oid, opts) do
-      GenServer.call(opts[:server], {:load_column_info, oid}, :infinity)
+      GenServer.call(opts[:server], {:load_column_info, oid, asked_at()}, :infinity)
     end
   end
 
@@ -70,7 +70,7 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
           {:ok, Map.t()} | {:error, String.t() | :connection_not_available}
   def load_supported_features(opts) do
     with :not_in_cache <- fetch_supported_features_from_ets(opts) do
-      GenServer.call(opts[:server], :load_supported_features, :infinity)
+      GenServer.call(opts[:server], {:load_supported_features, asked_at()}, :infinity)
     end
   end
 
@@ -88,10 +88,15 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
   end
 
   @impl Inspector
-  @spec reset(opts :: term()) :: :ok
+  @spec reset(opts :: term()) :: :ok | {:error, term()}
   def reset(opts) do
     GenServer.call(opts[:server], :reset, :infinity)
   end
+
+  # A lookup that caches nothing (a missing table, a database error) would otherwise be repeated
+  # by every request queued behind it. An answer fetched after a request asked is as fresh as
+  # asking again, so that request gets it instead.
+  defp asked_at, do: System.monotonic_time()
 
   ## Internal API
 
@@ -122,7 +127,9 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
         pg_inspector_table: pg_inspector_table,
         pg_pool: opts.pool,
         persistent_kv: opts.persistent_kv,
-        persistence_key: persistence_key
+        persistence_key: persistence_key,
+        # key => {started_at, result} for lookups whose result was not cached
+        uncached_results: %{}
       }
       |> restore_persistent_state()
 
@@ -130,38 +137,35 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
   end
 
   @impl GenServer
-  def handle_call({:load_relation_oid, rel}, _from, state) do
-    response =
+  def handle_call({:load_relation_oid, rel, asked_at}, _from, state) do
+    lookup(state, {:relation, rel}, asked_at, fn ->
       with :not_in_cache <- fetch_normalized_relation_from_ets(rel, state),
            :ok <- fill_cache(rel, state) do
         fetch_normalized_relation_from_ets(rel, state)
       end
-
-    {:reply, response, state}
+    end)
   end
 
-  def handle_call({:load_relation_info, oid}, _from, state) do
-    response =
+  def handle_call({:load_relation_info, oid, asked_at}, _from, state) do
+    lookup(state, {:oid, oid}, asked_at, fn ->
       with :not_in_cache <- fetch_relation_info_from_ets(oid, state),
            :ok <- fill_cache(oid, state) do
         fetch_relation_info_from_ets(oid, state)
       end
-
-    {:reply, response, state}
+    end)
   end
 
-  def handle_call({:load_column_info, oid}, _from, state) do
-    response =
+  def handle_call({:load_column_info, oid, asked_at}, _from, state) do
+    lookup(state, {:oid, oid}, asked_at, fn ->
       with :not_in_cache <- fetch_column_info_from_ets(oid, state),
            :ok <- fill_cache(oid, state) do
         fetch_column_info_from_ets(oid, state)
       end
-
-    {:reply, response, state}
+    end)
   end
 
-  def handle_call(:load_supported_features, _from, state) do
-    response =
+  def handle_call({:load_supported_features, asked_at}, _from, state) do
+    lookup(state, :supported_features, asked_at, fn ->
       with :not_in_cache <- fetch_supported_features_from_ets(state),
            {:ok, features} <-
              wrap_in_db_errors(fn -> DirectInspector.load_supported_features(state.pg_pool) end) do
@@ -169,8 +173,7 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
         persist_data(state)
         {:ok, features}
       end
-
-    {:reply, response, state}
+    end)
   end
 
   def handle_call({:clean, oid}, _from, state) do
@@ -180,15 +183,15 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
   def handle_call(:reset, _from, state) do
     :ets.delete_all_objects(inspector_table(state))
     # Re-persist so the cleared cache survives a restart instead of restoring stale data.
-    persist_data(state)
-    {:reply, :ok, state}
+    # A write that fails is the caller's to handle: the next start would restore the old cache.
+    {:reply, persist_reset(state), %{state | uncached_results: %{}}}
   end
 
   def handle_call(:list_relations_with_stale_cache, _from, state) do
     known_schema = known_schema(state)
     known_schema_oids = known_schema |> Enum.map(& &1.relation_id)
 
-    {:ok, diverged_relations} =
+    {:ok, {diverged_relations, columns_with_collation}} =
       Postgrex.transaction(
         state.pg_pool,
         fn conn ->
@@ -208,17 +211,25 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
             |> Enum.map(& &1.relation_id)
             |> Electric.Postgres.Inspector.DirectInspector.load_column_info_by_oids!(conn)
 
-          diverged_relations =
+          {cached_without_collation, diverged_relations} =
             present_relations
             |> Enum.filter(fn %{relation_id: oid, columns: known_columns} ->
               found_relations_columns[oid] != known_columns
             end)
+            |> Enum.split_with(fn %{relation_id: oid, columns: known_columns} ->
+              same_columns_but_collation?(known_columns, found_relations_columns[oid])
+            end)
 
-          (diverged_relations ++ missing_relations)
-          |> Enum.map(fn %{relation: rel, relation_id: oid} -> {oid, rel} end)
+          {(diverged_relations ++ missing_relations)
+           |> Enum.map(fn %{relation: rel, relation_id: oid} -> {oid, rel} end),
+           Map.new(cached_without_collation, fn %{relation_id: oid} ->
+             {oid, found_relations_columns[oid]}
+           end)}
         end,
         timeout: 5_000
       )
+
+    :ok = store_columns_with_collation(state, columns_with_collation)
 
     {:reply, {:ok, diverged_relations}, state}
   catch
@@ -228,6 +239,75 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
       )
 
       {:reply, :error, state}
+  end
+
+  # A cache persisted before the column info carried the collation has none. Read as a schema
+  # change, it removed every shape on the first check after an upgrade.
+  defp same_columns_but_collation?(known_columns, found_columns)
+       when is_list(found_columns) and length(known_columns) == length(found_columns) do
+    known_columns
+    |> Enum.zip(found_columns)
+    |> Enum.all?(fn {known, found} ->
+      not Map.has_key?(known, :deterministic_collation) and
+        Map.delete(found, :deterministic_collation) == known
+    end)
+  end
+
+  defp same_columns_but_collation?(_known_columns, _found_columns), do: false
+
+  defp store_columns_with_collation(_state, columns) when map_size(columns) == 0, do: :ok
+
+  defp store_columns_with_collation(state, columns) do
+    table = inspector_table(state)
+
+    Enum.each(columns, fn {oid, cols} ->
+      [{key, info, _cols}] = :ets.lookup(table, oid_to_info_key(oid))
+      :ets.insert(table, {key, info, cols})
+    end)
+
+    persist_data(state)
+  end
+
+  # An uncached answer is kept with the time its lookup started and handed to requests that asked
+  # before then. An empty mailbox means none of those are left, so the kept answers are dropped.
+  # A mailbox that never empties, such as a steady stream of requests for different missing
+  # tables, drops them at the cap instead: that only costs a repeat lookup.
+  @max_uncached_results 1_000
+
+  defp lookup(state, key, asked_at, load) do
+    case Map.fetch(state.uncached_results, key) do
+      {:ok, {started_at, result}} when started_at >= asked_at ->
+        {:reply, result, forget_uncached_when_idle(state)}
+
+      _ ->
+        started_at = System.monotonic_time()
+        result = load.()
+
+        state =
+          case result do
+            {:ok, _} -> update_in(state.uncached_results, &Map.delete(&1, key))
+            _ -> keep_uncached(state, key, {started_at, result})
+          end
+
+        {:reply, result, forget_uncached_when_idle(state)}
+    end
+  end
+
+  defp keep_uncached(%{uncached_results: results} = state, key, entry)
+       when map_size(results) >= @max_uncached_results,
+       do: %{state | uncached_results: %{key => entry}}
+
+  defp keep_uncached(state, key, entry), do: put_in(state.uncached_results[key], entry)
+
+  defp forget_uncached_when_idle(%{uncached_results: results} = state)
+       when map_size(results) == 0,
+       do: state
+
+  defp forget_uncached_when_idle(state) do
+    case Process.info(self(), :message_queue_len) do
+      {:message_queue_len, 0} -> %{state | uncached_results: %{}}
+      _ -> state
+    end
   end
 
   @impl GenServer
@@ -293,7 +373,16 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
       {:error, :connection_not_available}
   end
 
-  @spec persist_data(map()) :: :ok
+  # The filesystem backend raises when it cannot create the directory or sync it after the
+  # rename. A raise ended this process, and the caller's call with it, instead of reporting the
+  # failure for the caller to retry.
+  defp persist_reset(state) do
+    persist_data(state)
+  rescue
+    error in File.Error -> {:error, error}
+  end
+
+  @spec persist_data(map()) :: :ok | {:error, term()}
   defp persist_data(state) do
     inspector_data = :ets.tab2list(state.pg_inspector_table)
     PersistentKV.set(state.persistent_kv, state.persistence_key, version: 1, data: inspector_data)
@@ -314,6 +403,15 @@ defmodule Electric.Postgres.Inspector.EtsInspector do
         state
 
       {:error, :not_found} ->
+        state
+
+      {:error, reason} ->
+        # Same cost as the dropped format above: this is a cache of live Postgres, so an
+        # unreadable copy is rebuilt rather than fatal.
+        Logger.warning(
+          "Could not read the persisted inspector cache (#{inspect(reason)}), starting empty."
+        )
+
         state
     end
   end

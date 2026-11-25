@@ -158,6 +158,38 @@ defmodule Electric.Shapes.PartitionedTablesTest do
            } = relation
   end
 
+  test "a plain table recreated under a dropped partition's name is not sent to the old root",
+       ctx do
+    {:ok, root_shape} = Shape.new("public.partitioned_items", inspector: ctx.inspector)
+    {root_handle, _} = ShapeCache.get_or_create_shape_handle(root_shape, ctx.stack_id)
+    :started = ShapeCache.await_snapshot_start(root_handle, ctx.stack_id)
+    root_ref = subscribe(root_handle, ctx)
+
+    # the root shape maps its partitions by name from here on
+    Postgrex.query!(ctx.db_conn, ~s|DROP TABLE "partitioned_items_200"|, [])
+
+    Postgrex.query!(
+      ctx.db_conn,
+      ~s|CREATE TABLE "partitioned_items_200" (a INT, b INT, PRIMARY KEY (a, b))|,
+      []
+    )
+
+    # a shape of its own puts the new table in the publication
+    {:ok, plain_shape} = Shape.new("public.partitioned_items_200", inspector: ctx.inspector)
+    {plain_handle, _} = ShapeCache.get_or_create_shape_handle(plain_shape, ctx.stack_id)
+    :started = ShapeCache.await_snapshot_start(plain_handle, ctx.stack_id)
+    plain_ref = subscribe(plain_handle, ctx)
+
+    Postgrex.query!(
+      ctx.db_conn,
+      ~s|INSERT INTO "partitioned_items_200" (a, b) VALUES (2, 150)|,
+      []
+    )
+
+    assert_receive {^plain_ref, :new_changes, _}, 5000
+    refute_receive {^root_ref, :new_changes, _}, 500
+  end
+
   test "truncation of partition truncates the partition root", ctx do
     {:ok, shape} = Shape.new("public.partitioned_items", inspector: ctx.inspector)
     {:ok, partition_shape} = Shape.new("public.partitioned_items_100", inspector: ctx.inspector)
@@ -260,7 +292,11 @@ defmodule Electric.Shapes.PartitionedTablesTest do
     wait_until_publication_tables(ctx, [])
   end
 
-  defp wait_until_publication_tables(ctx, tables, timeout \\ 500) do
+  defp wait_until_publication_tables(
+         ctx,
+         tables,
+         timeout \\ ExUnit.configuration()[:assert_receive_timeout]
+       ) do
     start_time = System.monotonic_time(:millisecond)
 
     try do

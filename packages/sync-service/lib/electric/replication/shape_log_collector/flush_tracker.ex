@@ -45,7 +45,8 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
     ```
     Shape => {last_sent, last_flushed, last_progress_at}
     ```
-    - Shapes where `last_sent == last_flushed` can be considered caught-up, and can be discarded from the mapping
+    - A shape is caught up when its flush reaches or passes the sent operation within the same transaction.
+      A flush from a later transaction remains tracked until that transaction's commit is registered.
     - `last_progress_at` is a monotonic timestamp (in milliseconds) always injected by the caller — this module
       never reads the clock itself. It is set when the shape is first tracked and refreshed only by flush
       notifications (including partial ones): progress means flush progress, so new transactions routed to an
@@ -70,7 +71,7 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
 
   On writer flush (i.e. when writer notifies the central process of a flushed write) notifying with `newlast_flushed` expressed via `handle_flush_notification/4`
   1. Update the mapping for the shape:
-    1. If `last_sent` equals to the new flush position, then we're caught up. Delete this shape from the mapping
+    1. If the flush reaches or passes `last_sent` within the same transaction, delete the caught-up shape from the mapping
     2. Otherwise, replace `last_flushed` with this new value and refresh `last_progress_at`
   2. If Mapping is empty after the update, we're globally caught up - set `last_global_flushed_offset` to equal `last_seen_offset`
   3. Otherwise:
@@ -105,10 +106,24 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
 
   @doc """
   Returns true if the shape is awaiting a flush notification from storage.
+
+  A notification for an untracked shape is dropped as a removed-shape stray; callers
+  that deliver data ahead of registering it (scatter-ahead) use this to tell a
+  notification that arrived early from a genuine stray.
   """
   @spec tracked?(t(), shape_id()) :: boolean()
   def tracked?(%__MODULE__{last_flushed: last_flushed}, shape_id) do
     is_map_key(last_flushed, shape_id)
+  end
+
+  @doc """
+  The tracked entry for a shape — `{last_sent, last_flushed, last_progress_at}` — or
+  nil when the shape is not awaiting a flush. Diagnostic accessor for stall reporting.
+  """
+  @spec entry(t(), shape_id()) ::
+          {LogOffset.t(), LogOffset.t(), last_progress_at :: integer()} | nil
+  def entry(%__MODULE__{last_flushed: last_flushed}, shape_id) do
+    Map.get(last_flushed, shape_id)
   end
 
   @spec handle_txn_fragment(t(), TransactionFragment.t(), Enumerable.t(shape_id()), integer()) ::
@@ -145,22 +160,32 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
        ) do
     prev_log_offset = %LogOffset{tx_offset: last_log_offset.tx_offset - 1}
 
-    {last_flushed, new_shape_ids} =
+    {last_flushed, new_shape_ids, min_incomplete_flush_tree} =
       Enum.reduce(
         affected_shapes,
-        {last_flushed, MapSet.new()},
-        fn shape, {new_last_flushed, new_shape_ids} ->
+        {last_flushed, MapSet.new(), min_incomplete_flush_tree},
+        fn shape, {new_last_flushed, new_shape_ids, tree} ->
           case Map.fetch(new_last_flushed, shape) do
+            # The shape already reported this very commit flushed: scatter-ahead delivers to
+            # consumers before the commit registers here, so the notification can land first.
+            # It is caught up — completing the entry now, as an in-order flush would, instead
+            # of re-arming it at an offset the consumer will never send again.
+            {:ok, {_, flushed, _}}
+            when flushed.tx_offset == last_log_offset.tx_offset and
+                   flushed.op_offset >= last_log_offset.op_offset ->
+              {Map.delete(new_last_flushed, shape), new_shape_ids,
+               delete_from_tree(tree, flushed, shape)}
+
             {:ok, {_, last_flushed_offset, last_progress_at}} ->
               {Map.put(
                  new_last_flushed,
                  shape,
                  {last_log_offset, last_flushed_offset, last_progress_at}
-               ), new_shape_ids}
+               ), new_shape_ids, tree}
 
             :error ->
               {Map.put(new_last_flushed, shape, {last_log_offset, prev_log_offset, now}),
-               MapSet.put(new_shape_ids, shape)}
+               MapSet.put(new_shape_ids, shape), tree}
           end
         end
       )
@@ -190,7 +215,9 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
       when is_map_key(last_flushed, shape_id) do
     {last_flushed, min_incomplete_flush_tree} =
       case Map.fetch!(last_flushed, shape_id) do
-        {^last_flushed_offset, prev_flushed_offset, _last_progress_at} ->
+        {last_sent, prev_flushed_offset, _last_progress_at}
+        when last_sent.tx_offset == last_flushed_offset.tx_offset and
+               last_flushed_offset.op_offset >= last_sent.op_offset ->
           {Map.delete(last_flushed, shape_id),
            min_incomplete_flush_tree
            |> delete_from_tree(prev_flushed_offset, shape_id)}
@@ -248,6 +275,20 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
     end
   end
 
+  @doc """
+  Reset `last_progress_at` for every tracked shape, granting them all a fresh grace period.
+  """
+  @spec touch_all(t(), integer()) :: t()
+  def touch_all(%__MODULE__{last_flushed: last_flushed} = state, now) do
+    %{
+      state
+      | last_flushed:
+          Map.new(last_flushed, fn {shape_id, {last_sent, last_flushed_offset, _}} ->
+            {shape_id, {last_sent, last_flushed_offset, now}}
+          end)
+    }
+  end
+
   def handle_shape_removed(%__MODULE__{last_flushed: last_flushed} = state, shape_id) do
     case Map.fetch(last_flushed, shape_id) do
       {:ok, {_, last_flushed_offset, _}} ->
@@ -296,15 +337,21 @@ defmodule Electric.Replication.ShapeLogCollector.FlushTracker do
   end
 
   defp notify_global_offset_updated(state) do
-    if state.last_flushed == %{} do
-      # We're caught up
-      state.notify_fn.(state.last_global_flushed_offset.tx_offset)
-    else
-      # We're not caught up
-      state.notify_fn.(state.last_global_flushed_offset.tx_offset - 1)
-    end
-
+    state.notify_fn.(consumer_durable_boundary(state))
     state
+  end
+
+  @doc """
+  The position every tracked writer is durable through — the same value `notify_fn`
+  reports: one short of the newest flush while any entry is still incomplete.
+  """
+  @spec consumer_durable_boundary(t()) :: integer()
+  def consumer_durable_boundary(%__MODULE__{} = state) do
+    if state.last_flushed == %{} do
+      state.last_global_flushed_offset.tx_offset
+    else
+      state.last_global_flushed_offset.tx_offset - 1
+    end
   end
 
   defp delete_from_tree(tree, offset, shape_id) do

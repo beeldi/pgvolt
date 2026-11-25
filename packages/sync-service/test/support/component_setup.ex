@@ -216,7 +216,10 @@ defmodule Support.ComponentSetup do
             publication_name: ctx.publication_name,
             update_debounce_timeout: Access.get(ctx, :update_debounce_timeout, 0),
             db_pool: ctx.pool,
-            manual_table_publishing?: Access.get(ctx, :manual_table_publishing?, false)
+            persistent_kv: ctx.persistent_kv,
+            database_timeline: Map.get(ctx, :database_timeline),
+            manual_table_publishing?: Access.get(ctx, :manual_table_publishing?, false),
+            admin_pool_size: Access.get(ctx, :admin_pool_size)
           ]
         ]
       },
@@ -504,6 +507,33 @@ defmodule Support.ComponentSetup do
   Returns a map with the updated `:stack_supervisor` pid.
   """
   def brutally_restart_complete_stack(ctx) do
+    sup_id = brutally_stop_complete_stack(ctx)
+
+    stack_supervisor =
+      start_stack_supervisor!(
+        ctx,
+        ctx.stack_id,
+        ctx.persistent_kv,
+        ctx.storage,
+        ctx.stack_events_registry,
+        ctx.publication_name,
+        id: sup_id
+      )
+
+    # Generous timeout: worst case the stale advisory lock is only cleared on
+    # the periodic lock-breaker cycle (~10s), not immediately on kill.
+    :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 15_000)
+
+    %{stack_supervisor: stack_supervisor, stack_supervisor_id: sup_id}
+  end
+
+  @doc """
+  The crash half of `brutally_restart_complete_stack/1`: kills the running
+  `Electric.StackSupervisor` outright and waits until nothing it started is
+  alive, leaving its storage exactly as the crash left it. Returns the ExUnit
+  child id to start the next stack under.
+  """
+  def brutally_stop_complete_stack(ctx) do
     sup_id = Map.get(ctx, :stack_supervisor_id, Electric.StackSupervisor)
     pid = ctx.stack_supervisor
     ref = Process.monitor(pid)
@@ -522,28 +552,14 @@ defmodule Support.ComponentSetup do
       {:error, :not_found} -> :ok
     end
 
-    # A brutal kill propagates asynchronously; wait for the stack's registered
-    # processes (and their ETS tables) to actually be gone before starting a
-    # new stack with the same stack_id, else the new stack races name/table
-    # reuse and crashes on boot.
-    wait_for_stack_processes_down(ctx.stack_id)
+    # The kill only takes the top supervisor down: the supervisors below it trap
+    # the exit and shut their children down for a while after the stack's
+    # registry is gone. Wait for every one of them before starting a new stack
+    # with the same stack_id, else the old processes keep acting on the new
+    # stack's names, tables and files and can shut it down after it boots.
+    wait_for_stack_processes_down(pid)
 
-    stack_supervisor =
-      start_stack_supervisor!(
-        ctx,
-        ctx.stack_id,
-        ctx.persistent_kv,
-        ctx.storage,
-        ctx.stack_events_registry,
-        ctx.publication_name,
-        id: sup_id
-      )
-
-    # Generous timeout: worst case the stale advisory lock is only cleared on
-    # the periodic lock-breaker cycle (~10s), not immediately on kill.
-    :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 15_000)
-
-    %{stack_supervisor: stack_supervisor, stack_supervisor_id: sup_id}
+    sup_id
   end
 
   @doc """
@@ -654,27 +670,28 @@ defmodule Support.ComponentSetup do
     |> Map.merge(%{server_id: new_server_id, rolling_gen: gen})
   end
 
-  # Polls until the stack's registered processes are gone. Uses
-  # ProcessRegistry.alive?/2 which tolerates the per-stack registry itself
-  # being torn down (returns false rather than raising).
-  defp wait_for_stack_processes_down(stack_id, deadline \\ nil) do
-    deadline = deadline || System.monotonic_time(:millisecond) + 5_000
+  # Polls until no process started under the killed stack supervisor is alive.
+  # Registry lookups cannot answer this: they come back empty as soon as the
+  # stack's registry is gone, while the rest of the old tree is still running.
+  defp wait_for_stack_processes_down(stack_supervisor, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 15_000
 
-    down? =
-      not Electric.ProcessRegistry.alive?(stack_id, Electric.StatusMonitor) and
-        not Electric.ProcessRegistry.alive?(stack_id, Electric.Connection.Manager) and
-        GenServer.whereis(Electric.ProcessRegistry.registry_name(stack_id)) == nil
+    leftovers =
+      for pid <- Process.list(),
+          {:dictionary, dictionary} <- [Process.info(pid, :dictionary)],
+          stack_supervisor in Keyword.get(dictionary, :"$ancestors", []),
+          do: {pid, Keyword.get(dictionary, :"$process_label")}
 
     cond do
-      down? ->
+      leftovers == [] ->
         :ok
 
       System.monotonic_time(:millisecond) > deadline ->
-        flunk("stack #{stack_id} did not fully terminate after brutal kill")
+        flunk("stack processes still alive after brutal kill: #{inspect(leftovers)}")
 
       true ->
-        Process.sleep(100)
-        wait_for_stack_processes_down(stack_id, deadline)
+        Process.sleep(50)
+        wait_for_stack_processes_down(stack_supervisor, deadline)
     end
   end
 
@@ -744,10 +761,14 @@ defmodule Support.ComponentSetup do
            # queue timeouts and 409 load-shedding. Override for such tests.
            pool_size: Map.get(ctx, :db_pool_size, env_pool_size())
          ],
-         tweaks: [
-           registry_partitions: 1,
-           shape_cleaner_opts: shape_cleaner_opts(ctx)
-         ],
+         tweaks:
+           Keyword.merge(
+             [
+               registry_partitions: 1,
+               shape_cleaner_opts: shape_cleaner_opts(ctx)
+             ],
+             Map.get(ctx, :stack_tweaks, [])
+           ),
          manual_table_publishing?: Map.get(ctx, :manual_table_publishing?, false),
          telemetry_opts: [instance_id: "test_instance", version: Electric.version()],
          feature_flags: Electric.Config.get_env(:feature_flags),
@@ -761,7 +782,7 @@ defmodule Support.ComponentSetup do
 
     # allow a reasonable time for full stack setup to account for
     # potential CI slowness, including PG
-    if await_ready?, do: assert_receive({:stack_status, ^ref, :ready}, 2000)
+    if await_ready?, do: assert_receive({:stack_status, ^ref, :ready})
 
     stack_supervisor
   end

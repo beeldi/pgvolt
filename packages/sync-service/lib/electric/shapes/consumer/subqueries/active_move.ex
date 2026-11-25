@@ -22,7 +22,11 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
     :values,
     :views_before_move,
     :views_after_move,
+    :patterns,
+    kind: :move_in,
+    query_patterns?: false,
     txids: [],
+    txids8: [],
     snapshot: nil,
     move_in_snapshot_name: nil,
     move_in_row_count: nil,
@@ -36,12 +40,16 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
 
   @type t() :: %__MODULE__{
           dep_index: non_neg_integer(),
-          dep_move_kind: :move_in | :move_out,
+          dep_move_kind: :move_in | :move_out | :replace,
           subquery_ref: [String.t()],
-          values: [move_value()],
+          values: [move_value()] | {[move_value()], [move_value()]},
           views_before_move: Views.t(),
           views_after_move: Views.t(),
+          patterns: [map()] | %{move_in: [map()], move_out: [map()]} | nil,
+          kind: :move_in | :move_out | :replace,
+          query_patterns?: boolean(),
           txids: [non_neg_integer()],
+          txids8: [non_neg_integer()],
           snapshot: {term(), term(), [term()]} | nil,
           move_in_snapshot_name: String.t() | nil,
           move_in_row_count: non_neg_integer() | nil,
@@ -56,12 +64,13 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
   @spec start(
           Views.t(),
           non_neg_integer(),
-          :move_in | :move_out,
+          :move_in | :move_out | :replace,
           [String.t()],
-          [move_value()],
+          [move_value()] | {[move_value()], [move_value()]},
+          [non_neg_integer()],
           [non_neg_integer()]
         ) :: t()
-  def start(views, dep_index, dep_move_kind, subquery_ref, values, txids \\ [])
+  def start(views, dep_index, dep_move_kind, subquery_ref, values, txids \\ [], txids8 \\ [])
       when is_map(views) do
     %__MODULE__{
       dep_index: dep_index,
@@ -69,6 +78,7 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
       subquery_ref: subquery_ref,
       values: values,
       txids: txids,
+      txids8: txids8,
       views_before_move: views,
       views_after_move: Views.apply_move(views, subquery_ref, values, dep_move_kind)
     }
@@ -113,31 +123,47 @@ defmodule Electric.Shapes.Consumer.Subqueries.ActiveMove do
     raise ArgumentError, "received {:pg_snapshot_known, snapshot} more than once for one move-in"
   end
 
-  @spec record_query_complete!(t(), String.t(), non_neg_integer(), non_neg_integer(), Lsn.t()) ::
+  @spec record_query_complete!(
+          t(),
+          String.t() | nil,
+          non_neg_integer(),
+          non_neg_integer(),
+          Lsn.t(),
+          [map()] | %{move_in: [map()], move_out: [map()]} | nil
+        ) ::
           t()
   def record_query_complete!(
-        %__MODULE__{move_in_snapshot_name: nil} = active_move,
+        %__MODULE__{move_in_lsn: nil} = active_move,
         snapshot_name,
         row_count,
         row_bytes,
-        move_in_lsn
+        move_in_lsn,
+        patterns
       ) do
     active_move
     |> Map.put(:move_in_snapshot_name, snapshot_name)
     |> Map.put(:move_in_row_count, row_count)
     |> Map.put(:move_in_row_bytes, row_bytes)
     |> Map.put(:move_in_lsn, move_in_lsn)
+    |> Map.put(:patterns, patterns)
     |> maybe_set_boundary_from_seen_lsn()
   end
 
-  def record_query_complete!(%__MODULE__{}, _snapshot_name, _row_count, _row_bytes, _move_in_lsn) do
+  def record_query_complete!(
+        %__MODULE__{},
+        _snapshot_name,
+        _row_count,
+        _row_bytes,
+        _move_in_lsn,
+        _patterns
+      ) do
     raise ArgumentError,
           "received {:query_move_in_complete, snapshot_name, row_count, row_bytes, move_in_lsn} more than once for one move-in"
   end
 
   @spec ready_to_splice?(t()) :: boolean()
   def ready_to_splice?(%__MODULE__{} = active_move) do
-    not is_nil(active_move.snapshot) and not is_nil(active_move.move_in_snapshot_name) and
+    not is_nil(active_move.snapshot) and not is_nil(active_move.move_in_lsn) and
       not is_nil(active_move.boundary_txn_count)
   end
 

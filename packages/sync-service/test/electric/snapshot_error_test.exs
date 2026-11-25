@@ -131,4 +131,48 @@ defmodule Electric.SnapshotErrorTest do
              } = SnapshotError.from_error(error)
     end
   end
+
+  describe "exited/1" do
+    test "classifies shutdown-class exits as a retryable :shutdown" do
+      for reason <- [
+            :shutdown,
+            :normal,
+            :killed,
+            :noproc,
+            {:shutdown, :db_gone},
+            {:noproc, {GenServer, :call, []}},
+            {:timeout, {GenServer, :call, []}}
+          ] do
+        assert %SnapshotError{type: :shutdown, original_error: ^reason} =
+                 SnapshotError.exited(reason)
+      end
+    end
+
+    test "classifies an unrecognised exit reason as :unknown" do
+      assert %SnapshotError{type: :unknown, original_error: :boom} = SnapshotError.exited(:boom)
+    end
+  end
+
+  describe "retryable?/1" do
+    test "is true for environment-transient failures" do
+      assert SnapshotError.retryable?(SnapshotError.exited(:shutdown))
+
+      assert SnapshotError.retryable?(
+               SnapshotError.from_error(%DBConnection.ConnectionError{
+                 reason: :queue_timeout,
+                 message: "queue timeout",
+                 severity: :error
+               })
+             )
+
+      assert SnapshotError.retryable?(SnapshotError.connection_not_available())
+    end
+
+    test "is false for failures that indicate the shape itself is invalid" do
+      refute SnapshotError.retryable?(SnapshotError.exited(:boom))
+      refute SnapshotError.retryable?(%SnapshotError{type: :schema_changed})
+      refute SnapshotError.retryable?(%SnapshotError{type: :missing_privilege})
+      refute SnapshotError.retryable?(%SnapshotError{type: :unknown})
+    end
+  end
 end

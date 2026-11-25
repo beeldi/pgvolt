@@ -47,17 +47,20 @@ defmodule Electric.Shapes.Consumer.Subqueries.IndexChanges do
 
   ## Caller conventions
 
-  - **Non-buffering cases** (positive move-out, negated move-in): the move
-    completes atomically, so callers use `effects_for_complete/3`.
-  - **Buffering cases** (positive move-in, negated move-out): callers use
-    `effects_for_buffering/3` when entering buffering and
-    `effects_for_complete/3` at splice time.
+  - Positive move-outs and negated move-ins with known tags complete immediately
+    via `effects_for_complete/3`.
+  - A move that needs a snapshot uses `effects_for_buffering/3` before querying
+    and `effects_for_complete/3` at splice time. This includes negated move-ins
+    whose outgoing tags must be queried from the root table, and positive
+    move-outs on a `numeric` key, whose rows may hold its value at another scale.
   """
 
   alias Electric.Shapes.Consumer.Effects
   alias Electric.Shapes.DnfPlan
 
-  @type move :: {:move_in | :move_out, non_neg_integer(), list(), [non_neg_integer()]}
+  alias Electric.Shapes.Consumer.Subqueries.MoveQueue
+
+  @type move :: MoveQueue.batch() | MoveQueue.replacement()
 
   @doc """
   Returns index effects to apply when a dependency move event starts buffering.
@@ -68,7 +71,15 @@ defmodule Electric.Shapes.Consumer.Subqueries.IndexChanges do
   """
   @spec effects_for_buffering(DnfPlan.t(), move(), [String.t()]) ::
           [Effects.AddToSubqueryIndex.t() | Effects.RemoveFromSubqueryIndex.t()]
-  def effects_for_buffering(dnf_plan, {dep_move_kind, dep_index, values, _txids}, subquery_ref) do
+  def effects_for_buffering(plan, {:replace, dep_index, {outs, _}, txids, txids8}, ref) do
+    effects_for_buffering(plan, {:move_out, dep_index, outs, txids, txids8}, ref)
+  end
+
+  def effects_for_buffering(
+        dnf_plan,
+        {dep_move_kind, dep_index, values, _txids, _txids8},
+        subquery_ref
+      ) do
     polarity = Map.get(dnf_plan.dependency_polarities, dep_index, :positive)
 
     case {polarity, dep_move_kind} do
@@ -90,6 +101,13 @@ defmodule Electric.Shapes.Consumer.Subqueries.IndexChanges do
           }
         ]
 
+      {:negated, :move_in} ->
+        []
+
+      # A move-out whose tags are queried keeps routing the moved values until the splice.
+      {:positive, :move_out} ->
+        []
+
       other ->
         raise ArgumentError,
               "effects_for_buffering/3 only supports buffering cases, got #{inspect(other)}"
@@ -104,7 +122,15 @@ defmodule Electric.Shapes.Consumer.Subqueries.IndexChanges do
   """
   @spec effects_for_complete(DnfPlan.t(), move(), [String.t()]) ::
           [Effects.AddToSubqueryIndex.t() | Effects.RemoveFromSubqueryIndex.t()]
-  def effects_for_complete(dnf_plan, {dep_move_kind, dep_index, values, _txids}, subquery_ref) do
+  def effects_for_complete(plan, {:replace, dep_index, {_, ins}, txids, txids8}, ref) do
+    effects_for_complete(plan, {:move_in, dep_index, ins, txids, txids8}, ref)
+  end
+
+  def effects_for_complete(
+        dnf_plan,
+        {dep_move_kind, dep_index, values, _txids, _txids8},
+        subquery_ref
+      ) do
     polarity = Map.get(dnf_plan.dependency_polarities, dep_index, :positive)
 
     case {polarity, dep_move_kind} do

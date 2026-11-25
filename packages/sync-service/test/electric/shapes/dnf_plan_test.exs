@@ -338,6 +338,134 @@ defmodule Electric.Shapes.DnfPlanTest do
     {expr, deps}
   end
 
+  describe "get_row_metadata/6 with a value the evaluator cannot read" do
+    setup do
+      {where, deps} =
+        parse_where_with_sublinks(~S|x IN (SELECT id FROM dep) AND NOT (status::int4 = 1)|, 1)
+
+      {:ok, plan} = DnfPlan.compile(make_shape(where, deps))
+
+      %{plan: plan, where: where, views: %{["$sublink", "0"] => MapSet.new([1])}}
+    end
+
+    test "keeps a row out when a negated position cannot be evaluated", ctx do
+      # Act
+      {:ok, included?, _tags, active_conditions} =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "1", "status" => "not-an-int4"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      # Assert — collapsing the failure into `false` and negating it would admit the row on a
+      # predicate that was never read.
+      refute included?
+      assert active_conditions == [true, false]
+    end
+
+    test "reports a position it could not evaluate as an unevaluable row", ctx do
+      test_pid = self()
+      handler_id = "dnf-unevaluable-row-#{inspect(make_ref())}"
+
+      :telemetry.attach(
+        handler_id,
+        [:electric, :shape, :unevaluable_row_excluded],
+        fn _event, measurements, metadata, _config ->
+          # handlers run in the emitting process; other async tests emit this event too
+          if self() == test_pid, do: send(test_pid, {:unevaluable_row, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      # Act
+      {:ok, false, _tags, _active_conditions} =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "1", "status" => "not-an-int4"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      # Assert
+      assert_receive {:unevaluable_row, %{count: 1}, %{refs: refs}}
+      assert refs[["status"]] == :text
+
+      # A row that evaluates, whether it matches or not, reports nothing.
+      {:ok, _included?, _tags, _active_conditions} =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "1", "status" => "2"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      refute_receive {:unevaluable_row, _, _}, 100
+    end
+
+    test "still admits a row whose negated position is evaluably false", ctx do
+      # Act
+      {:ok, included?, _tags, active_conditions} =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "1", "status" => "2"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      # Assert — the control that makes the case above discriminate rather than merely agree.
+      assert included?
+      assert active_conditions == [true, true]
+    end
+
+    test "keeps a row out when its negated position is evaluably true", ctx do
+      # Act
+      {:ok, included?, _tags, _active_conditions} =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "1", "status" => "1"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      # Assert
+      refute included?
+    end
+
+    test "answers a row whose refs will not parse instead of returning an unhandled :error",
+         ctx do
+      # Act
+      result =
+        Shape.get_row_metadata(
+          ctx.plan,
+          %{"x" => "not-an-int4", "status" => "2"},
+          ctx.views,
+          ctx.where,
+          "stack",
+          "handle"
+        )
+
+      # Assert — the only caller matches on {:ok, _, _, _}, so an :error here is a CaseClauseError
+      # on the change-processing path. One unreadable column no longer costs the other position its
+      # answer: `x` is refused, `status` parses and its negated position is genuinely active. The
+      # row still stays out, which is the property that matters — a refusal must never be negated
+      # into inclusion.
+      assert {:ok, false, _tags, [false, true]} = result
+    end
+  end
+
   defp make_shape(where, deps) do
     %Shape{
       root_table: {"public", "test"},

@@ -15,7 +15,6 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
   alias Electric.StatusMonitor
 
   alias Support.Fixtures
-  alias Support.RepatchExt
 
   import Support.TestUtils,
     only: [
@@ -55,8 +54,28 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
     existing_shapes = Map.get(ctx, :restore_shapes, [])
 
+    # The boot restore folds `reduce_encoded_shapes/3` rather than materialising `list_shapes/1`.
+    # The latter stays stubbed for the paths that still read it; a test that wants to prove the
+    # fold is the restore's source sets `reduce_restore_shapes` to a population the materialised
+    # list does not carry.
+    stream_shapes = Map.get(ctx, :reduce_restore_shapes, existing_shapes)
+
     Repatch.patch(Electric.ShapeCache.ShapeStatus, :list_shapes, [mode: :shared], fn ^stack_id ->
       existing_shapes
+    end)
+
+    # Only the restore reads the shapes this way, and it is served the staged shapes, as the
+    # store's buffer serves them: decoded.
+    Repatch.patch(Electric.ShapeCache.ShapeStatus, :reduce_encoded_shapes, [mode: :shared], fn
+      ^stack_id, acc, fun ->
+        stream_shapes
+        |> Enum.map(fn {handle, shape} -> {handle, shape.root_table_id, shape} end)
+        |> Enum.reduce(acc, fun)
+
+      other_stack_id, acc, fun ->
+        Repatch.real(
+          Electric.ShapeCache.ShapeStatus.reduce_encoded_shapes(other_stack_id, acc, fun)
+        )
     end)
 
     Support.TestUtils.activate_mocks_for_descendant_procs(ShapeLogCollector)
@@ -64,20 +83,22 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
     inspector = Map.get(ctx, :inspector, {Mock.Inspector, elem(@inspector, 1)})
 
     # Start the ShapeLogCollector process
-    opts = [
-      stack_id: stack_id,
-      inspector: inspector,
-      persistent_kv: ctx.persistent_kv,
-      consumer_registry_opts: Map.get(ctx, :consumer_registry_opts, [])
-    ]
+    opts =
+      [
+        stack_id: stack_id,
+        inspector: inspector,
+        persistent_kv: ctx.persistent_kv,
+        consumer_registry_opts: Map.get(ctx, :consumer_registry_opts, [])
+      ] ++ Map.get(ctx, :collector_flags, [])
 
     {:ok, _pid} = start_supervised({ShapeLogCollector.Supervisor, opts})
 
     parent = self()
 
-    Repatch.patch(StatusMonitor, :mark_shape_log_collector_ready, [mode: :shared], fn _, _ ->
-      send(parent, :shape_log_collector_ready)
-      :ok
+    Repatch.patch(StatusMonitor, :mark_shape_log_collector_ready, [mode: :shared], fn
+      ready_stack_id, collector ->
+        send(parent, {:shape_log_collector_ready, ready_stack_id, collector})
+        :ok
     end)
 
     shape_cache_opts =
@@ -87,9 +108,14 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
     shape_cache_pid = start_link_supervised!({Electric.ShapeCache, shape_cache_opts})
 
-    assert_receive :shape_log_collector_ready, 1000
+    assert_receive {:shape_log_collector_ready, ^stack_id, ready_collector}
 
-    %{stack_id: stack_id, registry: registry_name, shape_cache: shape_cache_pid}
+    %{
+      stack_id: stack_id,
+      registry: registry_name,
+      shape_cache: shape_cache_pid,
+      ready_collector: ready_collector
+    }
   end
 
   describe "process gc configuration" do
@@ -105,6 +131,47 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
       assert :high == info[:priority]
       assert info[:garbage_collection][:min_bin_vheap_size] >= 1024 * 1024
+    end
+  end
+
+  describe "removing a shape that never registered" do
+    setup :setup_log_collector
+
+    test "still reclaims a consumer registry entry the cancelled create left behind", ctx do
+      collector = ShapeLogCollector.name(ctx.stack_id) |> GenServer.whereis()
+      batcher = Electric.Replication.ShapeLogCollector.RequestBatcher.name(ctx.stack_id)
+      handle = "orphaned-consumer-handle"
+      consumer = spawn(fn -> Process.sleep(:infinity) end)
+
+      :ok = Electric.Shapes.ConsumerRegistry.register_consumer(consumer, handle, ctx.stack_id)
+      assert Electric.Shapes.ConsumerRegistry.active_consumer_count(ctx.stack_id) == 1
+      refute Map.has_key?(:sys.get_state(collector).shape_owners, handle)
+
+      :ok = ShapeLogCollector.remove_shape(ctx.stack_id, handle)
+      _ = :sys.get_state(GenServer.whereis(batcher))
+      _ = :sys.get_state(collector)
+
+      assert Electric.Shapes.ConsumerRegistry.active_consumer_count(ctx.stack_id) == 0
+    end
+  end
+
+  describe "router shard configuration" do
+    test "rejects a shard count past the payload arena's discriminator space", ctx do
+      Process.flag(:trap_exit, true)
+
+      opts = [
+        stack_id: ctx.stack_id,
+        inspector: @inspector,
+        persistent_kv: ctx.persistent_kv,
+        router_shards: 256,
+        shared_payload_arena: true,
+        worker_prepare: true
+      ]
+
+      result = ShapeLogCollector.start_link(opts)
+
+      assert {:error, {%ArgumentError{message: message}, _stacktrace}} = result
+      assert message =~ "ELECTRIC_ROUTER_SHARDS must be at most 255"
     end
   end
 
@@ -226,8 +293,18 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert xids == [xmin]
     end
 
-    # Subquery shapes are pruned (not restored) at the start of the collector's
-    # restore via `ShapeStatus.prune_subquery_shapes/1`. Its effect — the subquery
+    # The restore folds the catalogue stream rather than materialising `list_shapes/1`. Staging
+    # the shape only in the stream, with the materialised list left empty, pins the source: a
+    # restore reading the list would find nothing to restore.
+    @tag restore_shapes: [],
+         reduce_restore_shapes: [{@shape_handle, @shape}],
+         inspector: @inspector
+    test "restores shapes from the folded catalogue stream, not the materialised list", ctx do
+      assert @shape_handle in ShapeLogCollector.active_shapes(ctx.stack_id)
+    end
+
+    # Subquery shapes are pruned (not restored) by the collector's restore, in the
+    # read that rebuilds its routing. Its effect — the subquery
     # hierarchy absent from both `ShapeCache.list_shapes/1` and `active_shapes/1`
     # after a real restart, while plain shapes are retained — is covered by the
     # "after restart" tests in `shape_cache_test.exs`.
@@ -312,6 +389,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
   end
 
   describe "lazy consumer initialization" do
+    setup :with_shape_cleaner
     setup :setup_log_collector
 
     setup do
@@ -702,7 +780,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
       assert :ok = ShapeLogCollector.handle_event(irrelevant_txn, ctx.stack_id)
       expected_lsn = Lsn.to_integer(prev_lsn)
-      assert_receive {:flush_boundary_updated, ^expected_lsn}, 50
+      assert_receive {:flush_boundary_updated, ^expected_lsn}
 
       txn =
         complete_txn_fragment(100, lsn, [
@@ -723,7 +801,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       ShapeLogCollector.notify_flushed(ctx.stack_id, @shape_handle <> "-3", last_log_offset)
 
       expected_lsn = Lsn.to_integer(lsn)
-      assert_receive {:flush_boundary_updated, ^expected_lsn}, 100
+      assert_receive {:flush_boundary_updated, ^expected_lsn}
     end
 
     test "correctly broadcasts flush when transaction is not relevant to any shape", ctx do
@@ -756,7 +834,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
         ])
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-      assert_receive {:flush_boundary_updated, 55}, 50
+      assert_receive {:flush_boundary_updated, 55}
     end
 
     test "correctly broadcasts flush when transaction has already been processed before", ctx do
@@ -778,7 +856,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
         ])
 
       assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-      assert_receive {:flush_boundary_updated, 20}, 50
+      assert_receive {:flush_boundary_updated, 20}
     end
 
     test "correctly broadcasts flush when consumers die", ctx do
@@ -803,7 +881,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
         stop_supervised!({:consumer, id})
       end
 
-      assert_receive {:flush_boundary_updated, 20}, 50
+      assert_receive {:flush_boundary_updated, 20}
     end
 
     test "returns error if relation info cannot be loaded", ctx do
@@ -957,6 +1035,54 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       assert :ok = ShapeLogCollector.handle_event(relation2, ctx.stack_id)
 
       Support.TransactionConsumer.assert_consume(ctx.consumers, [relation1, relation2])
+    end
+
+    # A relation whose columns changed (an ADD COLUMN, say) arrives as `:changed`, so the message
+    # differs from the tracked one and the cached schema is stale. The clean used to be gated on
+    # the relation being unchanged, which skipped exactly this case; on a table with no active
+    # consumer nothing downstream cleaned it either, leaving the stale entry until the periodic
+    # reconciler. The clean now fires for every relation status.
+    test "cleans the inspector cache for a changed relation with no active consumer", ctx do
+      # can get is the one handle_relation performs
+      stub_inspector(
+        [force: true],
+        load_relation_oid: fn
+          {"public", "test_table"}, _ -> {:ok, {1234, {"public", "test_table"}}}
+          {"public", "bar"}, _ -> {:ok, {1235, {"public", "bar"}}}
+        end,
+        load_relation_info: fn
+          1234, _ ->
+            {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+
+          1235, _ ->
+            {:ok, %{id: 1235, schema: "public", name: "bar", parent: nil, children: nil}}
+        end
+      )
+
+      # once for the :new registration, once for the :changed columns — the second is the case the
+      # old `rel == updated_rel` gate skipped
+      expect_inspector(clean: {fn 1235, _ -> :ok end, exactly: 2})
+
+      registered = %Relation{
+        id: 1235,
+        table: "bar",
+        schema: "public",
+        columns: [%Changes.Column{name: "id", type_oid: 23}]
+      }
+
+      assert :ok = ShapeLogCollector.handle_event(registered, ctx.stack_id)
+
+      changed = %Relation{
+        id: 1235,
+        table: "bar",
+        schema: "public",
+        columns: [
+          %Changes.Column{name: "id", type_oid: 23},
+          %Changes.Column{name: "name", type_oid: 25}
+        ]
+      }
+
+      assert :ok = ShapeLogCollector.handle_event(changed, ctx.stack_id)
     end
 
     @tag capture_log: true
@@ -1205,16 +1331,122 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
     assert next_lsn == LsnTracker.get_last_processed_lsn(ctx.stack_id)
   end
 
-  test "notifies the StatusMonitor when it's ready", ctx do
-    ctx = Map.merge(ctx, setup_log_collector(ctx))
-    pid = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+  test "does not publish a processed LSN for a fragment the shapes cannot serve yet", ctx do
+    registry_name = Module.concat(__MODULE__, NonCommitRegistry)
+    start_link_supervised!({Registry, keys: :duplicate, name: registry_name})
 
-    assert RepatchExt.called_within_ms?(
-             StatusMonitor,
-             :mark_shape_log_collector_ready,
-             [ctx.stack_id, pid],
-             100
-           )
+    opts = [
+      stack_id: ctx.stack_id,
+      inspector: {Mock.Inspector, elem(@inspector, 1)},
+      persistent_kv: ctx.persistent_kv
+    ]
+
+    {:ok, _pid} = start_supervised({ShapeLogCollector.Supervisor, opts})
+
+    Repatch.patch(StatusMonitor, :mark_shape_log_collector_ready, [mode: :shared], fn _, _ ->
+      :ok
+    end)
+
+    Repatch.allow(self(), ShapeLogCollector.name(ctx.stack_id))
+
+    stub_inspector(
+      load_relation_oid: fn {"public", "test_table"}, _ ->
+        {:ok, {1234, {"public", "test_table"}}}
+      end,
+      load_relation_info: fn 1234, _ ->
+        {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+      end,
+      load_column_info: fn 1234, _ ->
+        {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+      end
+    )
+
+    consumer_id = "non_commit_consumer"
+
+    consumer =
+      start_link_supervised!(
+        {Support.TransactionConsumer,
+         id: consumer_id,
+         stack_id: ctx.stack_id,
+         parent: self(),
+         shape: @shape,
+         shape_handle: @shape_handle}
+      )
+
+    start_lsn = Lsn.from_integer(100)
+    txn_lsn = Lsn.increment(start_lsn, +1)
+
+    LsnTracker.set_last_processed_lsn(ctx.stack_id, start_lsn)
+    ShapeLogCollector.mark_as_ready(ctx.stack_id)
+
+    # A transaction split the way the replication client splits one past max_batch_size: an opening
+    # fragment carrying rows but no commit, then the fragment that commits it.
+    [opening_fragment, closing_fragment] =
+      txn_fragments(101, txn_lsn, [
+        %{
+          changes: [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "1"},
+              log_offset: LogOffset.new(txn_lsn, 0)
+            }
+          ],
+          has_begin?: true,
+          has_commit?: false
+        },
+        %{
+          changes: [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(txn_lsn, 1)
+            }
+          ],
+          has_begin?: false,
+          has_commit?: true
+        }
+      ])
+
+    assert :ok = ShapeLogCollector.handle_event(opening_fragment, ctx.stack_id)
+
+    # the rest of the transaction is still to come at exactly that LSN (electric-sql#4755).
+    assert start_lsn == LsnTracker.get_last_processed_lsn(ctx.stack_id)
+
+    assert :ok = ShapeLogCollector.handle_event(closing_fragment, ctx.stack_id)
+
+    assert txn_lsn == LsnTracker.get_last_processed_lsn(ctx.stack_id)
+    assert is_pid(consumer)
+  end
+
+  test "notifies the StatusMonitor when it's ready", ctx do
+    %{ready_collector: ready_collector} = setup_log_collector(ctx)
+
+    assert ready_collector == ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+  end
+
+  # The replication client retries this dispatch every 50ms for up to ten minutes and logs the exit
+  # reason on each attempt, so whatever the reason carries lands in the log pipeline and the error
+  # tracker thousands of times over for one collector restart. The event carries row data.
+  test "keeps the event out of the exit reason when the collector is not running", ctx do
+    # restarting Shapes.Supervisor looks like to the replication client.
+    lsn = Lsn.from_integer(42)
+
+    txn =
+      complete_txn_fragment(100, lsn, [
+        %Changes.NewRecord{
+          relation: {"public", "test_table"},
+          record: %{"id" => "1", "value" => "a-row-value"},
+          log_offset: LogOffset.new(lsn, 0)
+        }
+      ])
+
+    reason = catch_exit(ShapeLogCollector.handle_event_async(txn, ctx.stack_id))
+
+    stack_id = ctx.stack_id
+    assert {:noproc, {ShapeLogCollector, :handle_event_async, [^stack_id]}} = reason
+
+    refute inspect(reason, limit: :infinity, printable_limit: :infinity) =~
+             "a-row-value"
   end
 
   describe "add_shape/4" do
@@ -1586,7 +1818,7 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
 
       task = Task.async(fn -> ShapeLogCollector.handle_event(fragment2, stack_id) end)
 
-      assert_receive {Support.TransactionConsumer, {2, _pid}, {:blocked, from}}, 1000
+      assert_receive {Support.TransactionConsumer, {2, _pid}, {:blocked, from}}
 
       # The collector is still inside ConsumerRegistry.publish/2 waiting on this
       # consumer, so the transaction is not durable for every shape yet.
@@ -1619,511 +1851,1069 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
     end
   end
 
-  describe "FlushTracker advancement when consumer is killed mid-transaction" do
-    setup :setup_log_collector
+  @quiet_inspector Support.StubInspector.new(
+                     tables: [{5678, {"public", "other_table"}}],
+                     columns: [%{name: "id", type: "int8", pk_position: 0}]
+                   )
+  @quiet_shape Shape.new!("other_table", inspector: @quiet_inspector)
 
-    setup ctx do
-      parent = self()
+  # The handle names are load-bearing in the sharded arm: phash2 has to place them on
+  # different workers at 2 shards for the collector to merge two worker acks at all.
+  for router_shards <- [1, 2] do
+    describe "FlushTracker advancement when consumer is killed mid-transaction (router_shards: #{router_shards})" do
+      @describetag collector_flags: [router_shards: router_shards]
 
-      stub_inspector(
-        load_relation_oid: fn {"public", "test_table"}, _ ->
-          {:ok, {1234, {"public", "test_table"}}}
-        end,
-        load_relation_info: fn 1234, _ ->
-          {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
-        end,
-        load_column_info: fn 1234, _ ->
-          {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
-        end
-      )
+      setup :setup_log_collector
 
-      # Two consumers for two shape handles
-      consumer1 =
-        start_supervised!(
-          {Support.TransactionConsumer,
-           id: :alive,
-           stack_id: ctx.stack_id,
-           parent: parent,
-           shape: @shape,
-           shape_handle: "shape-alive"},
-          id: {:consumer, :alive}
-        )
+      setup ctx do
+        parent = self()
 
-      consumer2 =
-        start_supervised!(
-          {Support.TransactionConsumer,
-           id: :doomed,
-           stack_id: ctx.stack_id,
-           parent: parent,
-           shape: @shape,
-           shape_handle: "shape-doomed"},
-          id: {:consumer, :doomed}
-        )
-
-      %{consumer_alive: consumer1, consumer_doomed: consumer2}
-    end
-
-    test "FlushTracker advances past undeliverable shapes from crashed consumer", ctx do
-      register_as_replication_client(ctx.stack_id)
-
-      # Send a transaction that affects both shapes and causes the consumer for "shape-doomed"
-      # to terminate. As a consequence, SLC should NOT track "shape-doomed" in FlushTracker.
-      lsn = Lsn.from_integer(42)
-      log_offset = LogOffset.new(lsn, 0)
-
-      txn =
-        complete_txn_fragment(100, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "test_table"},
-            record: %{
-              "id" => "stop-with-reason",
-              "handle" => "shape-doomed",
-              "reason" => {:shutdown, :test}
-            },
-            log_offset: log_offset
-          }
-        ])
-
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-        end)
-
-      assert log =~
-               ~s'Consumer processes crashed or missing during broadcast: %{"shape-doomed" => {:shutdown, :test}}'
-
-      # The alive consumer receives the transaction
-      assert_receive {Support.TransactionConsumer, {:alive, _pid}, [_txn]}
-
-      # Flush only the alive consumer — FlushTracker should advance because
-      # the doomed shape was never tracked (excluded as undeliverable).
-      ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-alive", log_offset)
-
-      expected_lsn = Lsn.to_integer(lsn)
-      assert_receive {:flush_boundary_updated, ^expected_lsn}
-    end
-
-    test "FlushTracker advances when consumer crashes on later fragment of multi-fragment txn",
-         ctx do
-      register_as_replication_client(ctx.stack_id)
-
-      lsn = Lsn.from_integer(42)
-
-      # Fragment 1 (non-commit): both consumers are alive and process it.
-      # FlushTracker starts tracking both shapes.
-      frag1 = %TransactionFragment{
-        xid: 100,
-        lsn: lsn,
-        last_log_offset: LogOffset.new(lsn, 0),
-        has_begin?: true,
-        commit: nil,
-        changes: [
-          %Changes.NewRecord{
-            relation: {"public", "test_table"},
-            record: %{"id" => "1"},
-            log_offset: LogOffset.new(lsn, 0)
-          }
-        ],
-        affected_relations: MapSet.new([{"public", "test_table"}])
-      }
-
-      assert :ok = ShapeLogCollector.handle_event(frag1, ctx.stack_id)
-
-      # Both consumers receive fragment 1
-      assert_receive {Support.TransactionConsumer, {:alive, _}, [_]}
-      assert_receive {Support.TransactionConsumer, {:doomed, _}, [_]}
-
-      # Kill the doomed consumer between fragments. This simulates a crash
-      # that happens after fragment 1 was processed but before fragment 2.
-      kill_consumer(ctx.consumer_doomed, :kill)
-
-      # Fragment 2 (commit): the doomed consumer is dead.
-      # ConsumerRegistry.broadcast detects the dead PID → crashed.
-      # SLC must remove "shape-doomed" from FlushTracker (it was tracked
-      # in fragment 1) and exclude it from the commit fragment tracking.
-      frag2 = %TransactionFragment{
-        xid: 100,
-        lsn: lsn,
-        last_log_offset: LogOffset.new(lsn, 5),
-        has_begin?: false,
-        commit: %Changes.Commit{tx_started_at: System.monotonic_time()},
-        changes: [
-          %Changes.NewRecord{
-            relation: {"public", "test_table"},
-            record: %{"id" => "2"},
-            log_offset: LogOffset.new(lsn, 5)
-          }
-        ],
-        affected_relations: MapSet.new([{"public", "test_table"}])
-      }
-
-      log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          assert :ok = ShapeLogCollector.handle_event(frag2, ctx.stack_id)
-        end)
-
-      assert log =~
-               ~s'Consumer processes crashed or missing during broadcast: %{"shape-doomed" => :noproc}'
-
-      # The alive consumer receives fragment 2
-      assert_receive {Support.TransactionConsumer, {:alive, _}, [_]}
-
-      # Flush both fragments for the alive consumer — FlushTracker should advance
-      # because the doomed shape was removed from tracking when its crash was detected.
-      ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-alive", LogOffset.new(lsn, 5))
-
-      expected_lsn = Lsn.to_integer(lsn)
-      assert_receive {:flush_boundary_updated, ^expected_lsn}
-    end
-  end
-
-  # Adapted from the stall reproduction in PR #4713, with the outcome inverted:
-  # a consumer that dies without running its terminate callback (or wedges alive
-  # without flushing) no longer pins the FlushTracker's global minimum forever.
-  # The SLC monitors the writer pid behind every pending flush entry and runs a
-  # periodic stall check, so the boundary is unpinned and the shape invalidated
-  # without requiring new traffic or an explicit `remove_shape` call.
-  describe "FlushTracker writer monitors and stall detection" do
-    @quiet_inspector Support.StubInspector.new(
-                       tables: [{5678, {"public", "other_table"}}],
-                       columns: [%{name: "id", type: "int8", pk_position: 0}]
-                     )
-    @quiet_shape Shape.new!("other_table", inspector: @quiet_inspector)
-
-    setup :setup_log_collector
-
-    setup ctx do
-      parent = self()
-
-      stub_inspector(
-        load_relation_oid: fn
-          {"public", "test_table"}, _ -> {:ok, {1234, {"public", "test_table"}}}
-          {"public", "other_table"}, _ -> {:ok, {5678, {"public", "other_table"}}}
-        end,
-        load_relation_info: fn
-          1234, _ ->
+        stub_inspector(
+          load_relation_oid: fn {"public", "test_table"}, _ ->
+            {:ok, {1234, {"public", "test_table"}}}
+          end,
+          load_relation_info: fn 1234, _ ->
             {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
-
-          5678, _ ->
-            {:ok, %{id: 5678, schema: "public", name: "other_table", parent: nil, children: nil}}
-        end,
-        load_column_info: fn
-          1234, _ -> {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
-          5678, _ -> {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
-        end
-      )
-
-      consumer_alive =
-        start_supervised!(
-          {Support.TransactionConsumer,
-           id: :alive,
-           stack_id: ctx.stack_id,
-           parent: parent,
-           shape: @shape,
-           shape_handle: "shape-alive"},
-          id: {:consumer, :alive}
+          end,
+          load_column_info: fn 1234, _ ->
+            {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+          end
         )
 
-      consumer_doomed =
-        start_supervised!(
-          {Support.TransactionConsumer,
-           id: :doomed,
-           stack_id: ctx.stack_id,
-           parent: parent,
-           shape: @quiet_shape,
-           shape_handle: "shape-doomed"},
-          id: {:consumer, :doomed}
+        # Two consumers for two shape handles
+        consumer1 =
+          start_supervised!(
+            {Support.TransactionConsumer,
+             id: :healthy,
+             stack_id: ctx.stack_id,
+             parent: parent,
+             shape: @shape,
+             shape_handle: "shape-healthy"},
+            id: {:consumer, :healthy}
+          )
+
+        consumer2 =
+          start_supervised!(
+            {Support.TransactionConsumer,
+             id: :doomed,
+             stack_id: ctx.stack_id,
+             parent: parent,
+             shape: @shape,
+             shape_handle: "shape-doomed"},
+            id: {:consumer, :doomed}
+          )
+
+        assert_shape_placement(ctx, ["shape-healthy", "shape-doomed"])
+
+        %{consumer_healthy: consumer1, consumer_doomed: consumer2}
+      end
+
+      test "FlushTracker advances past undeliverable shapes from crashed consumer", ctx do
+        stub_shape_cleaner(ctx)
+        register_as_replication_client(ctx.stack_id)
+
+        # Send a transaction that affects both shapes and causes the consumer for "shape-doomed"
+        # to terminate. As a consequence, SLC should NOT track "shape-doomed" in FlushTracker.
+        lsn = Lsn.from_integer(42)
+        log_offset = LogOffset.new(lsn, 0)
+
+        txn =
+          complete_txn_fragment(100, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{
+                "id" => "stop-with-reason",
+                "handle" => "shape-doomed",
+                "reason" => {:shutdown, :test}
+              },
+              log_offset: log_offset
+            }
+          ])
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+          end)
+
+        assert log =~
+                 ~s'Consumer processes crashed or missing during broadcast: %{"shape-doomed" => {:shutdown, :test}}'
+
+        # The healthy consumer receives the transaction
+        assert_receive {Support.TransactionConsumer, {:healthy, _pid}, [_txn]}
+
+        # Flush only the healthy consumer — FlushTracker should advance because
+        # the doomed shape was never tracked (excluded as undeliverable).
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", log_offset)
+
+        # The shape is invalidated before the boundary moves past the transaction it missed.
+        expected_lsn = Lsn.to_integer(lsn)
+        assert_receive {:remove_shapes, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, ^expected_lsn}
+      end
+
+      test "holds the boundary for a consumer dead before the commit fragment", ctx do
+        stub_removal_chain(ctx)
+        register_as_replication_client(ctx.stack_id)
+
+        lsn = Lsn.from_integer(42)
+
+        # Fragment 1 (non-commit): both consumers are alive and process it.
+        # FlushTracker starts tracking both shapes.
+        frag1 = %TransactionFragment{
+          xid: 100,
+          lsn: lsn,
+          last_log_offset: LogOffset.new(lsn, 0),
+          has_begin?: true,
+          commit: nil,
+          changes: [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "1"},
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ],
+          affected_relations: MapSet.new([{"public", "test_table"}])
+        }
+
+        assert :ok = ShapeLogCollector.handle_event(frag1, ctx.stack_id)
+
+        # Both consumers receive fragment 1
+        assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+        assert_receive {Support.TransactionConsumer, {:doomed, _}, [_]}
+
+        # Kill the doomed consumer between fragments. This simulates a crash
+        # that happens after fragment 1 was processed but before fragment 2.
+        kill_consumer(ctx.consumer_doomed, :kill)
+
+        # Fragment 2 (commit): the doomed consumer is dead.
+        # ConsumerRegistry.broadcast detects the dead PID → crashed with :noproc,
+        # which reads the same as a teardown. SLC keeps the shape and pins its flush
+        # entry at this commit for the stall check.
+        frag2 = %TransactionFragment{
+          xid: 100,
+          lsn: lsn,
+          last_log_offset: LogOffset.new(lsn, 5),
+          has_begin?: false,
+          commit: %Changes.Commit{tx_started_at: System.monotonic_time()},
+          changes: [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(lsn, 5)
+            }
+          ],
+          affected_relations: MapSet.new([{"public", "test_table"}])
+        }
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok = ShapeLogCollector.handle_event(frag2, ctx.stack_id)
+          end)
+
+        assert log =~
+                 ~s'Consumer processes crashed or missing during broadcast: %{"shape-doomed" => :noproc}'
+
+        # The healthy consumer receives fragment 2
+        assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", LogOffset.new(lsn, 5))
+
+        # The killed consumer is gone without a verdict on its shape, which is still valid
+        # and lacks fragment 2: the boundary waits for the stall check to rule on it.
+        expected_lsn = Lsn.to_integer(lsn)
+        refute_receive {:flush_boundary_updated, ^expected_lsn}
+
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, ^expected_lsn}
+      end
+    end
+
+    # Adapted from the stall reproduction in PR #4713, with the outcome inverted:
+    # a consumer that dies without running its terminate callback (or wedges alive
+    # without flushing) no longer pins the FlushTracker's global minimum forever.
+    # The SLC monitors the writer pid behind every pending flush entry and runs a
+    # periodic stall check, so the boundary is unpinned and the shape invalidated
+    # without requiring new traffic or an explicit `remove_shape` call.
+    describe "FlushTracker writer monitors and stall detection (router_shards: #{router_shards})" do
+      @describetag collector_flags: [router_shards: router_shards]
+
+      setup :setup_log_collector
+
+      setup ctx do
+        parent = self()
+
+        stub_inspector(
+          load_relation_oid: fn
+            {"public", "test_table"}, _ -> {:ok, {1234, {"public", "test_table"}}}
+            {"public", "other_table"}, _ -> {:ok, {5678, {"public", "other_table"}}}
+          end,
+          load_relation_info: fn
+            1234, _ ->
+              {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+
+            5678, _ ->
+              {:ok,
+               %{id: 5678, schema: "public", name: "other_table", parent: nil, children: nil}}
+          end,
+          load_column_info: fn
+            1234, _ -> {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+            5678, _ -> {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+          end
         )
 
-      register_as_replication_client(ctx.stack_id)
+        consumer_healthy =
+          start_supervised!(
+            {Support.TransactionConsumer,
+             id: :healthy,
+             stack_id: ctx.stack_id,
+             parent: parent,
+             shape: @shape,
+             shape_handle: "shape-healthy"},
+            id: {:consumer, :healthy}
+          )
 
-      %{consumer_alive: consumer_alive, consumer_doomed: consumer_doomed}
-    end
+        consumer_doomed =
+          start_supervised!(
+            {Support.TransactionConsumer,
+             id: :doomed,
+             stack_id: ctx.stack_id,
+             parent: parent,
+             shape: @quiet_shape,
+             shape_handle: "shape-doomed"},
+            id: {:consumer, :doomed}
+          )
 
-    test "crashed writer DOWN unpins the boundary and schedules removal without traffic", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
+        register_as_replication_client(ctx.stack_id)
 
-      seed_pinned_flush_entry(ctx)
+        assert_shape_placement(ctx, ["shape-healthy", "shape-doomed"])
 
-      # The doomed consumer crashes out-of-band (terminate/2 never runs) while its
-      # shape's table stays quiet. The writer monitor's DOWN unpins the entry
-      # immediately and schedules the shape's removal — no traffic needed.
-      Support.TransactionConsumer.crash(ctx.consumer_doomed, {:error, :simulated_disk_failure})
+        %{consumer_healthy: consumer_healthy, consumer_doomed: consumer_doomed}
+      end
 
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-      assert_receive {:flush_boundary_updated, 42}
+      test "crashed writer DOWN unpins the boundary and schedules removal without traffic", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
 
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
-    end
+        seed_pinned_flush_entry(ctx)
 
-    test "consumer killed without cleanup is self-healed by the stall check", ctx do
-      # Emulate the real removal chain: ShapeCleaner.remove_shapes eventually issues
-      # ShapeLogCollector.remove_shape for each handle from a cleanup task.
-      stack_id = ctx.stack_id
-      parent = self()
+        # The doomed consumer crashes out-of-band (terminate/2 never runs) while its
+        # shape's table stays quiet. The writer monitor's DOWN unpins the entry
+        # immediately and schedules the shape's removal — no traffic needed.
+        Support.TransactionConsumer.crash(ctx.consumer_doomed, {:error, :simulated_disk_failure})
 
-      patch_calls(Electric.ShapeCache.ShapeCleaner, [],
-        remove_shapes_async: fn ^stack_id, handles ->
-          send(parent, {:remove_shapes_async, handles})
-          spawn(fn -> Enum.each(handles, &ShapeLogCollector.remove_shape(stack_id, &1)) end)
-          :ok
-        end
-      )
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, 42}
 
-      seed_pinned_flush_entry(ctx)
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
+      end
 
-      # `:kill` is untrappable: the consumer dies without terminate/2 and the DOWN
-      # reason `:killed` is classified as supervisor teardown, so the entry stays
-      # pinned for now...
-      kill_consumer(ctx.consumer_doomed, :kill)
-      refute_receive {:flush_boundary_updated, _}
-      refute_receive {:remove_shapes_async, _}
+      test "consumer killed without cleanup is self-healed by the stall check", ctx do
+        # Emulate the real removal chain: ShapeCleaner.remove_shapes eventually issues
+        # ShapeLogCollector.remove_shape for each handle from a cleanup task.
+        stack_id = ctx.stack_id
+        parent = self()
 
-      # ...until the stall check finds it past the grace period and removes the
-      # shape, which unpins the boundary — without new traffic and without an
-      # explicit remove_shape call.
-      Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-      assert_receive {:flush_boundary_updated, 42}
-    end
-
-    test "consumer stopped with bare :shutdown keeps the entry pinned", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      # Bare :shutdown is assumed to be a supervisor teardown: the entry must stay
-      # pinned and the shape must not be invalidated.
-      Support.TransactionConsumer.crash(ctx.consumer_doomed, :shutdown)
-
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
-      refute_receive {:remove_shapes_async, _}
-      refute_receive {:flush_boundary_updated, _}
-    end
-
-    test "undeliverable :noproc keeps the entry pinned and the stall check armed", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      # The doomed consumer is killed; the `:killed` DOWN is classified as
-      # supervisor teardown, so the entry stays pinned and the monitor is gone.
-      kill_consumer(ctx.consumer_doomed, :kill)
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
-
-      # New traffic for its table resolves the stale registry entry to the dead
-      # pid, so the publish observes a `:noproc` — a masked reason that must not
-      # be treated as a crash (no invalidation) nor blindly unpinned (the entry
-      # must stay for the stall check).
-      lsn = Lsn.from_integer(43)
-
-      txn =
-        complete_txn_fragment(101, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "other_table"},
-            record: %{"id" => "2"},
-            log_offset: LogOffset.new(lsn, 0)
-          }
-        ])
-
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
-      refute_receive {:remove_shapes_async, _}
-      refute_receive {:flush_boundary_updated, _}
-
-      # The entry is still pinned, so the stall check self-heals one grace
-      # period later.
-      Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-    end
-
-    test "stall check challenges a wedged-alive consumer, then invalidates it", ctx do
-      stub_shape_cleaner(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      # The doomed consumer is alive but never flushes. Once its entry exceeds
-      # the grace period, the stall check first challenges the writer rather
-      # than removing the shape outright.
-      Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:flush_progress_challenged, _pid}
-      refute_receive {:remove_shapes_async, _}
-
-      # The wedged consumer never answers: the next check invalidates it.
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-
-      # The touch re-armed the grace period: an immediate re-check does not re-fire.
-      trigger_stall_check(ctx.stack_id)
-      refute_receive {:remove_shapes_async, _}
-
-      # If the removal chain is lost (our stub drops it), the stall re-fires one
-      # grace period later — again as a challenge first, then invalidation.
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:flush_progress_challenged, _pid}
-      refute_receive {:remove_shapes_async, _}
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-    end
-
-    test "a challenged deferring writer answers and re-arms the grace period", ctx do
-      stub_shape_cleaner(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
-      Process.sleep(50)
-
-      # The stalled entry's writer is challenged; answering with
-      # notify_flush_deferred (as a deliberately deferring consumer would)
-      # touches the entry, so an immediate re-check finds nothing stalled.
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:flush_progress_challenged, _pid}
-      ShapeLogCollector.notify_flush_deferred(ctx.stack_id, "shape-doomed")
-      trigger_stall_check(ctx.stack_id)
-      refute_receive {:flush_progress_challenged, _pid}
-      refute_receive {:remove_shapes_async, _}
-
-      # A challenge answered without any stall check in between: the answer must
-      # clear the suspicion, so when the entry stalls again a full grace period
-      # later the writer is challenged afresh instead of being invalidated as an
-      # unresponsive suspect...
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:flush_progress_challenged, _pid}
-      refute_receive {:remove_shapes_async, _}
-      ShapeLogCollector.notify_flush_deferred(ctx.stack_id, "shape-doomed")
-      Process.sleep(50)
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:flush_progress_challenged, _pid}
-      refute_receive {:remove_shapes_async, _}
-
-      # ...and only an unanswered challenge invalidates the shape.
-      trigger_stall_check(ctx.stack_id)
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-    end
-
-    test "completed entry is demonitored so later writer death has no effect", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      # The doomed consumer flushes everything: its entry completes and its monitor
-      # is dropped.
-      ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-doomed", LogOffset.new(42, 2))
-      assert_receive {:flush_boundary_updated, 42}
-
-      # Its subsequent death is nobody's business: no DOWN side effects.
-      Support.TransactionConsumer.crash(ctx.consumer_doomed, {:error, :simulated_disk_failure})
-
-      refute_receive {:writer_down_telemetry, _, _}
-      refute_receive {:remove_shapes_async, _}
-      refute_receive {:flush_boundary_updated, _}
-    end
-
-    test "monitor follows the writer when a commit is redelivered to a fresh pid", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
-
-      seed_pinned_flush_entry(ctx)
-
-      # Simulate the suspend-retry hand-over: the registry entry for the
-      # still-incomplete shape is replaced by a fresh consumer before the old
-      # one's exit is observed by the SLC.
-      Electric.Shapes.ConsumerRegistry.remove_consumer("shape-doomed", ctx.stack_id)
-
-      consumer_fresh =
-        start_supervised!(
-          {Support.TransactionConsumer,
-           id: :doomed_fresh,
-           stack_id: ctx.stack_id,
-           parent: self(),
-           shape: @quiet_shape,
-           shape_handle: "shape-doomed",
-           action: :restore},
-          id: {:consumer, :doomed_fresh}
+        patch_calls(Electric.ShapeCache.ShapeCleaner, [],
+          remove_shapes_async: fn ^stack_id, handles ->
+            send(parent, {:remove_shapes_async, handles})
+            spawn(fn -> Enum.each(handles, &ShapeLogCollector.remove_shape(stack_id, &1)) end)
+            :ok
+          end
         )
 
-      lsn = Lsn.from_integer(50)
+        seed_pinned_flush_entry(ctx)
 
-      txn =
-        complete_txn_fragment(101, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "other_table"},
-            record: %{"id" => "2"},
-            log_offset: LogOffset.new(lsn, 0)
-          }
-        ])
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
 
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-      assert_receive {Support.TransactionConsumer, {:doomed_fresh, _}, [_]}
+        # `:kill` is untrappable: the consumer dies without terminate/2 and the DOWN
+        # reason `:killed` is classified as supervisor teardown, so the entry stays
+        # pinned for now — visibly: the pin is logged, since a silent one is
+        # indistinguishable from healthy quiet in a stall post-mortem.
+        pin_log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            kill_consumer(ctx.consumer_doomed, :kill)
+            :sys.get_state(collector)
+          end)
 
-      # The predecessor's late exit — e.g. its deferred {:shutdown, :suspend} —
-      # is no longer this shape's business: no crash classification, no
-      # invalidation. Without the monitor swap this reads as a contract
-      # violation and spuriously invalidates a healthy shape.
-      Support.TransactionConsumer.crash(ctx.consumer_doomed, {:shutdown, :suspend})
-      refute_receive {:writer_down_telemetry, _, _}
-      refute_receive {:remove_shapes_async, _}
+        assert pin_log =~ "leaving its flush entry pinned"
+        refute_receive {:flush_boundary_updated, _}
+        refute_receive {:remove_shapes_async, _}
 
-      # The monitor followed the fresh pid: its crash unpins and invalidates.
-      Support.TransactionConsumer.crash(consumer_fresh, {:error, :simulated_disk_failure})
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-      assert_receive {:flush_boundary_updated, 50}
-    end
+        # ...until the stall check finds it past the grace period and removes the
+        # shape, which unpins the boundary — without new traffic and without an
+        # explicit remove_shape call. The removal diagnostic captures the orphaned
+        # signature: no writer monitor, registered pid dead.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Process.sleep(50)
 
-    test "writer crashing during publish is classified as a crash for its tracked entry", ctx do
-      stub_shape_cleaner(ctx)
-      attach_writer_down_telemetry(ctx)
+        removal_log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            trigger_stall_check(ctx.stack_id)
+            assert_receive {:remove_shapes_async, ["shape-doomed"]}
+            :sys.get_state(collector)
+          end)
 
-      seed_pinned_flush_entry(ctx)
+        assert removal_log =~ "Flush-stall removal: shape-doomed:"
+        assert removal_log =~ "monitored=false"
+        assert removal_log =~ "alive=false"
 
-      # The doomed consumer exits with a real crash reason while handling the
-      # next commit: the publish-time exit observation must classify it exactly
-      # like a monitor DOWN — immediate unpin plus invalidation, with the
-      # writer monitor's own queued DOWN flushed rather than double-handled.
-      lsn = Lsn.from_integer(50)
+        assert_receive {:flush_boundary_updated, 42}
+      end
 
-      txn =
-        complete_txn_fragment(101, lsn, [
-          %Changes.NewRecord{
-            relation: {"public", "other_table"},
-            record: %{
-              "id" => "stop-with-reason",
-              "handle" => "shape-doomed",
-              "reason" => {:error, :simulated_disk_failure}
+      test "a cold-start writer outlasting the steady grace survives the boot window", ctx do
+        stub_shape_cleaner(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # The steady-state grace is long expired, but the collector just booted:
+        # first flushes at large shape counts routinely outlast the steady
+        # grace, and a slow-but-healthy writer answers no challenge by design, so
+        # scans within the boot window must not even open a challenge.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+        refute_receive {:flush_progress_challenged, _}, 100
+        trigger_stall_check(ctx.stack_id)
+        refute_receive {:remove_shapes_async, _}, 100
+
+        # Past the boot window the steady grace governs again and the wedged-writer
+        # backstop fires: challenge first, removal on the next scan.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:flush_progress_challenged, _}
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+      end
+
+      test "the first-flush allowance follows the writer, not the collector's uptime", ctx do
+        stub_shape_cleaner(ctx)
+
+        # flushed and is still awaiting its first one.
+        seed_pinned_flush_entry(ctx)
+
+        lsn = Lsn.from_integer(50)
+
+        txn =
+          complete_txn_fragment(101, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "test_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(lsn, 0)
             },
-            log_offset: LogOffset.new(lsn, 0)
-          }
-        ])
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(lsn, 2)
+            }
+          ])
 
-      assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+        assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+        assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+        assert_receive {Support.TransactionConsumer, {:doomed, _}, [_]}
 
-      assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
-      assert_receive {:remove_shapes_async, ["shape-doomed"]}
-      assert_receive {:flush_boundary_updated, 42}
-      assert_receive {:flush_boundary_updated, 50}
+        # allowance long enough that no amount of collector uptime could exhaust it.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 60_000)
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+
+        # prove it can flush keeps its allowance however long the collector has been up — a
+        # reconnect an hour in is the same cold start as a boot.
+        healthy = ctx.consumer_healthy
+        assert_receive {:flush_progress_challenged, ^healthy}
+        refute_receive {:flush_progress_challenged, _}, 100
+
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:remove_shapes_async, ["shape-healthy"]}
+        refute_receive {:remove_shapes_async, _}, 100
+      end
+
+      test "consumer stopped with bare :shutdown keeps the entry pinned", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # Bare :shutdown is assumed to be a supervisor teardown: the entry must stay
+        # pinned and the shape must not be invalidated.
+        Support.TransactionConsumer.crash(ctx.consumer_doomed, :shutdown)
+
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
+        refute_receive {:remove_shapes_async, _}
+        refute_receive {:flush_boundary_updated, _}
+      end
+
+      test "a writer deferring past the round limit stops being honored and is invalidated",
+           ctx do
+        stack_id = ctx.stack_id
+        parent = self()
+
+        patch_calls(Electric.ShapeCache.ShapeCleaner, [],
+          remove_shapes_async: fn ^stack_id, handles ->
+            send(parent, {:remove_shapes_async, handles})
+            spawn(fn -> Enum.each(handles, &ShapeLogCollector.remove_shape(stack_id, &1)) end)
+            :ok
+          end
+        )
+
+        seed_pinned_flush_entry(ctx)
+
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Electric.StackConfig.put(ctx.stack_id, :flush_deferral_round_limit, 2)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+
+        # Answer every challenge with a deferral until the collector stops trusting
+        # the writer and invalidates the shape. Driving on received challenges —
+        # rather than a fixed trigger script — keeps stray periodic stall ticks
+        # (the check timer runs at its 1s floor with this grace period) from
+        # skewing the round accounting into a flaky early invalidation.
+        answer_until_removed = fn
+          _recurse, answered when answered > 10 ->
+            flunk(
+              "still honored after #{answered} deferral answers — the round limit never tripped"
+            )
+
+          recurse, answered ->
+            trigger_stall_check(ctx.stack_id)
+
+            receive do
+              {:flush_progress_challenged, _} ->
+                ShapeLogCollector.notify_flush_deferred(ctx.stack_id, "shape-doomed")
+                :sys.get_state(collector)
+                recurse.(recurse, answered + 1)
+
+              {:remove_shapes_async, ["shape-doomed"]} ->
+                answered
+            after
+              100 -> recurse.(recurse, answered)
+            end
+        end
+
+        answered = answer_until_removed.(answer_until_removed, 0)
+
+        # Both budgeted rounds were honored, the answer past the limit was ignored,
+        # and only then did the stall pass invalidate the shape and unpin the boundary.
+        assert answered >= 3
+        assert_receive {:flush_boundary_updated, 42}
+      end
+
+      test "undeliverable :noproc keeps the entry pinned and the stall check armed", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # The doomed consumer is killed; the `:killed` DOWN is classified as
+        # supervisor teardown, so the entry stays pinned and the monitor is gone.
+        kill_consumer(ctx.consumer_doomed, :kill)
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
+
+        # New traffic for its table resolves the stale registry entry to the dead
+        # pid, so the publish observes a `:noproc` — a masked reason that must not
+        # be treated as a crash (no invalidation) nor blindly unpinned (the entry
+        # must stay for the stall check).
+        lsn = Lsn.from_integer(43)
+
+        txn =
+          complete_txn_fragment(101, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ])
+
+        assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :shutdown}}
+        refute_receive {:remove_shapes_async, _}
+        refute_receive {:flush_boundary_updated, _}
+
+        # The entry is still pinned, so the stall check self-heals one grace
+        # period later.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+      end
+
+      test "stall check challenges a wedged-alive consumer, then invalidates it", ctx do
+        stub_shape_cleaner(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+
+        # The doomed consumer is alive but never flushes. Once its entry exceeds
+        # the grace period, the stall check first challenges the writer rather
+        # than removing the shape outright — logging the writer's state so an
+        # eventual removal has a before/after picture.
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Process.sleep(50)
+
+        challenge_log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            trigger_stall_check(ctx.stack_id)
+            assert_receive {:flush_progress_challenged, _pid}
+            :sys.get_state(collector)
+          end)
+
+        assert challenge_log =~ "Flush-stall challenge: shape-doomed:"
+        assert challenge_log =~ "stalled_for_ms="
+        refute_receive {:remove_shapes_async, _}
+
+        # The wedged consumer never answers: the next check invalidates it. The
+        # removal diagnostic pins the wedged-alive signature: still monitored,
+        # registered pid alive, with its current function and queue depth.
+        removal_log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            trigger_stall_check(ctx.stack_id)
+            assert_receive {:remove_shapes_async, ["shape-doomed"]}
+            :sys.get_state(collector)
+          end)
+
+        assert removal_log =~ "Flush-stall removal: shape-doomed:"
+        assert removal_log =~ "monitored_pid=#PID"
+        assert removal_log =~ "alive=true"
+        assert removal_log =~ "current_function="
+
+        # The touch re-armed the grace period: an immediate re-check does not re-fire.
+        trigger_stall_check(ctx.stack_id)
+        refute_receive {:remove_shapes_async, _}
+
+        # If the removal chain is lost (our stub drops it), the stall re-fires one
+        # grace period later — again as a challenge first, then invalidation.
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:flush_progress_challenged, _pid}
+        refute_receive {:remove_shapes_async, _}
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+      end
+
+      test "a challenged deferring writer answers and re-arms the grace period", ctx do
+        stub_shape_cleaner(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+        Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+        Process.sleep(50)
+
+        # The stalled entry's writer is challenged; answering with
+        # notify_flush_deferred (as a deliberately deferring consumer would)
+        # touches the entry, so an immediate re-check finds nothing stalled.
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:flush_progress_challenged, _pid}
+        ShapeLogCollector.notify_flush_deferred(ctx.stack_id, "shape-doomed")
+        trigger_stall_check(ctx.stack_id)
+        refute_receive {:flush_progress_challenged, _pid}
+        refute_receive {:remove_shapes_async, _}
+
+        # A challenge answered without any stall check in between: the answer must
+        # clear the suspicion, so when the entry stalls again a full grace period
+        # later the writer is challenged afresh instead of being invalidated as an
+        # unresponsive suspect...
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:flush_progress_challenged, _pid}
+        refute_receive {:remove_shapes_async, _}
+        ShapeLogCollector.notify_flush_deferred(ctx.stack_id, "shape-doomed")
+        Process.sleep(50)
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:flush_progress_challenged, _pid}
+        refute_receive {:remove_shapes_async, _}
+
+        # ...and only an unanswered challenge invalidates the shape.
+        trigger_stall_check(ctx.stack_id)
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+      end
+
+      test "completed entry is demonitored so later writer death has no effect", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # The doomed consumer flushes everything: its entry completes and its monitor
+        # is dropped.
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-doomed", LogOffset.new(42, 2))
+        assert_receive {:flush_boundary_updated, 42}
+
+        # Its subsequent death is nobody's business: no DOWN side effects.
+        Support.TransactionConsumer.crash(ctx.consumer_doomed, {:error, :simulated_disk_failure})
+
+        refute_receive {:writer_down_telemetry, _, _}
+        refute_receive {:remove_shapes_async, _}
+        refute_receive {:flush_boundary_updated, _}
+      end
+
+      test "monitor follows the writer when a commit is redelivered to a fresh pid", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # Simulate the suspend-retry hand-over: the registry entry for the
+        # still-incomplete shape is replaced by a fresh consumer before the old
+        # one's exit is observed by the SLC.
+        Electric.Shapes.ConsumerRegistry.remove_consumer("shape-doomed", ctx.stack_id)
+
+        consumer_fresh =
+          start_supervised!(
+            {Support.TransactionConsumer,
+             id: :doomed_fresh,
+             stack_id: ctx.stack_id,
+             parent: self(),
+             shape: @quiet_shape,
+             shape_handle: "shape-doomed",
+             action: :restore},
+            id: {:consumer, :doomed_fresh}
+          )
+
+        lsn = Lsn.from_integer(50)
+
+        txn =
+          complete_txn_fragment(101, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "2"},
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ])
+
+        assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+        assert_receive {Support.TransactionConsumer, {:doomed_fresh, _}, [_]}
+
+        # The predecessor's late exit — e.g. its deferred {:shutdown, :suspend} —
+        # is no longer this shape's business: no crash classification, no
+        # invalidation. Without the monitor swap this reads as a contract
+        # violation and spuriously invalidates a healthy shape.
+        Support.TransactionConsumer.crash(ctx.consumer_doomed, {:shutdown, :suspend})
+        refute_receive {:writer_down_telemetry, _, _}
+        refute_receive {:remove_shapes_async, _}
+
+        # The monitor followed the fresh pid: its crash unpins and invalidates.
+        Support.TransactionConsumer.crash(consumer_fresh, {:error, :simulated_disk_failure})
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, 50}
+      end
+
+      test "removing a shape forgets that its writer was warm", ctx do
+        stub_shape_cleaner(ctx)
+        seed_pinned_flush_entry(ctx)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+        assert is_map_key(:sys.get_state(collector).warm_writers, "shape-healthy")
+
+        # The batcher acknowledges a removal before the collector applies it.
+        ShapeLogCollector.remove_shape(ctx.stack_id, "shape-healthy")
+
+        assert Support.TestUtils.wait_until(fn ->
+                 not is_map_key(:sys.get_state(collector).warm_writers, "shape-healthy")
+               end)
+      end
+
+      test "a late flush notification for a removed shape does not warm it", ctx do
+        stub_shape_cleaner(ctx)
+        seed_pinned_flush_entry(ctx)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+        ShapeLogCollector.remove_shape(ctx.stack_id, "shape-healthy")
+
+        # The notification has to arrive after the collector applied the removal, which the
+        # batcher acknowledges before it lands.
+        assert Support.TestUtils.wait_until(fn ->
+                 not is_map_key(:sys.get_state(collector).warm_writers, "shape-healthy")
+               end)
+
+        ShapeLogCollector.notify_flushed(
+          ctx.stack_id,
+          "shape-healthy",
+          LogOffset.new(Lsn.from_integer(42), 2),
+          ctx.consumer_healthy
+        )
+
+        refute is_map_key(:sys.get_state(collector).warm_writers, "shape-healthy")
+      end
+
+      test "a replacement writer has to earn the first-flush allowance again", ctx do
+        stub_shape_cleaner(ctx)
+        seed_pinned_flush_entry(ctx)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+
+        # A partial flush: the entry stays tracked, and the writer that sent it is warm.
+        ShapeLogCollector.notify_flushed(
+          ctx.stack_id,
+          "shape-doomed",
+          LogOffset.new(Lsn.from_integer(42), 1),
+          ctx.consumer_doomed
+        )
+
+        assert is_map_key(:sys.get_state(collector).warm_writers, "shape-doomed")
+
+        fresh = resume_consumer(ctx, :doomed_fresh, @quiet_shape, "shape-doomed")
+        send_txn(ctx, 50, {"public", "other_table"})
+        assert_receive {Support.TransactionConsumer, {:doomed_fresh, _}, [_]}
+
+        assert_awaits_first_flush(ctx, fresh)
+      end
+
+      # The commit reaches the fresh pid while the flush of the pid it replaces is still queued, so
+      # the monitor has moved to the fresh pid by the time that flush is applied.
+      test "a flush the replaced writer sent does not warm its replacement", ctx do
+        stub_shape_cleaner(ctx)
+        seed_pinned_flush_entry(ctx)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+
+        fresh = resume_consumer(ctx, :doomed_fresh, @quiet_shape, "shape-doomed")
+        send_txn(ctx, 50, {"public", "other_table"})
+        assert_receive {Support.TransactionConsumer, {:doomed_fresh, _}, [_]}
+
+        ShapeLogCollector.notify_flushed(
+          ctx.stack_id,
+          "shape-doomed",
+          LogOffset.new(Lsn.from_integer(42), 1),
+          ctx.consumer_doomed
+        )
+
+        # Read after the cast, so the flush is applied; it leaves the entry tracked.
+        state = :sys.get_state(collector)
+        assert %{"shape-doomed" => {^fresh, _ref}} = state.writer_monitors
+        refute is_map_key(state.warm_writers, "shape-doomed")
+
+        assert_awaits_first_flush(ctx, fresh)
+      end
+
+      # A consumer suspends with no pending entry, so no monitor sees it go and nothing cools its
+      # record. The pid that resumes the shape later has flushed nothing yet.
+      test "a writer resuming a shape after a completed flush gets the first-flush allowance",
+           ctx do
+        stub_shape_cleaner(ctx)
+        seed_pinned_flush_entry(ctx)
+        collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+        refute is_map_key(:sys.get_state(collector).writer_monitors, "shape-healthy")
+        assert is_map_key(:sys.get_state(collector).warm_writers, "shape-healthy")
+
+        fresh = resume_consumer(ctx, :healthy_fresh, @shape, "shape-healthy")
+        send_txn(ctx, 50, {"public", "test_table"})
+        assert_receive {Support.TransactionConsumer, {:healthy_fresh, _}, [_]}
+
+        assert_awaits_first_flush(ctx, fresh)
+      end
+
+      test "a writer hung on a broadcast is killed, invalidated, and unpinned", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        previous = Application.get_env(:electric, :broadcast_reply_grace)
+        Application.put_env(:electric, :broadcast_reply_grace, 100)
+        on_exit(fn -> Application.put_env(:electric, :broadcast_reply_grace, previous) end)
+
+        seed_pinned_flush_entry(ctx)
+
+        # The doomed consumer wedges alive inside the next commit's broadcast and
+        # never replies. The registry's kill escalation must read as a crash for
+        # its tracked entry — immediate invalidation and unpin — not as a
+        # supervisor teardown that leaves the entry pinned until the stall check
+        # reaps it a full grace period later.
+        lsn = Lsn.from_integer(50)
+
+        txn =
+          complete_txn_fragment(101, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{"id" => "hang", "handle" => "shape-doomed"},
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ])
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+          end)
+
+        assert log =~ "unresponsive to a broadcast"
+        assert log =~ "{:killed, :broadcast_unresponsive}"
+
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, 42}
+        assert_receive {:flush_boundary_updated, 50}
+      end
+
+      test "writer crashing during publish is classified as a crash for its tracked entry", ctx do
+        stub_shape_cleaner(ctx)
+        attach_writer_down_telemetry(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        # The doomed consumer exits with a real crash reason while handling the
+        # next commit: the publish-time exit observation must classify it exactly
+        # like a monitor DOWN — immediate unpin plus invalidation, with the
+        # writer monitor's own queued DOWN flushed rather than double-handled.
+        lsn = Lsn.from_integer(50)
+
+        txn =
+          complete_txn_fragment(101, lsn, [
+            %Changes.NewRecord{
+              relation: {"public", "other_table"},
+              record: %{
+                "id" => "stop-with-reason",
+                "handle" => "shape-doomed",
+                "reason" => {:error, :simulated_disk_failure}
+              },
+              log_offset: LogOffset.new(lsn, 0)
+            }
+          ])
+
+        assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+
+        assert_receive {:writer_down_telemetry, %{count: 1}, %{reason_class: :crash}}
+        assert_receive {:remove_shapes_async, ["shape-doomed"]}
+        assert_receive {:flush_boundary_updated, 42}
+        assert_receive {:flush_boundary_updated, 50}
+      end
+
+      # A consumer that exits while a commit is being broadcast to it, with no flush
+      # pending from an earlier commit, never received that commit. The flush boundary
+      # must not pass the commit while the shape is still valid and missing it: either
+      # the shape is invalidated first, or the boundary waits for the stall check to do
+      # it.
+      for reason <- [:shutdown, :killed] do
+        test "untracked shape, consumer exits #{inspect(reason)} mid-broadcast: boundary held",
+             ctx do
+          stub_removal_chain(ctx)
+
+          txn = commit_with_doomed_exit(50, unquote(reason))
+
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+          end)
+
+          assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+          ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", LogOffset.new(50, 2))
+
+          # The exit is ambiguous (it may be a deploy), so the shape is kept and the
+          # boundary stays behind the commit the shape did not get.
+          refute_receive {:flush_boundary_updated, 50}
+          refute_receive {:remove_shapes_async, _}
+
+          # The stall check resolves it: the shape is invalidated, and only then does
+          # the boundary move past the commit.
+          Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+          Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+          Process.sleep(50)
+          trigger_stall_check(ctx.stack_id)
+
+          assert_receive {:remove_shapes_async, ["shape-doomed"]}
+          assert_receive {:flush_boundary_updated, 50}
+        end
+      end
+
+      for {label, reason} <- [normal: :normal, crash: {:error, :simulated_disk_failure}] do
+        test "untracked shape, consumer exits #{label} mid-broadcast: removed first", ctx do
+          stack_id = ctx.stack_id
+          parent = self()
+
+          # The synchronous removal is the one the registry already uses for a consumer
+          # that stays suspended: it returns once the shape is out of ShapeStatus.
+          patch_calls(Electric.ShapeCache.ShapeCleaner, [],
+            remove_shapes_waiting: fn ^stack_id, handles, wait_ms ->
+              send(parent, {:remove_shapes, handles})
+              send(parent, {:removal_wait, wait_ms})
+              :ok
+            end,
+            remove_shapes_async: fn ^stack_id, _handles -> :ok end
+          )
+
+          txn = commit_with_doomed_exit(50, unquote(Macro.escape(reason)))
+
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+          end)
+
+          assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+          ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", LogOffset.new(50, 2))
+          assert_receive {:flush_boundary_updated, 50}
+
+          {:messages, messages} = Process.info(self(), :messages)
+
+          assert Enum.find_index(messages, &(&1 == {:remove_shapes, ["shape-doomed"]})) <
+                   Enum.find_index(messages, &(&1 == {:flush_boundary_updated, 50}))
+
+          # It waits for the catalog no longer than a stalled gather is given.
+          %{gather_stall_timeout: gather_stall_timeout} =
+            :sys.get_state(ShapeLogCollector.name(ctx.stack_id))
+
+          assert_received {:removal_wait, ^gather_stall_timeout}
+        end
+      end
+
+      test "tracked shape, consumer exits :shutdown mid-broadcast: late flush ignored", ctx do
+        stub_removal_chain(ctx)
+
+        seed_pinned_flush_entry(ctx)
+
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   ShapeLogCollector.handle_event(
+                     commit_with_doomed_exit(50, :shutdown),
+                     ctx.stack_id
+                   )
+        end)
+
+        assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", LogOffset.new(50, 2))
+
+        # The consumer flushed the earlier commit before it died: that flush says nothing
+        # about the commit it exited on.
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-doomed", LogOffset.new(42, 2))
+
+        refute_receive {:flush_boundary_updated, 50}
+      end
+
+      test "consumer exits :shutdown on an earlier fragment: commit holds boundary", ctx do
+        stub_removal_chain(ctx)
+
+        lsn = Lsn.from_integer(50)
+
+        [fragment1, fragment2] =
+          txn_fragments(100, lsn, [
+            %{
+              changes: [
+                %Changes.NewRecord{
+                  relation: {"public", "other_table"},
+                  record: %{
+                    "id" => "die-silently",
+                    "handle" => "shape-doomed",
+                    "reason" => :shutdown
+                  },
+                  log_offset: LogOffset.new(lsn, 0)
+                }
+              ],
+              has_begin?: true
+            },
+            %{
+              changes: [
+                %Changes.NewRecord{
+                  relation: {"public", "test_table"},
+                  record: %{"id" => "2"},
+                  log_offset: LogOffset.new(lsn, 2)
+                }
+              ],
+              has_commit?: true
+            }
+          ])
+
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = ShapeLogCollector.handle_event(fragment1, ctx.stack_id)
+          assert :ok = ShapeLogCollector.handle_event(fragment2, ctx.stack_id)
+        end)
+
+        assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
+        ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-healthy", LogOffset.new(lsn, 2))
+
+        refute_receive {:flush_boundary_updated, 50}
+      end
     end
   end
 
-  # Publish a txn (lsn 42) touching both test_table (shape-alive) and other_table
-  # (shape-doomed), then flush shape-alive completely. shape-doomed's entry is left
+  # A commit at `lsn` touching both shapes, on which the consumer of shape-doomed exits
+  # with `reason` while handling it.
+  defp commit_with_doomed_exit(lsn, reason) do
+    lsn = Lsn.from_integer(lsn)
+
+    complete_txn_fragment(101, lsn, [
+      %Changes.NewRecord{
+        relation: {"public", "test_table"},
+        record: %{"id" => "2"},
+        log_offset: LogOffset.new(lsn, 0)
+      },
+      %Changes.NewRecord{
+        relation: {"public", "other_table"},
+        record: %{"id" => "die-silently", "handle" => "shape-doomed", "reason" => reason},
+        log_offset: LogOffset.new(lsn, 2)
+      }
+    ])
+  end
+
+  # The removal chain the stall check starts: the request, then the collector's own
+  # removal of the shape, which is what unpins its flush entry.
+  defp stub_removal_chain(%{stack_id: stack_id}) do
+    parent = self()
+
+    patch_calls(Electric.ShapeCache.ShapeCleaner, [],
+      remove_shapes_waiting: fn ^stack_id, handles, _wait_ms ->
+        send(parent, {:remove_shapes, handles})
+        :ok
+      end,
+      remove_shapes_async: fn ^stack_id, handles ->
+        send(parent, {:remove_shapes_async, handles})
+        spawn(fn -> Enum.each(handles, &ShapeLogCollector.remove_shape(stack_id, &1)) end)
+        :ok
+      end
+    )
+  end
+
+  # Publish a txn (lsn 42) touching both test_table (shape-healthy) and other_table
+  # (shape-doomed), then flush shape-healthy completely. shape-doomed's entry is left
   # as the only incomplete one, holding the flush boundary just before the txn.
+  # Stands in for a consumer started again for the shape: the registry hands the next transaction
+  # to the new pid, which has flushed nothing.
+  defp resume_consumer(ctx, id, shape, shape_handle) do
+    Electric.Shapes.ConsumerRegistry.remove_consumer(shape_handle, ctx.stack_id)
+
+    start_supervised!(
+      {Support.TransactionConsumer,
+       id: id,
+       stack_id: ctx.stack_id,
+       parent: self(),
+       shape: shape,
+       shape_handle: shape_handle,
+       action: :restore},
+      id: {:consumer, id}
+    )
+  end
+
+  defp send_txn(ctx, lsn, relation) do
+    lsn = Lsn.from_integer(lsn)
+
+    txn =
+      complete_txn_fragment(101, lsn, [
+        %Changes.NewRecord{
+          relation: relation,
+          record: %{"id" => "2"},
+          log_offset: LogOffset.new(lsn, 0)
+        }
+      ])
+
+    assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
+  end
+
+  # Past the steady grace, a writer still inside the first-flush allowance is not challenged, and
+  # is once the allowance is gone.
+  defp assert_awaits_first_flush(ctx, writer) do
+    Electric.StackConfig.put(ctx.stack_id, :flush_stall_grace_period, 20)
+    Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 60_000)
+    Process.sleep(50)
+    trigger_stall_check(ctx.stack_id)
+    refute_receive {:flush_progress_challenged, ^writer}, 100
+
+    Electric.StackConfig.put(ctx.stack_id, :flush_stall_boot_grace, 0)
+    trigger_stall_check(ctx.stack_id)
+    assert_receive {:flush_progress_challenged, ^writer}
+  end
+
   defp seed_pinned_flush_entry(ctx) do
     lsn = Lsn.from_integer(42)
 
@@ -2142,17 +2932,232 @@ defmodule Electric.Replication.ShapeLogCollectorTest do
       ])
 
     assert :ok = ShapeLogCollector.handle_event(txn, ctx.stack_id)
-    assert_receive {Support.TransactionConsumer, {:alive, _}, [_]}
+    assert_receive {Support.TransactionConsumer, {:healthy, _}, [_]}
     assert_receive {Support.TransactionConsumer, {:doomed, _}, [_]}
 
-    ShapeLogCollector.notify_flushed(ctx.stack_id, "shape-alive", LogOffset.new(lsn, 2))
+    ShapeLogCollector.notify_flushed(
+      ctx.stack_id,
+      "shape-healthy",
+      LogOffset.new(lsn, 2),
+      ctx.consumer_healthy
+    )
+
     assert_receive {:flush_boundary_updated, 40}
+  end
+
+  describe "async gather stall escalation (router_shards: 2)" do
+    @describetag collector_flags: [router_shards: 2, gather_stall_timeout: 100]
+
+    setup :setup_log_collector
+
+    setup ctx do
+      parent = self()
+
+      stub_inspector(
+        load_relation_oid: fn {"public", "test_table"}, _ ->
+          {:ok, {1234, {"public", "test_table"}}}
+        end,
+        load_relation_info: fn 1234, _ ->
+          {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+        end,
+        load_column_info: fn 1234, _ ->
+          {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+        end
+      )
+
+      consumer1 =
+        start_supervised!(
+          {Support.TransactionConsumer,
+           id: :healthy,
+           stack_id: ctx.stack_id,
+           parent: parent,
+           shape: @shape,
+           shape_handle: "shape-healthy"},
+          id: {:consumer, :healthy}
+        )
+
+      consumer2 =
+        start_supervised!(
+          {Support.TransactionConsumer,
+           id: :doomed,
+           stack_id: ctx.stack_id,
+           parent: parent,
+           shape: @shape,
+           shape_handle: "shape-doomed"},
+          id: {:consumer, :doomed}
+        )
+
+      assert_shape_placement(ctx, ["shape-healthy", "shape-doomed"])
+
+      %{consumer_healthy: consumer1, consumer_doomed: consumer2}
+    end
+
+    test "a worker that stays alive but never acks crashes the collector instead of wedging silently",
+         ctx do
+      # an alive-but-silent worker must not freeze ingest.
+      register_as_replication_client(ctx.stack_id)
+      collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+      %{workers: workers} = :sys.get_state(collector)
+      :ok = :sys.suspend(elem(workers, 0))
+      monitor = Process.monitor(collector)
+
+      # age the gather head past the deadline and run the periodic check.
+      lsn = Lsn.from_integer(42)
+
+      txn =
+        complete_txn_fragment(100, lsn, [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "1"},
+            log_offset: LogOffset.new(lsn, 0)
+          }
+        ])
+
+      ShapeLogCollector.handle_event_async(txn, ctx.stack_id)
+      %{pending_gathers: pending} = :sys.get_state(collector)
+      refute :queue.is_empty(pending)
+      Process.sleep(150)
+      trigger_stall_check(ctx.stack_id)
+
+      # pinning the pipeline forever.
+      assert_receive {:DOWN, ^monitor, :process, _pid, {%RuntimeError{message: message}, _}}
+
+      assert message =~ "Async scatter gather stalled"
+      assert message =~ "router worker(s) [0]"
+    end
+  end
+
+  # One dependency-bearing shape disables scatter-ahead for the whole stack, so every
+  # fragment publishes on the blocking path — where the gather is a bare receive rather
+  # than a queue the periodic stall check can inspect. That path needs its own deadline.
+  describe "blocking gather stall (mixed ownership)" do
+    @describetag collector_flags: [router_shards: 2, gather_stall_timeout: 100]
+
+    @shape Shape.new!("test_table", inspector: @inspector)
+    @shape2 Shape.new!("test_table",
+              where: "id IN (SELECT id FROM test_table WHERE id > 10)",
+              inspector: @inspector
+            )
+
+    setup :setup_log_collector
+
+    setup ctx do
+      parent = self()
+
+      stub_inspector(
+        load_relation_oid: fn {"public", "test_table"}, _ ->
+          {:ok, {1234, {"public", "test_table"}}}
+        end,
+        load_relation_info: fn 1234, _ ->
+          {:ok, %{id: 1234, schema: "public", name: "test_table", parent: nil, children: nil}}
+        end,
+        load_column_info: fn 1234, _ ->
+          {:ok, [%{pk_position: 0, name: "id", is_generated: false}]}
+        end
+      )
+
+      start_link_supervised!(
+        {Support.TransactionConsumer,
+         id: :sharded,
+         stack_id: ctx.stack_id,
+         parent: parent,
+         shape: @shape,
+         shape_handle: "sharded-shape-handle"},
+        id: {:consumer, :sharded}
+      )
+
+      start_link_supervised!(
+        {Support.TransactionConsumer,
+         id: :inner,
+         stack_id: ctx.stack_id,
+         parent: parent,
+         shape: @shape2.shape_dependencies |> List.first(),
+         shape_handle: "inner-shape-handle"},
+        id: {:consumer, :inner}
+      )
+
+      start_link_supervised!(
+        {Support.TransactionConsumer,
+         id: :outer,
+         stack_id: ctx.stack_id,
+         parent: parent,
+         shape: %{@shape2 | shape_dependencies_handles: ["inner-shape-handle"]},
+         shape_handle: "outer-shape-handle"},
+        id: {:consumer, :outer}
+      )
+
+      start_link_supervised!(
+        {Support.StubMaterializer,
+         stack_id: ctx.stack_id,
+         shape_handle: "inner-shape-handle",
+         initial_values: MapSet.new([])}
+      )
+
+      :ok
+    end
+
+    test "an alive worker that never acks crashes the collector", ctx do
+      # shape) publishes on the blocking path, and every router worker is suspended so no
+      # slice ever acks.
+      register_as_replication_client(ctx.stack_id)
+      collector = ctx.stack_id |> ShapeLogCollector.name() |> GenServer.whereis()
+      state = :sys.get_state(collector)
+      assert state.own_shape_count > 0
+      assert is_integer(Map.fetch!(state.shape_owners, "sharded-shape-handle"))
+      state.workers |> Tuple.to_list() |> Enum.each(&(:ok = :sys.suspend(&1)))
+      monitor = Process.monitor(collector)
+
+      lsn = Lsn.from_integer(42)
+
+      txn =
+        complete_txn_fragment(100, lsn, [
+          %Changes.NewRecord{
+            relation: {"public", "test_table"},
+            record: %{"id" => "1"},
+            log_offset: LogOffset.new(lsn, 0)
+          }
+        ])
+
+      ShapeLogCollector.handle_event_async(txn, ctx.stack_id)
+
+      # pending_gathers, so the periodic stall check could never have seen this fragment.
+      assert_receive {:DOWN, ^monitor, :process, _pid, {%RuntimeError{message: message}, _}}
+
+      assert message =~ "Scatter gather stalled"
+      assert :queue.is_empty(state.pending_gathers)
+    end
+  end
+
+  # An arm claiming to shard must actually scatter: both shapes have to land on distinct
+  # router workers, or the collector never merges two workers' acks for one fragment.
+  defp assert_shape_placement(ctx, shape_handles) do
+    owners =
+      ctx.stack_id
+      |> ShapeLogCollector.name()
+      |> GenServer.whereis()
+      |> :sys.get_state()
+      |> Map.fetch!(:shape_owners)
+      |> Map.take(shape_handles)
+      |> Map.values()
+
+    assert length(owners) == length(shape_handles)
+
+    if Keyword.get(ctx.collector_flags, :router_shards, 1) > 1 do
+      assert Enum.all?(owners, &is_integer/1)
+      assert Enum.uniq(owners) == owners
+    else
+      assert Enum.uniq(owners) == [:own]
+    end
   end
 
   defp stub_shape_cleaner(%{stack_id: stack_id}) do
     parent = self()
 
     patch_calls(Electric.ShapeCache.ShapeCleaner, [],
+      remove_shapes_waiting: fn ^stack_id, handles, _wait_ms ->
+        send(parent, {:remove_shapes, handles})
+        :ok
+      end,
       remove_shapes_async: fn ^stack_id, handles ->
         send(parent, {:remove_shapes_async, handles})
         :ok

@@ -47,6 +47,34 @@ defmodule Electric.Postgres.XidTest do
   defp xid32_gen, do: StreamData.integer(1..@uint32_max)
   defp xid64_gen, do: StreamData.integer((@uint32_max + 1)..@uint64_max)
 
+  describe "xids that name the same transaction in different epochs" do
+    property "compare as equal however wide each side is" do
+      check all xid <- xid32_gen(),
+                epochs <- StreamData.integer(1..0xFFFFFFFF),
+                max_runs: 100_000,
+                max_run_time: 600 do
+        xid8 = epochs * (@uint32_max + 1) + xid
+
+        assert compare(xid, xid8) == :eq
+        assert compare(xid8, xid) == :eq
+        refute is_lt(xid, xid8)
+        refute is_lt(xid8, xid)
+        assert is_eq(xid, xid8)
+      end
+    end
+
+    property "a transaction at xmax is after the snapshot when the stream carries its bare xid" do
+      check all xmax <- xid32_gen(),
+                epochs <- StreamData.integer(1..0xFFFFFFFF),
+                max_runs: 100_000,
+                max_run_time: 600 do
+        snapshot = {epochs * (@uint32_max + 1) + xmax, epochs * (@uint32_max + 1) + xmax, []}
+
+        assert after_snapshot?(xmax, snapshot)
+      end
+    end
+  end
+
   describe "after_snapshot?/2" do
     property "returns true iff xid >= xmax (mixed 32/64-bit xids)" do
       check all xid <- StreamData.one_of([xid32_gen(), xid64_gen()]),

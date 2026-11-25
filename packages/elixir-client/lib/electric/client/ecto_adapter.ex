@@ -5,6 +5,8 @@ if Code.ensure_loaded?(Ecto) do
     alias Electric.Client.ShapeDefinition
     alias Electric.Client.EctoAdapter.ArrayDecoder
 
+    require Logger
+
     @behaviour Electric.Client.ValueMapper
 
     def shape!(schema, opts \\ [])
@@ -177,9 +179,21 @@ if Code.ensure_loaded?(Ecto) do
       struct(
         module,
         Enum.map(fields, fn {column, field, fun} ->
-          {field, fun.(Map.get(values, column))}
+          {field, cast_column(fun, Map.get(values, column), column, module, field)}
         end)
       )
+    end
+
+    defp cast_column(fun, value, column, module, field) do
+      fun.(value)
+    rescue
+      exception ->
+        # Cast errors carry the raw value, so only the column and its type are logged.
+        Logger.error(
+          "Unable to cast column #{inspect(column)} to #{inspect(module.__schema__(:type, field))}"
+        )
+
+        reraise exception, __STACKTRACE__
     end
 
     @doc false

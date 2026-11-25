@@ -2,7 +2,7 @@ name: Lux Integration Tests
 
 on:
   push:
-    branches: ['main']
+    branches: ['main', 'release/**']
     paths:
       - '.github/workflows/integration_tests.yml'
       - '.tool-versions'
@@ -17,13 +17,24 @@ on:
       - 'packages/electric-telemetry/**'
       - 'packages/sync-service/**'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # erlef/setup-beam picks its Erlang/OTP build from ImageOS, which only GitHub's own images set
+  ImageOS: ubuntu24
+  # Set repository variable PUBLIC_DNS_UNAVAILABLE=true in environments without public DNS
+  PUBLIC_DNS_UNAVAILABLE: ${{ vars.PUBLIC_DNS_UNAVAILABLE }}
+
 permissions:
   contents: read
+  packages: read
 
 jobs:
   build:
     name: Run Lux integration tests
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: integration-tests
@@ -31,16 +42,16 @@ jobs:
       MIX_ENV: dev
       MIX_TARGET: application
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         id: setup_beam
         with:
           version-type: strict
           version-file: '.tool-versions'
 
       - name: Cache dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: packages/sync-service/deps
           key: "${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}"
@@ -50,7 +61,7 @@ jobs:
             ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-
 
       - name: Cache compiled code
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             packages/sync-service/_build/*/lib
@@ -70,7 +81,7 @@ jobs:
         working-directory: packages/sync-service
 
       - name: Cache lux
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: integration-tests/lux
           key: '${{ runner.os }}-lux-629e45c-${{ steps.setup_beam.outputs.otp-version }}'
@@ -81,12 +92,135 @@ jobs:
       - name: Setup lux
         run: make
 
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The setup macros in tests/_macros.luxinc give the container 10-15s to come
+      # up, and on a cold runner the first test would otherwise spend that
+      # window pulling the image. Keep this list in step with those macros.
+      # The copies on GHCR (build_postgres_image.yml) keep Docker Hub's rate
+      # limit out of the run; tagging them with their Docker Hub names lets the
+      # macros run them unchanged.
+      - name: Pull the test images
+        run: |
+          for image in postgres:18-alpine bitnamilegacy/pgbouncer:latest otel/opentelemetry-collector-contrib:latest; do
+            docker pull "ghcr.io/beeldi/electric/$image"
+            docker tag "ghcr.io/beeldi/electric/$image" "$image"
+          done
+
       - name: Run integration tests
         id: tests
         run: ./run.sh
       - name: Upload lux logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ failure() && steps.tests.outcome == 'failure' }}
         with:
           name: lux_logs
+          path: integration-tests/**/lux_logs/run_*
+
+  # Fork lane: the same real-binary tests that exercise the perf stack's surface —
+  # crash recovery (journal boot + storage write/sync split), rolling deploys (slot
+  # takeover), keepalives under backpressure (the last-seen LSN feed) and oversized
+  # transactions — run again with every perf flag on. electric_dev.sh inherits this
+  # environment, so no lux macro changes are needed.
+  flags_on:
+    name: Run Lux integration tests with the perf features on
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: integration-tests
+    env:
+      MIX_ENV: dev
+      MIX_TARGET: application
+      ELECTRIC_SHARED_CONVERSION: 'true'
+      ELECTRIC_SHARED_PAYLOAD_ARENA: 'true'
+      ELECTRIC_SHARED_FRAGMENT_BLOCKS: 'true'
+      ELECTRIC_WORKER_PREPARE: 'true'
+      ELECTRIC_ROUTER_SHARDS: '4'
+      ELECTRIC_INGEST_PRIORITY_HIGH: 'true'
+      ELECTRIC_FILTER_ROUTING_MEMO: 'true'
+      ELECTRIC_ACK_AFTER_JOURNAL: 'true'
+      ELECTRIC_REPLICATION_PIPELINE_WINDOW: '4'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        id: setup_beam
+        with:
+          version-type: strict
+          version-file: '.tool-versions'
+
+      - name: Cache dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: packages/sync-service/deps
+          key: "${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}"
+          restore-keys: |
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-deps-
+
+      - name: Cache compiled code
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            packages/sync-service/_build/*/lib
+            !packages/sync-service/_build/*/lib/electric
+          key: "${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-build-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}"
+          restore-keys: |
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-build-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-${{ hashFiles('packages/sync-service/mix.lock') }}
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-build-${{ env.MIX_TARGET }}-${{ env.MIX_ENV }}-
+            ${{ runner.os }}-${{ hashFiles('.tool-versions') }}-sync-service-build-
+
+      - name: Install dependencies
+        run: mix do deps.get + deps.compile
+        working-directory: packages/sync-service
+
+      - name: Compile
+        run: mix compile
+        working-directory: packages/sync-service
+
+      - name: Cache lux
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: integration-tests/lux
+          key: '${{ runner.os }}-lux-629e45c-${{ steps.setup_beam.outputs.otp-version }}'
+          restore-keys: |
+            ${{ runner.os }}-lux-629e45c-${{ steps.setup_beam.outputs.otp-version }}
+            ${{ runner.os }}-lux-629e45c
+
+      - name: Setup lux
+        run: make
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Same reason as the job above: crash-recovery.lux runs first and its
+      # 15s setup_pg window must not include the image pull.
+      - name: Pull the test images
+        run: |
+          docker pull ghcr.io/beeldi/electric/postgres:18-alpine
+          docker tag ghcr.io/beeldi/electric/postgres:18-alpine postgres:18-alpine
+
+      - name: Run integration tests
+        id: tests
+        run: >-
+          ./run.sh
+          tests/crash-recovery.lux
+          tests/rolling-deploy.lux
+          tests/replication-keepalive-during-backpressure.lux
+          tests/exceedingly-large-transaction.lux
+      - name: Upload lux logs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        with:
+          name: lux_logs_flags_on
           path: integration-tests/**/lux_logs/run_*

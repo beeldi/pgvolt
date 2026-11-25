@@ -8,6 +8,33 @@ defmodule Support.DbSetup do
     types: PgInterop.Postgrex.Types
   ]
 
+  @database_ddl_timeout 45_000
+
+  @doc """
+  Run `fun` on a connection carrying the settings Electric pins before it reads anything.
+
+  Every differential test against Postgres needs them: the answers Electric is compared to are only
+  valid under these pinned session settings, and a value read under any other is text the
+  replication stream never produces.
+  """
+  def in_pinned_session(pool, fun) do
+    Postgrex.transaction(pool, fn conn ->
+      Enum.each(Electric.Postgres.display_settings(), fn setting ->
+        Postgrex.query!(conn, String.replace_prefix(setting, "SET ", "SET LOCAL "), [])
+      end)
+
+      fun.(conn)
+    end)
+  end
+
+  @doc """
+  Run a query expected to answer exactly one row of one column, and return that value.
+  """
+  def scalar(conn, sql, params) do
+    %Postgrex.Result{rows: [[value]]} = Postgrex.query!(conn, sql, params)
+    value
+  end
+
   def with_unique_db(ctx) do
     replication_config = Application.fetch_env!(:electric, :replication_connection_opts)
     query_config = Application.fetch_env!(:electric, :query_connection_opts)
@@ -32,8 +59,15 @@ defmodule Support.DbSetup do
       [db_name]
     )
 
-    Postgrex.query!(utility_pool, "DROP DATABASE IF EXISTS \"#{escaped_db_name}\"", [])
-    Postgrex.query!(utility_pool, "CREATE DATABASE \"#{escaped_db_name}\"", [])
+    # CREATE DATABASE copies the template and DROP DATABASE removes the files: on a busy runner,
+    # with every async test doing the same, either can take longer than a query's default 15 s.
+    Postgrex.query!(utility_pool, "DROP DATABASE IF EXISTS \"#{escaped_db_name}\"", [],
+      timeout: @database_ddl_timeout
+    )
+
+    Postgrex.query!(utility_pool, "CREATE DATABASE \"#{escaped_db_name}\"", [],
+      timeout: @database_ddl_timeout
+    )
 
     Enum.each(database_settings(ctx), fn setting ->
       Postgrex.query!(utility_pool, "ALTER DATABASE \"#{escaped_db_name}\" SET #{setting}", [])

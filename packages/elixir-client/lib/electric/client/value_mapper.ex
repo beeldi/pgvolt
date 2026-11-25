@@ -10,9 +10,9 @@ defmodule Electric.Client.ValueMapper do
   Quickstart](https://electric-sql.com/docs/quickstart) is
 
       %{
-        id: %{type: "int4", pk_index: 0, not_null: true},
-        name: %{type: "varchar", max_length: 255},
-        value: %{type: "float8"}
+        "id" => %{type: "int4", pk_index: 0, not_null: true},
+        "name" => %{type: "varchar", max_length: 255},
+        "value" => %{type: "float8"}
       }
 
   The `c:for_schema/2` function receives this schema as the first argument and it
@@ -23,9 +23,9 @@ defmodule Electric.Client.ValueMapper do
 
       # the schema for the `foo` table
       schema = %{
-        id: %{type: "int4", pk_index: 0, not_null: true},
-        name: %{type: "varchar", max_length: 255},
-        value: %{type: "float8"}
+        "id" => %{type: "int4", pk_index: 0, not_null: true},
+        "name" => %{type: "varchar", max_length: 255},
+        "value" => %{type: "float8"}
       }
 
       # get the mapper function for this schema
@@ -83,6 +83,15 @@ defmodule Electric.Client.ValueMapper do
 
   defp build_mapping(schema) when is_map(schema) do
     Map.new(schema, &column_mapping/1)
+  end
+
+  # An array column carries `dims > 0` and the scalar `type` of its element. The
+  # scalar converters below take a single value, so feeding them the array text
+  # (`{1,2}`) raises. Arrays are left as their raw binary, like every other type
+  # this mapper does not decode.
+  defp column_mapping({column_name, %{dims: dims} = _column_info})
+       when is_integer(dims) and dims > 0 do
+    {to_string(column_name), & &1}
   end
 
   defp column_mapping({column_name, %{type: type} = _column_info}) do

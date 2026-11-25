@@ -1,5 +1,6 @@
 packages:
   - 'packages/*'
-  - 'examples/*'
-  - 'website'
-  - 'examples/.shared'
+minimumReleaseAge: 10080
+trustPolicy: no-downgrade
+trustPolicyIgnoreAfter: 43200
+blockExoticSubdeps: true

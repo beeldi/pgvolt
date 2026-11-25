@@ -26,7 +26,11 @@ defmodule Electric.MonitoredCoreSupervisor do
        [stack_id: stack_id] ++ Keyword.get(tweaks, :shape_cleaner_opts, [])},
       {Electric.ShapeCache.ShapeStatus.ShapeDb.Supervisor,
        Keyword.take(opts, [:stack_id, :shape_db_opts])},
-      {Electric.ShapeCache.ShapeStatusOwner, [stack_id: stack_id]},
+      {Electric.ShapeCache.ShapeStatusOwner,
+       [
+         stack_id: stack_id,
+         timeline_opts: get_in(opts, [:connection_manager_opts, :timeline_opts]) || []
+       ]},
       {Electric.CoreSupervisor, opts}
     ]
 

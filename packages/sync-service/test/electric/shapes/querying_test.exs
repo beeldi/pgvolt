@@ -1,7 +1,9 @@
 defmodule Electric.Shapes.QueryingTest do
   use Support.TransactionCase, async: true
 
+  alias Electric.Replication.Eval.Expr
   alias Electric.Replication.Eval.Parser
+  alias Electric.Replication.Eval.SqlGenerator
   alias Electric.Shapes.DnfPlan
   alias Electric.Postgres.Inspector.DirectInspector
   alias Electric.Shapes.Querying
@@ -20,6 +22,32 @@ defmodule Electric.Shapes.QueryingTest do
   }
   @stack_id "test_stack"
   @shape_handle "test_shape"
+
+  test "composite tag inputs agree byte for byte between SQL and Elixir", %{db_conn: conn} do
+    for {encoding, a, b, input} <- [
+          {:length_prefixed, nil, "NULL", "4:NULL6:v:NULL"},
+          {:length_prefixed, "", nil, "2:v:4:NULL"},
+          {:length_prefixed, "é😊", ~s[v:/'"], ~s[8:v:é😊7:v:v:/'"]},
+          {:length_prefixed, "x", "yb:v:z", "3:v:x8:v:yb:v:z"},
+          {:length_prefixed, "xb:v:y", "z", "8:v:xb:v:y3:v:z"},
+          {:legacy, "x", "yb:v:z", "a:v:xb:v:yb:v:z"},
+          {:legacy, "xb:v:y", "z", "a:v:xb:v:yb:v:z"}
+        ] do
+      assert SubqueryTags.composite_tag_input([{"a", a}, {"b", b}], encoding) == input
+
+      sql = Querying.composite_tag_input_sql(["a", "b"], encoding)
+
+      assert %{rows: [[^input]]} =
+               Postgrex.query!(
+                 conn,
+                 "SELECT #{sql} FROM (VALUES ($1::text, $2::text)) AS child(a, b)",
+                 [
+                   a,
+                   b
+                 ]
+               )
+    end
+  end
 
   describe "stream_initial_data/4" do
     test "should give information about the table and the result stream", %{db_conn: conn} do
@@ -90,6 +118,27 @@ defmodule Electric.Shapes.QueryingTest do
              ] =
                decode_stream(
                  Querying.stream_initial_data(conn, "dummy-stack-id", "dummy-shape-handle", shape)
+               )
+    end
+
+    test "streams a shape saved before qualified SQL was stored", %{db_conn: conn} do
+      Postgrex.query!(conn, "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)", [])
+      Postgrex.query!(conn, "INSERT INTO items VALUES (1, 'a'), (2, 'z')", [])
+
+      where = ~s(value COLLATE "C" > 'a')
+      shape = Shape.new!("items", where: where, inspector: {DirectInspector, conn})
+      legacy_shape = update_in(shape.where, &Map.delete(&1, :qualified_sql))
+
+      assert Postgrex.query!(conn, "SELECT id FROM items WHERE #{where}", []).rows == [[2]]
+
+      assert [%{key: ~S["public"."items"/"2"], value: %{value: "z"}}] =
+               decode_stream(
+                 Querying.stream_initial_data(
+                   conn,
+                   "dummy-stack-id",
+                   "dummy-shape-handle",
+                   legacy_shape
+                 )
                )
     end
 
@@ -422,25 +471,55 @@ defmodule Electric.Shapes.QueryingTest do
                )
     end
 
+    test "a negated position over NULL is inactive, as the live path computes it", %{
+      db_conn: conn
+    } do
+      for statement <- [
+            "CREATE TABLE parent (id SERIAL PRIMARY KEY, excluded BOOLEAN NOT NULL DEFAULT FALSE)",
+            "CREATE TABLE child (id SERIAL PRIMARY KEY, value INTEGER, parent_id INTEGER REFERENCES parent(id))",
+            "INSERT INTO parent (excluded) VALUES (false), (true)",
+            "INSERT INTO child (value, parent_id) VALUES (20, NULL)"
+          ],
+          do: Postgrex.query!(conn, statement)
+
+      # `NULL NOT IN (...)` is unknown: the row is in the shape through `value = 20` alone, so
+      # when that disjunct stops holding the row has to leave.
+      shape =
+        Shape.new!("child",
+          where: "parent_id NOT IN (SELECT id FROM parent WHERE excluded = true) OR value = 20",
+          inspector: {DirectInspector, conn}
+        )
+
+      assert [
+               %{
+                 value: %{value: "20", parent_id: nil},
+                 headers: %{active_conditions: [false, true]}
+               }
+             ] =
+               decode_stream(
+                 Querying.stream_initial_data(conn, "dummy-stack-id", "dummy-shape-handle", shape)
+               )
+    end
+
     test "if shape has a subquery, tags the results (with composite keys)", %{db_conn: conn} do
       tag1 =
         :crypto.hash(
           :md5,
-          "dummy-stack-id" <> "dummy-shape-handle" <> "parent_id1:v:1" <> "parent_id2:v:1"
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:13:v:1"
         )
         |> Base.encode16(case: :lower)
 
       tag2 =
         :crypto.hash(
           :md5,
-          "dummy-stack-id" <> "dummy-shape-handle" <> "parent_id1:v:2" <> "parent_id2:v:2"
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:23:v:2"
         )
         |> Base.encode16(case: :lower)
 
       tag3 =
         :crypto.hash(
           :md5,
-          "dummy-stack-id" <> "dummy-shape-handle" <> "parent_id1:v:3" <> "parent_id2:v:3"
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:33:v:3"
         )
         |> Base.encode16(case: :lower)
 
@@ -463,6 +542,82 @@ defmodule Electric.Shapes.QueryingTest do
                %{value: %{value: "5"}, headers: %{tags: [^tag2]}},
                %{value: %{value: "6"}, headers: %{tags: [^tag3]}}
              ] =
+               decode_stream(
+                 Querying.stream_initial_data(conn, "dummy-stack-id", "dummy-shape-handle", shape)
+               )
+    end
+
+    test "move-in query tags the rows of a row-valued subquery when a column name holds a quote",
+         %{db_conn: conn} do
+      for statement <- [
+            "CREATE TABLE parent (id1 SERIAL, id2 SERIAL, value INTEGER, PRIMARY KEY (id1, id2))",
+            "CREATE TABLE child (id SERIAL PRIMARY KEY, value INTEGER, parent_id1 INTEGER, \"parent'id2\" INTEGER)",
+            "INSERT INTO parent (value) VALUES (1)",
+            "INSERT INTO child (value, parent_id1, \"parent'id2\") VALUES (4, 1, 1)"
+          ],
+          do: Postgrex.query!(conn, statement)
+
+      shape =
+        Shape.new!("child",
+          where: "(parent_id1, \"parent'id2\") IN (SELECT id1, id2 FROM parent)",
+          inspector: {DirectInspector, conn}
+        )
+        |> fill_handles()
+
+      {:ok, dnf_plan} = DnfPlan.compile(shape)
+
+      assert {where, params} =
+               Querying.move_in_where_clause(
+                 dnf_plan,
+                 0,
+                 %{["$sublink", "0"] => MapSet.new()},
+                 %{["$sublink", "0"] => MapSet.new([{1, 1}])},
+                 shape.where.used_refs
+               )
+
+      tag =
+        :crypto.hash(
+          :md5,
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:13:v:1"
+        )
+        |> Base.encode16(case: :lower)
+
+      assert [%{value: %{value: "4"}, headers: %{tags: [^tag]}}] =
+               Querying.query_move_in(
+                 conn,
+                 "dummy-stack-id",
+                 "dummy-shape-handle",
+                 shape,
+                 {where, params}
+               )
+               |> Enum.map(fn [_key, _tags, json] -> json end)
+               |> decode_stream()
+    end
+
+    test "if shape has a row-valued subquery, tags the results when a column name holds a quote",
+         %{db_conn: conn} do
+      for statement <- [
+            "CREATE TABLE parent (id1 SERIAL, id2 SERIAL, value INTEGER, PRIMARY KEY (id1, id2))",
+            "CREATE TABLE child (id SERIAL PRIMARY KEY, value INTEGER, parent_id1 INTEGER, \"parent'id2\" INTEGER)",
+            "INSERT INTO parent (value) VALUES (1)",
+            "INSERT INTO child (value, parent_id1, \"parent'id2\") VALUES (4, 1, 1)"
+          ],
+          do: Postgrex.query!(conn, statement)
+
+      shape =
+        Shape.new!("child",
+          where: "(parent_id1, \"parent'id2\") IN (SELECT id1, id2 FROM parent)",
+          inspector: {DirectInspector, conn}
+        )
+
+      tag =
+        :crypto.hash(
+          :md5,
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:13:v:1"
+        )
+        |> Base.encode16(case: :lower)
+
+      assert [%{value: %{value: "4"}, headers: %{tags: [^tag]}}] =
                decode_stream(
                  Querying.stream_initial_data(conn, "dummy-stack-id", "dummy-shape-handle", shape)
                )
@@ -735,14 +890,14 @@ defmodule Electric.Shapes.QueryingTest do
       tag1 =
         :crypto.hash(
           :md5,
-          "dummy-stack-id" <> "dummy-shape-handle" <> "parent_id1:v:1" <> "parent_id2:v:1"
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:13:v:1"
         )
         |> Base.encode16(case: :lower)
 
       tag2 =
         :crypto.hash(
           :md5,
-          "dummy-stack-id" <> "dummy-shape-handle" <> "parent_id1:v:2" <> "parent_id2:v:2"
+          "dummy-stack-id" <> "dummy-shape-handle" <> "3:v:23:v:2"
         )
         |> Base.encode16(case: :lower)
 
@@ -935,7 +1090,7 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ "= ANY ($1::"
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert sql =~ "= ANY ($2::"
       assert sql =~ "= ANY ($3::"
       assert length(params) == 3
@@ -965,7 +1120,7 @@ defmodule Electric.Shapes.QueryingTest do
           where.used_refs
         )
 
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert length(params) == 3
       assert Enum.sort(Enum.at(params, 0)) == [10, 100]
       assert Enum.at(params, 1) == [10]
@@ -1010,7 +1165,7 @@ defmodule Electric.Shapes.QueryingTest do
       assert sql =~ "= ANY ($1::"
       assert sql =~ "= ANY ($2::"
       assert sql =~ ~s|"status" = 'open'|
-      assert sql =~ "AND NOT"
+      assert sql =~ "IS NOT TRUE"
       assert length(params) == 3
     end
   end
@@ -1033,7 +1188,8 @@ defmodule Electric.Shapes.QueryingTest do
         )
 
       assert sql =~ ~s|NOT ("x" = ANY ($1::|
-      assert sql =~ ~s|AND NOT (NOT ("x" = ANY ($2::|
+      assert sql =~ ~s|AND (NOT ("x" = ANY ($2::|
+      assert sql =~ "IS NOT TRUE"
       assert params == [[3], [1, 2, 3]]
     end
 
@@ -1057,6 +1213,198 @@ defmodule Electric.Shapes.QueryingTest do
       assert sql =~ ~s|NOT ("y" = ANY ($1::|
       assert sql =~ ~s|NOT ("y" = ANY ($2::|
       assert params == [[6], [5, 6]]
+    end
+  end
+
+  test "move patterns of an IN name the tags of rows holding a moved numeric at any scale",
+       %{db_conn: conn} do
+    Postgrex.query!(conn, "CREATE TABLE parent (id int PRIMARY KEY, code numeric)", [])
+    Postgrex.query!(conn, "CREATE TABLE child (id int PRIMARY KEY, code numeric)", [])
+
+    Postgrex.query!(
+      conn,
+      "INSERT INTO child VALUES (1, 1.00), (2, 1), (3, 2.0), (4, NULL)",
+      []
+    )
+
+    shape =
+      Shape.new!("child",
+        where: "code IN (SELECT code FROM parent)",
+        inspector: {DirectInspector, conn}
+      )
+
+    assert {:ok, plan} = DnfPlan.compile(shape)
+    ref = ["$sublink", "0"]
+    one_and_two = %{ref => MapSet.new([Decimal.new(1), Decimal.new(2)])}
+    two = %{ref => MapSet.new([Decimal.new(2)])}
+
+    tags = fn texts ->
+      texts
+      |> Enum.map(&SubqueryTags.make_value_hash_raw(@stack_id, @shape_handle, "v:" <> &1))
+      |> Enum.sort()
+    end
+
+    patterns = fn before, after_move, kind ->
+      conn
+      |> Querying.move_patterns(
+        @stack_id,
+        @shape_handle,
+        shape,
+        plan,
+        0,
+        before,
+        after_move,
+        kind
+      )
+      |> Enum.map(& &1.value)
+      |> Enum.sort()
+    end
+
+    assert patterns.(one_and_two, two, :move_out) == tags.(["1", "1.00"])
+    assert patterns.(two, one_and_two, :move_in) == tags.(["1", "1.00"])
+  end
+
+  test "negated move patterns encode bytea and JSONB keys from replication text", %{db_conn: conn} do
+    Postgrex.query!(
+      conn,
+      "CREATE TABLE parent (id int PRIMARY KEY, payload bytea, data jsonb)",
+      []
+    )
+
+    Postgrex.query!(
+      conn,
+      "CREATE TABLE child (id int PRIMARY KEY, payload bytea, data jsonb)",
+      []
+    )
+
+    Postgrex.query!(
+      conn,
+      ~S|INSERT INTO child VALUES (1, '\x00ff', 'null'), (2, '\x00ff', NULL)|,
+      []
+    )
+
+    clause = "(data, payload) NOT IN (SELECT data, payload FROM parent)"
+    shape = Shape.new!("child", where: clause, inspector: {DirectInspector, conn})
+    assert {:ok, plan} = DnfPlan.compile(shape)
+    ref = ["$sublink", "0"]
+    before = %{ref => MapSet.new()}
+    after_move = %{ref => MapSet.new([{"null", ~S|\x00ff|}])}
+
+    assert patterns =
+             Querying.move_patterns(
+               conn,
+               @stack_id,
+               @shape_handle,
+               shape,
+               plan,
+               0,
+               before,
+               after_move,
+               :move_out
+             )
+
+    assert patterns |> Enum.map(& &1.value) |> Enum.sort() ==
+             Enum.sort([
+               SubqueryTags.make_value_hash_raw(
+                 @stack_id,
+                 @shape_handle,
+                 ~S|6:v:null8:v:\x00ff|
+               ),
+               SubqueryTags.make_value_hash_raw(
+                 @stack_id,
+                 @shape_handle,
+                 ~S|4:NULL8:v:\x00ff|
+               )
+             ])
+  end
+
+  test "move-in SQL preserves the explicit byte collation of a disjunct", %{db_conn: conn} do
+    Postgrex.query!(conn, ~s|CREATE TABLE parent (id int PRIMARY KEY)|, [])
+
+    Postgrex.query!(
+      conn,
+      ~s|CREATE TABLE child (id int PRIMARY KEY, parent_id int, name text COLLATE pg_catalog."und-x-icu")|,
+      []
+    )
+
+    Postgrex.query!(conn, "INSERT INTO child VALUES (1, 2, 'B'), (2, 2, 'b')", [])
+
+    clause = ~s|name COLLATE pg_catalog."C" >= 'a' OR parent_id IN (SELECT id FROM parent)|
+    shape = Shape.new!("child", where: clause, inspector: {DirectInspector, conn})
+    {:ok, plan} = DnfPlan.compile(shape)
+    sublink = ["$sublink", "0"]
+
+    {sql, params} =
+      Querying.move_in_where_clause(
+        plan,
+        0,
+        %{sublink => MapSet.new()},
+        %{sublink => MapSet.new([2])},
+        shape.where.used_refs
+      )
+
+    before = Postgrex.query!(conn, "SELECT id FROM child WHERE #{clause}", []).rows
+    Postgrex.query!(conn, "INSERT INTO parent VALUES (2)", [])
+    after_move = Postgrex.query!(conn, "SELECT id FROM child WHERE #{clause}", []).rows
+
+    assert after_move -- before == [[1]]
+    assert Postgrex.query!(conn, "SELECT id FROM child WHERE #{sql}", params).rows == [[1]]
+  end
+
+  test "a collated constant in coalesce is preserved in subquery move SQL", %{db_conn: conn} do
+    Postgrex.query!(conn, "CREATE TABLE parent (id int PRIMARY KEY)", [])
+
+    Postgrex.query!(
+      conn,
+      ~s|CREATE TABLE child (id int PRIMARY KEY, parent_id int, name text COLLATE pg_catalog."und-x-icu")|,
+      []
+    )
+
+    Postgrex.query!(conn, "INSERT INTO child VALUES (1, 1, 'B'), (2, 2, NULL)", [])
+
+    clause =
+      ~s|coalesce('x' COLLATE pg_catalog."C", name) = 'x' AND parent_id IN (SELECT id FROM parent)|
+
+    shape = Shape.new!("child", where: clause, inspector: {DirectInspector, conn})
+    assert {:ok, plan} = DnfPlan.compile(shape)
+    sublink = ["$sublink", "0"]
+
+    {sql, params} =
+      Querying.move_in_where_clause(
+        plan,
+        0,
+        %{sublink => MapSet.new()},
+        %{sublink => MapSet.new([1])},
+        shape.where.used_refs
+      )
+
+    Postgrex.query!(conn, "INSERT INTO parent VALUES (1)", [])
+    assert Postgrex.query!(conn, "SELECT id FROM child WHERE #{clause}", []).rows == [[1]]
+    assert Postgrex.query!(conn, "SELECT id FROM child WHERE #{sql}", params).rows == [[1]]
+  end
+
+  test "normalized SQL pins bare C and POSIX to pg_catalog", %{db_conn: conn} do
+    for collation <- ["C", "POSIX"] do
+      Postgrex.query!(
+        conn,
+        ~s|CREATE COLLATION public."#{collation}" FROM pg_catalog."und-x-icu"|,
+        []
+      )
+    end
+
+    Postgrex.query!(conn, "SET LOCAL search_path = public, pg_catalog", [])
+
+    for collation <- ["C", "POSIX"], lhs <- ["name", "concat(name, '')"] do
+      clause = ~s|#{lhs} COLLATE "#{collation}" >= 'a'|
+      where = Parser.parse_and_validate_expression!(clause, refs: @refs)
+
+      assert Postgrex.query!(conn, ~s|SELECT #{clause} FROM (VALUES ('B')) AS child(name)|, []).rows ==
+               [[true]]
+
+      for sql <- [Expr.sql(where), SqlGenerator.to_sql(where.eval)] do
+        assert Postgrex.query!(conn, ~s|SELECT #{sql} FROM (VALUES ('B')) AS child(name)|, []).rows ==
+                 [[false]]
+      end
     end
   end
 

@@ -21,7 +21,7 @@ Runtime configuration is available for the underlying otel_metric_exporter lib:
 ```elixir
 config :otel_metric_exporter,
   otlp_endpoint: "...",
-  otlp_headers: %{...}
+  otlp_headers: %{...},
   resource: %{...}
 ```
 
@@ -36,6 +36,6 @@ At a high level, the library includes these modules:
 - `ElectricTelemetry.ApplicationTelemetry` defines metrics and periodic measurements that apply to BEAM as a whole.
 
 - `ElectricTelemetry.StackTelemetry` defines metrics that are specific to the notion of an
-  Electric stack: shape stats, replication client stats, etc. No builtin measurements are defines here.
+  Electric stack: shape stats, replication client stats, etc. No builtin measurements are defined here.
 
 - Reporter modules. These are enabled individually and are used for exporting metrics to the corresponding destination.

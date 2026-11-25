@@ -96,16 +96,18 @@ defmodule Electric.Application do
     Electric.Config.persist_installation_id(persistent_kv, instance_id)
 
     replication_stream_id = get_env(opts, :replication_stream_id)
-
-    publication_name =
-      Keyword.get(opts, :publication_name, "electric_publication_#{replication_stream_id}")
-
+    manual_table_publishing? = get_env(opts, :manual_table_publishing?)
     slot_temporary? = get_env(opts, :replication_slot_temporary?)
     slot_temporary_random_name? = get_env(opts, :replication_slot_temporary_random_name?)
 
-    slot_name =
+    suffix =
       if slot_temporary? and slot_temporary_random_name? do
-        name = "electric_slot_#{Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)}"
+        Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+      end
+
+    slot_name =
+      if suffix do
+        name = "electric_slot_#{suffix}"
 
         Logger.warning(
           "Using a temporary replication slot with name: #{name}. This slot will be deleted on shutdown, so persistent storage should not outlive the Electric instance."
@@ -116,6 +118,17 @@ defmodule Electric.Application do
         Keyword.get(opts, :slot_name, "electric_slot_#{replication_stream_id}")
       end
 
+    generated_publication? =
+      not is_nil(suffix) and not manual_table_publishing? and
+        not Keyword.has_key?(opts, :publication_name)
+
+    publication_name =
+      if generated_publication? do
+        "electric_publication_#{suffix}"
+      else
+        Keyword.get(opts, :publication_name, "electric_publication_#{replication_stream_id}")
+      end
+
     replication_connection_opts = get_env!(opts, :replication_connection_opts)
     replication_idle_timeout = get_env(opts, :replication_idle_timeout)
 
@@ -123,6 +136,16 @@ defmodule Electric.Application do
          replication_idle_timeout < Electric.Config.min_replication_idle_timeout() do
       raise "Invalid value for ELECTRIC_REPLICATION_IDLE_TIMEOUT: #{replication_idle_timeout}. " <>
               "The minimum supported timeout is #{Electric.Config.min_replication_idle_timeout_in_seconds()}sec."
+    end
+
+    replication_heartbeat_interval = get_env(opts, :replication_heartbeat_interval)
+
+    # A heartbeat only keeps the stream from looking idle if at least two of them fit in the
+    # idle window: one may land just after an idle check, and the next must still beat it.
+    if replication_heartbeat_interval > 0 and replication_idle_timeout > 0 and
+         replication_heartbeat_interval * 2 > replication_idle_timeout do
+      raise "Invalid value for ELECTRIC_REPLICATION_HEARTBEAT_INTERVAL: #{replication_heartbeat_interval}. " <>
+              "It must be at most half of ELECTRIC_REPLICATION_IDLE_TIMEOUT (#{replication_idle_timeout})."
     end
 
     Keyword.merge(
@@ -136,12 +159,15 @@ defmodule Electric.Application do
         slot_temporary?: get_env(opts, :replication_slot_temporary?),
         max_txn_size: get_env(opts, :max_txn_size),
         max_batch_size: get_env(opts, :max_batch_size),
-        replication_idle_timeout: replication_idle_timeout
+        replication_idle_timeout: replication_idle_timeout,
+        replication_heartbeat_interval: replication_heartbeat_interval
       ],
+      drop_publication_on_stop?: generated_publication?,
       pool_opts:
         get_env_lazy(opts, :pool_opts, fn -> [pool_size: get_env(opts, :db_pool_size)] end),
       tcp_opts: tcp_opts(opts),
       chunk_bytes_threshold: get_env(opts, :chunk_bytes_threshold),
+      compaction_period: get_env(opts, :compaction_period),
       telemetry_opts: telemetry_opts([instance_id: instance_id] ++ opts),
       max_shapes: get_env(opts, :max_shapes),
       tweaks: [
@@ -155,12 +181,20 @@ defmodule Electric.Application do
         shape_enable_suspend?: get_env(opts, :shape_enable_suspend?),
         shape_suspend_after: get_env(opts, :shape_suspend_after),
         flush_stall_grace_period: get_env(opts, :flush_stall_grace_period),
+        flush_stall_boot_grace: get_env(opts, :flush_stall_boot_grace),
+        flush_deferral_round_limit: get_env(opts, :flush_deferral_round_limit),
+        gather_stall_timeout: get_env(opts, :gather_stall_timeout),
+        subquery_buffer_max_transactions: get_env(opts, :subquery_buffer_max_transactions),
         conn_max_requests: get_env(opts, :conn_max_requests),
+        max_request_line_length: get_env(opts, :max_request_line_length),
         handler_fullsweep_after: get_env(opts, :handler_fullsweep_after),
+        http2_max_reset_stream_rate: get_env(opts, :http2_max_reset_stream_rate),
         process_spawn_opts: get_env(opts, :process_spawn_opts),
-        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold)
+        consumer_gc_heap_threshold: get_env(opts, :consumer_gc_heap_threshold),
+        txn_buffer_max_changes: get_env(opts, :txn_buffer_max_changes),
+        stalled_serve_timeout: get_env(opts, :stalled_serve_timeout)
       ],
-      manual_table_publishing?: get_env(opts, :manual_table_publishing?),
+      manual_table_publishing?: manual_table_publishing?,
       shape_db_opts: [
         exclusive_mode: get_env(opts, :shape_db_exclusive_mode),
         storage_dir:
@@ -187,6 +221,7 @@ defmodule Electric.Application do
       stack_ready_timeout: get_env(opts, :stack_ready_timeout),
       send_cache_headers?: get_env(opts, :send_cache_headers?),
       max_concurrent_requests: get_env(opts, :max_concurrent_requests),
+      subset_max_rows: get_env(opts, :subset_max_rows),
       secret: Application.get_env(:electric, :secret)
     )
     |> Keyword.merge(Keyword.take(opts, [:encoder, :inspector]))
@@ -369,16 +404,42 @@ defmodule Electric.Application do
         []
       end
 
-    [
-      {Bandit,
-       [
-         plug: {Electric.Plug.Router, router_opts},
-         port: get_env(opts, :service_port),
-         http_1_options: http_1_opts,
-         http_2_options: [],
-         thousand_island_options: thousand_island_options(opts ++ ti_opts)
-       ]}
+    http_1_opts =
+      if max_length = Keyword.get(tweaks, :max_request_line_length) do
+        [{:max_request_line_length, max_length} | http_1_opts]
+      else
+        http_1_opts
+      end
+
+    # Bandit's reset-stream rate limit (a Rapid Reset mitigation) closes the entire
+    # connection once a client sends too many RST_STREAM frames, killing every stream
+    # on it without running their cleanup. The default leaves room for a proxy that
+    # multiplexes many end clients onto one upstream connection and cancels their
+    # long polls.
+    http_2_opts =
+      case Keyword.get(
+             tweaks,
+             :http2_max_reset_stream_rate,
+             Electric.Config.default(:http2_max_reset_stream_rate)
+           ) do
+        :disabled -> [max_reset_stream_rate: nil]
+        {count, period_ms} -> [max_reset_stream_rate: {count, period_ms}]
+      end
+
+    bandit_opts = [
+      plug: {Electric.Plug.Router, router_opts},
+      port: get_env(opts, :service_port),
+      http_1_options: http_1_opts,
+      http_2_options: http_2_opts,
+      thousand_island_options: thousand_island_options(opts ++ ti_opts)
     ]
+
+    bandit_opts =
+      if Electric.Telemetry.RequestValues.enabled?(),
+        do: Keyword.put(bandit_opts, :http_options, log_exceptions_with_status_codes: []),
+        else: bandit_opts
+
+    [{Bandit, bandit_opts}]
   end
 
   def api_server(Plug.Cowboy, opts) do
@@ -448,6 +509,7 @@ defmodule Electric.Application do
         get_opts(opts,
           system_metrics_poll_interval: :system_metrics_poll_interval,
           stack_telemetry_init_delay: :stack_telemetry_init_delay,
+          disk_usage_scan_period: :disk_usage_scan_period,
           long_gc_threshold: :telemetry_long_gc_threshold,
           long_schedule_threshold: :telemetry_long_schedule_threshold,
           long_message_queue_enable_threshold: :telemetry_long_message_queue_enable_threshold,

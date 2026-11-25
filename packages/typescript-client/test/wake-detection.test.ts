@@ -255,6 +255,422 @@ describe(`Wake detection`, () => {
     aborter.abort()
   })
 
+  const upToDateResponse = () =>
+    new Response(JSON.stringify([{ headers: { control: `up-to-date` } }]), {
+      status: 200,
+      headers: new Headers({
+        'electric-handle': `h1`,
+        'electric-offset': `0_0`,
+        'electric-schema': `{}`,
+        'electric-up-to-date': ``,
+      }),
+    })
+
+  const sseResponse = (body: ReadableStream<Uint8Array>) =>
+    new Response(body, {
+      status: 200,
+      headers: new Headers({
+        'content-type': `text/event-stream`,
+        'electric-handle': `h1`,
+        'electric-offset': `0_0`,
+        'electric-schema': `{}`,
+        'electric-cursor': `c1`,
+      }),
+    })
+
+  describe(`SSE request watchdog`, () => {
+    function startSseStream(
+      sseFetch: (signal: AbortSignal) => Promise<Response>,
+      liveRequestTimeoutMs: number | false = 100
+    ) {
+      const sseSignals: AbortSignal[] = []
+      const fetchWrapper = (
+        input: RequestInfo | URL,
+        init?: RequestInit
+      ): Promise<Response> => {
+        if (!input.toString().includes(`live_sse=true`)) {
+          return Promise.resolve(upToDateResponse())
+        }
+        sseSignals.push(init!.signal!)
+        return sseFetch(init!.signal!)
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient: fetchWrapper,
+        liveSse: true,
+        liveRequestTimeoutMs,
+      })
+      const unsub = stream.subscribe(() => {})
+      return { sseSignals, unsub }
+    }
+
+    it(`should restart an SSE request whose headers never arrive`, async () => {
+      vi.useFakeTimers()
+
+      // A fetch that never settles, even when aborted.
+      const { sseSignals, unsub } = startSseStream(
+        () => new Promise<Response>(() => {})
+      )
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sseSignals).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(101)
+
+      expect(sseSignals[0]!.aborted).toBe(true)
+      expect(sseSignals).toHaveLength(2)
+
+      unsub()
+    })
+
+    it(`should restart an SSE request whose body goes silent`, async () => {
+      vi.useFakeTimers()
+
+      // Headers arrive, then nothing: a half-open connection.
+      const { sseSignals, unsub } = startSseStream(() =>
+        Promise.resolve(sseResponse(new ReadableStream<Uint8Array>()))
+      )
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sseSignals).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(101)
+
+      expect(sseSignals[0]!.aborted).toBe(true)
+      expect(sseSignals).toHaveLength(2)
+
+      unsub()
+    })
+
+    it(`should drop a late SSE response after the watchdog restarted the request`, async () => {
+      vi.useFakeTimers()
+
+      const encode = (message: object) =>
+        new TextEncoder().encode(`data: ${JSON.stringify(message)}\n\n`)
+      let resolveLateFetch!: (response: Response) => void
+      let sseFetchCount = 0
+      const fetchWrapper = (
+        input: RequestInfo | URL,
+        _init?: RequestInit
+      ): Promise<Response> => {
+        if (!input.toString().includes(`live_sse=true`)) {
+          return Promise.resolve(upToDateResponse())
+        }
+        sseFetchCount++
+        // The first SSE fetch ignores abort and resolves late; later ones hang.
+        if (sseFetchCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveLateFetch = resolve
+          })
+        }
+        return new Promise<Response>(() => {})
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient: fetchWrapper,
+        liveSse: true,
+        liveRequestTimeoutMs: 100,
+      })
+      const received: unknown[] = []
+      const unsub = stream.subscribe((messages) => {
+        received.push(...messages)
+      })
+
+      await vi.advanceTimersByTimeAsync(101)
+      expect(sseFetchCount).toBe(2)
+      const messagesBeforeLateResponse = received.length
+
+      resolveLateFetch(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encode({
+                  headers: { operation: `insert` },
+                  key: `stale`,
+                  value: { id: `stale` },
+                  offset: `1_0`,
+                })
+              )
+              controller.enqueue(
+                encode({ headers: { control: `up-to-date` }, offset: `1_0` })
+              )
+              controller.close()
+            },
+          }),
+          {
+            status: 200,
+            headers: new Headers({
+              'content-type': `text/event-stream`,
+              'electric-handle': `h2`,
+              'electric-offset': `1_0`,
+              'electric-schema': `{}`,
+              'electric-cursor': `c2`,
+            }),
+          }
+        )
+      )
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(received).toHaveLength(messagesBeforeLateResponse)
+      expect(stream.shapeHandle).toBe(`h1`)
+      expect(stream.lastOffset).toBe(`0_0`)
+
+      unsub()
+    })
+
+    it(`should keep an SSE request open while keep-alive comments arrive`, async () => {
+      vi.useFakeTimers()
+
+      const keepAlive = new TextEncoder().encode(`: keep-alive\n\n`)
+      const { sseSignals, unsub } = startSseStream(() => {
+        let interval: ReturnType<typeof setInterval>
+        return Promise.resolve(
+          sseResponse(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                interval = setInterval(() => controller.enqueue(keepAlive), 50)
+              },
+              cancel() {
+                clearInterval(interval)
+              },
+            })
+          )
+        )
+      })
+
+      await vi.advanceTimersByTimeAsync(500)
+
+      expect(sseSignals).toHaveLength(1)
+      expect(sseSignals[0]!.aborted).toBe(false)
+
+      unsub()
+    })
+
+    it(`should not watch SSE requests when liveRequestTimeoutMs is false`, async () => {
+      vi.useFakeTimers()
+
+      const { sseSignals, unsub } = startSseStream(
+        () => Promise.resolve(sseResponse(new ReadableStream<Uint8Array>())),
+        false
+      )
+
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(sseSignals).toHaveLength(1)
+      expect(sseSignals[0]!.aborted).toBe(false)
+
+      unsub()
+    })
+  })
+
+  describe.each([
+    [`SSE`, true],
+    [`long-poll`, false],
+  ])(`%s live request that waits to retry`, (_, liveSse) => {
+    const liveRequestTimeoutMs = 45_000
+
+    // The first live attempt is answered 503 with Retry-After: 60, longer than
+    // the watchdog timeout. `nextAttempt` answers every later one.
+    function startStream(nextAttempt: () => Promise<Response>) {
+      vi.useFakeTimers()
+      // No jitter, so the wait is exactly the 60 seconds the server asked for.
+      vi.spyOn(Math, `random`).mockReturnValue(0)
+
+      const liveSignals: AbortSignal[] = []
+      const fetchClient = (
+        input: RequestInfo | URL,
+        init?: RequestInit
+      ): Promise<Response> => {
+        if (!input.toString().includes(`live=true`)) {
+          return Promise.resolve(upToDateResponse())
+        }
+        liveSignals.push(init!.signal!)
+        if (liveSignals.length > 1) return nextAttempt()
+        return Promise.resolve(
+          new Response(null, { status: 503, headers: { 'retry-after': `60` } })
+        )
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient,
+        liveSse,
+        liveRequestTimeoutMs,
+      })
+      const unsub = stream.subscribe(() => {})
+      return { liveSignals, unsub }
+    }
+
+    it(`should wait out a Retry-After longer than the watchdog timeout`, async () => {
+      const { liveSignals, unsub } = startStream(
+        () => new Promise<Response>(() => {})
+      )
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(liveSignals).toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(liveSignals).toHaveLength(1)
+      expect(liveSignals[0]!.aborted).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1_001)
+      // Retried within the same request, not restarted.
+      expect(liveSignals).toHaveLength(2)
+      expect(liveSignals[1]).toBe(liveSignals[0])
+      expect(liveSignals[0]!.aborted).toBe(false)
+
+      unsub()
+    })
+
+    it(`should give the attempt after the wait a full timeout window`, async () => {
+      const { liveSignals, unsub } = startStream(
+        () => new Promise<Response>(() => {})
+      )
+
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(liveSignals).toHaveLength(2)
+
+      // Almost the whole window has passed since the wait ended.
+      await vi.advanceTimersByTimeAsync(liveRequestTimeoutMs - 1_000)
+      expect(liveSignals[0]!.aborted).toBe(false)
+
+      // A silent attempt is still restarted once the window is over.
+      await vi.advanceTimersByTimeAsync(2_000)
+      expect(liveSignals[0]!.aborted).toBe(true)
+
+      unsub()
+    })
+  })
+
+  describe.each([
+    [`SSE`, true],
+    [`long-poll`, false],
+  ])(`%s live request that is aborted`, (_, liveSse) => {
+    // A fetch that never settles and does not look at its signal, like the
+    // wedged runtime fetches the watchdog is for.
+    function startWithIgnoredAbort() {
+      vi.useFakeTimers()
+      const fetchClient = (input: RequestInfo | URL): Promise<Response> =>
+        input.toString().includes(`live=true`)
+          ? new Promise<Response>(() => {})
+          : Promise.resolve(upToDateResponse())
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient,
+        liveSse,
+        liveRequestTimeoutMs: 45_000,
+      })
+      stream.subscribe(() => {})
+      return stream
+    }
+
+    it(`should not leave the watchdog timer behind when the stream is torn down`, async () => {
+      const stream = startWithIgnoredAbort()
+      await vi.advanceTimersByTimeAsync(0)
+      // The watchdog is armed on the live request.
+      expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+      stream.unsubscribeAll()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it(`should not leave the watchdog timer behind when the stream is aborted from outside`, async () => {
+      startWithIgnoredAbort()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(vi.getTimerCount()).toBeGreaterThan(0)
+
+      aborter.abort()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(vi.getTimerCount()).toBe(0)
+    })
+  })
+
+  describe(`SSE request with a body that ignores its signal`, () => {
+    // Every body stays silent and does not look at the request's signal, like
+    // the body of a wedged runtime fetch. Only a cancel of its source stops it.
+    function startWithWedgedBodies() {
+      vi.useFakeTimers()
+      let bodiesStarted = 0
+      const sourceCancelled = vi.fn()
+      const fetchClient = (input: RequestInfo | URL): Promise<Response> => {
+        if (!input.toString().includes(`live_sse=true`)) {
+          return Promise.resolve(upToDateResponse())
+        }
+        bodiesStarted++
+        return Promise.resolve(
+          sseResponse(
+            new ReadableStream<Uint8Array>({
+              pull: () => new Promise<void>(() => {}),
+              cancel: sourceCancelled,
+            })
+          )
+        )
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient,
+        liveSse: true,
+        liveRequestTimeoutMs: 100,
+      })
+      stream.subscribe(() => {})
+      return { stream, sourceCancelled, bodiesStarted: () => bodiesStarted }
+    }
+
+    it(`should cancel the body of an SSE request the watchdog restarted`, async () => {
+      const { sourceCancelled, bodiesStarted } = startWithWedgedBodies()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(bodiesStarted()).toBe(1)
+      expect(sourceCancelled).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(101)
+
+      // The restart opened a second body; the wedged first one was let go.
+      expect(bodiesStarted()).toBe(2)
+      expect(sourceCancelled).toHaveBeenCalledTimes(1)
+    })
+
+    it(`should cancel every body when the stream is torn down`, async () => {
+      const { stream, sourceCancelled, bodiesStarted } = startWithWedgedBodies()
+      await vi.advanceTimersByTimeAsync(101)
+      expect(bodiesStarted()).toBe(2)
+
+      stream.unsubscribeAll()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(sourceCancelled).toHaveBeenCalledTimes(2)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it(`should cancel the body when the stream is aborted from outside`, async () => {
+      const { sourceCancelled } = startWithWedgedBodies()
+      await vi.advanceTimersByTimeAsync(0)
+
+      aborter.abort()
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(sourceCancelled).toHaveBeenCalledTimes(1)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+  })
+
   it(`should use the React Native export to install AppState visibility`, async () => {
     vi.useFakeTimers()
 
@@ -464,6 +880,99 @@ describe(`Wake detection`, () => {
 
     unsub()
     aborter.abort()
+  })
+
+  describe(`when the stream is paused and resumed before its request loop settles`, () => {
+    // Hidden and then visible again with no tick in between, while the first
+    // request is in flight and takes a moment to unwind after it is aborted.
+    // The loop the pause aborted therefore settles only after the resumed
+    // loop is running.
+    function startPausableStream() {
+      vi.useFakeTimers()
+      let notifyVisibility: ((state: `visible` | `hidden`) => void) | undefined
+      const signals: AbortSignal[] = []
+      const fetchClient = (
+        input: RequestInfo | URL,
+        init?: RequestInit
+      ): Promise<Response> => {
+        const signal = init!.signal!
+        signals.push(signal)
+        // Only the first request and the live ones are held open.
+        if (signals.length > 1 && !input.toString().includes(`live=true`)) {
+          return Promise.resolve(upToDateResponse())
+        }
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener(
+            `abort`,
+            () => setTimeout(() => reject(new Error(`aborted`)), 10),
+            { once: true }
+          )
+        })
+      }
+
+      const stream = new ShapeStream({
+        url: shapeUrl,
+        params: { table: `foo` },
+        signal: aborter.signal,
+        fetchClient,
+        runtimeVisibility: {
+          getCurrentState: () => `visible`,
+          subscribe: (handler) => {
+            notifyVisibility = handler
+            return () => {
+              notifyVisibility = undefined
+            }
+          },
+        },
+      })
+      stream.subscribe(() => {})
+      return {
+        stream,
+        signals,
+        pauseAndResume() {
+          notifyVisibility?.(`hidden`)
+          notifyVisibility?.(`visible`)
+        },
+      }
+    }
+
+    it(`should still restart the request after a system wake`, async () => {
+      const { signals, pauseAndResume } = startPausableStream()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(signals).toHaveLength(1)
+
+      pauseAndResume()
+      // The resumed stream sends a catch-up request and then a live one. The
+      // aborted loop settles in this time, while the resumed one is running.
+      await vi.advanceTimersByTimeAsync(10)
+      expect(signals[0]!.aborted).toBe(true)
+      expect(signals).toHaveLength(3)
+      const resumedLive = signals[2]!
+      expect(resumedLive.aborted).toBe(false)
+
+      // Jump the clock forward like a sleeping machine, then let the wake
+      // detection tick.
+      vi.setSystemTime(Date.now() + 10_000)
+      await vi.advanceTimersByTimeAsync(2_001)
+      await vi.advanceTimersByTimeAsync(100)
+
+      expect(resumedLive.aborted).toBe(true)
+      expect(resumedLive.reason).toBe(`system-wake`)
+      expect(signals.length).toBeGreaterThan(3)
+    })
+
+    it(`should stop the wake detection timer once torn down`, async () => {
+      const { stream, pauseAndResume } = startPausableStream()
+      await vi.advanceTimersByTimeAsync(0)
+      pauseAndResume()
+      await vi.advanceTimersByTimeAsync(10)
+
+      stream.unsubscribeAll()
+      // Long enough for the aborted request to finish unwinding.
+      await vi.advanceTimersByTimeAsync(10)
+
+      expect(vi.getTimerCount()).toBe(0)
+    })
   })
 
   it(`should not timeout a slow but successful wake catch-up body`, async () => {

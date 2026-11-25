@@ -141,10 +141,13 @@ defmodule Electric.Client.Poll do
 
     # Check for stale CDN response — always enter stale-retry to add a cache
     # buster. Without this, the CDN keeps serving the same stale response and
-    # the client loops infinitely (the URL never changes).
+    # the client loops infinitely (the URL never changes). A handle that
+    # self-healing dropped from the cache is still known to be expired, so a
+    # response that carries it is stale too.
     cond do
-      response_handle == expired_handle ->
-        handle_stale_response(state, shape_key)
+      response_handle == expired_handle or
+          (not is_nil(state.self_healed_handle) and response_handle == state.self_healed_handle) ->
+        handle_stale_response(state, shape_key, response_handle)
 
       # Normal: process response
       true ->
@@ -171,7 +174,7 @@ defmodule Electric.Client.Poll do
     {:ok, messages, new_state}
   end
 
-  defp handle_stale_response(state, shape_key) do
+  defp handle_stale_response(state, shape_key, stale_handle) do
     cond do
       state.stale_cache_retry_count < @max_stale_retries ->
         {:stale_retry, ShapeState.enter_stale_retry(state)}
@@ -186,16 +189,19 @@ defmodule Electric.Client.Poll do
 
       true ->
         # Self-heal: clear the expired entry from local cache so the next
-        # request omits the `expired_handle` param. Since the server never
-        # reuses handles (SPEC.md S0), the next response should bypass stale
-        # detection. If it doesn't (broken CDN), we error on the next pass via
-        # the `self_heal_attempted?` branch above.
-        ExpiredShapesCache.clear_handle(shape_key)
+        # request omits the `expired_handle` param, which a cache may have keyed
+        # the stale response on. The handle stays in the state, though, because
+        # the server never reuses handles (SPEC.md S0): a response that carries
+        # it again is the stale one. If it does (broken CDN), we error after the
+        # retries through the `self_heal_attempted?` branch above. The entry is
+        # cleared only while it holds this handle, so a newer one is kept.
+        ExpiredShapesCache.clear_handle(shape_key, stale_handle)
 
         new_state =
           ShapeState.enter_stale_retry(%{
             state
             | self_heal_attempted?: true,
+              self_healed_handle: stale_handle,
               stale_cache_retry_count: 0
           })
 
@@ -315,14 +321,21 @@ defmodule Electric.Client.Poll do
 
   defp handle_schema(%Fetch.Response{schema: schema}, client, %{value_mapper_fun: nil} = state)
        when is_map(schema) do
-    {parser_module, parser_opts} = client.parser
-    value_mapper_fun = parser_module.for_schema(schema, parser_opts)
+    %{state | schema: schema, value_mapper_fun: build_value_mapper(client, schema)}
+  end
 
-    %{state | schema: schema, value_mapper_fun: value_mapper_fun}
+  defp handle_schema(_resp, client, %{value_mapper_fun: nil, schema: schema} = state)
+       when is_map(schema) do
+    %{state | value_mapper_fun: build_value_mapper(client, schema)}
   end
 
   defp handle_schema(_resp, _client, state) do
     state
+  end
+
+  defp build_value_mapper(client, schema) do
+    {parser_module, parser_opts} = client.parser
+    parser_module.for_schema(schema, parser_opts)
   end
 
   defp ensure_enum(body) do

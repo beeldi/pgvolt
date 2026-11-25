@@ -13,6 +13,17 @@ defmodule Electric.Shapes.DependencyLayers do
     end
   end
 
+  @doc """
+  `add_dependency/3` for every shape in `shape_handles`, at once: shapes that depend on no other.
+  """
+  def add_independent(layers, shape_handles) do
+    cond do
+      MapSet.size(shape_handles) == 0 -> layers
+      layers == [] -> [shape_handles]
+      true -> [MapSet.union(hd(layers), shape_handles) | tl(layers)]
+    end
+  end
+
   defp add_after_dependencies([layer | rest], shape_handle, deps_to_find) do
     remaining_deps = MapSet.difference(deps_to_find, layer)
 

@@ -143,7 +143,7 @@ defmodule Support.TestUtils do
 
   Returns `true` if the condition was met within the timeout, `false` otherwise.
   """
-  def wait_until(fun, timeout_ms \\ 500)
+  def wait_until(fun, timeout_ms \\ ExUnit.configuration()[:assert_receive_timeout])
       when is_function(fun, 0) and is_integer(timeout_ms) do
     do_wait_until(fun, timeout_ms, System.monotonic_time(:millisecond))
   end

@@ -1,5 +1,0 @@
-CREATE TABLE IF NOT EXISTS items (
-  id UUID PRIMARY KEY NOT NULL,
-  ciphertext TEXT NOT NULL,
-  iv TEXT NOT NULL
-);

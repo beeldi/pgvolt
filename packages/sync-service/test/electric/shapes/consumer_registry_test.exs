@@ -105,7 +105,7 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
 
       assert ConsumerRegistry.active_consumer_count(ctx.stack_id) == 2
 
-      assert_receive {:start_consumer, "handle-2"}, 10
+      assert_receive {:start_consumer, "handle-2"}
       assert_receive {:broadcast, "handle-1", {:txn, %{lsn: 2}}}
       assert_receive {:broadcast, "handle-2", {:txn, %{lsn: 2}}}
     end
@@ -169,7 +169,7 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
       assert Map.keys(delivered) |> Enum.sort() == ["handle-1", "handle-2", "handle-3"]
 
       assert_receive {:start_consumer, "handle-1"}
-      assert_receive {:start_consumer, "handle-2"}, 10
+      assert_receive {:start_consumer, "handle-2"}
 
       assert_receive {:broadcast, "handle-1", {:txn, %{lsn: 1}}}
       assert_receive {:broadcast, "handle-2", {:txn, %{lsn: 1}}}
@@ -292,6 +292,99 @@ defmodule Electric.Shapes.ConsumerRegistryTest do
       # Healthy handle delivered successfully
       refute Map.has_key?(undeliverable, "handle-ok")
       assert Map.keys(delivered) == ["handle-ok"]
+    end
+
+    test "a consumer that stays alive but never replies is killed after the grace", ctx do
+      %{stack_id: stack_id} = ctx
+      parent = self()
+
+      previous = Application.get_env(:electric, :broadcast_reply_grace)
+      Application.put_env(:electric, :broadcast_reply_grace, 100)
+      on_exit(fn -> Application.put_env(:electric, :broadcast_reply_grace, previous) end)
+
+      # A hung writer: alive, monitored, but its handle_call never returns a reply
+      {:ok, _hung_sub} =
+        start_supervised(
+          {TestSubscriber,
+           {stack_id, "handle-hung",
+            fn _msg, state ->
+              send(parent, {:hung, self()})
+              {:noreply, state}
+            end}},
+          id: :hung_subscriber,
+          restart: :temporary
+        )
+
+      {undeliverable, delivered} =
+        ConsumerRegistry.publish(%{"handle-hung" => {:txn, %{lsn: 1}}}, ctx.registry_state)
+
+      # The kill escalation classified it as crashed rather than pinning the publish,
+      # with a reason distinguishable from a supervisor's brutal kill so the
+      # collector invalidates the shape instead of leaving its flush entry pinned.
+      assert {:killed, :broadcast_unresponsive} == Map.fetch!(undeliverable, "handle-hung")
+      assert delivered == %{}
+      assert_received {:hung, pid}
+      refute Process.alive?(pid)
+    end
+
+    test "the reply grace bounds the whole broadcast, not the gap between replies", ctx do
+      %{stack_id: stack_id} = ctx
+
+      grace = 200
+      previous = Application.get_env(:electric, :broadcast_reply_grace)
+      Application.put_env(:electric, :broadcast_reply_grace, grace)
+      on_exit(fn -> Application.put_env(:electric, :broadcast_reply_grace, previous) end)
+
+      # Replies land at 20, 150, 300 and 450ms: the first two inside the grace, the last two past
+      # it. Each arrives within one grace of the one before, so a per-message grace would keep
+      # restarting and expire only after the last — carrying the hung consumer's kill to ~650ms
+      # instead of ~200ms. That multiplier is the defect: it scales with the consumer count, and
+      # :gather_stall_timeout does not.
+      Enum.each([20, 150, 300, 450], fn delay ->
+        {:ok, _} =
+          start_supervised(
+            {TestSubscriber,
+             {stack_id, "handle-reply-#{delay}",
+              fn _msg, state ->
+                Process.sleep(delay)
+                {:reply, :ok, state}
+              end}},
+            id: :"reply_#{delay}",
+            restart: :temporary
+          )
+      end)
+
+      {:ok, _} =
+        start_supervised(
+          {TestSubscriber, {stack_id, "handle-hung", fn _msg, state -> {:noreply, state} end}},
+          id: :hung_subscriber,
+          restart: :temporary
+        )
+
+      handles = ["handle-hung" | Enum.map([20, 150, 300, 450], &"handle-reply-#{&1}")]
+      events = Map.new(handles, &{&1, {:txn, %{lsn: 1}}})
+
+      # Act
+      {elapsed_us, {undeliverable, delivered}} =
+        :timer.tc(fn -> ConsumerRegistry.publish(events, ctx.registry_state) end)
+
+      elapsed = div(elapsed_us, 1000)
+
+      # Assert — the deadline is absolute, so the broadcast ends near the grace however many
+      # consumers reply inside it.
+      assert elapsed < grace * 2,
+             "broadcast took #{elapsed}ms against a #{grace}ms grace: the grace is restarting per message"
+
+      # Everything that answered inside the deadline is delivered; everything still outstanding
+      # at it is killed and classified so the collector invalidates those shapes rather than
+      # pinning the pipeline behind them.
+      assert Enum.sort(Map.keys(delivered)) == ["handle-reply-150", "handle-reply-20"]
+      assert {:killed, :broadcast_unresponsive} == Map.fetch!(undeliverable, "handle-hung")
+
+      Enum.each([300, 450], fn delay ->
+        assert {:killed, :broadcast_unresponsive} ==
+                 Map.fetch!(undeliverable, "handle-reply-#{delay}")
+      end)
     end
 
     test "suspended consumers are retried but crashed consumers are not", ctx do

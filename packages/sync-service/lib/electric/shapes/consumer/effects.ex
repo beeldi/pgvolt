@@ -9,15 +9,17 @@ defmodule Electric.Shapes.Consumer.Effects do
   alias Electric.Shapes.Filter.Indexes.SubqueryIndex
   alias Electric.ShapeCache.Storage
   alias Electric.LogItems
+  alias Electric.Replication.Changes
   alias Electric.Replication.LogOffset
   alias Electric.ShapeCache
+  alias Electric.Shapes.Consumer.Subqueries.MoveBroadcast
   alias Electric.Shapes.Querying
   alias Electric.Shapes.Shape
   alias Electric.Telemetry.OpenTelemetry
 
   defmodule AppendChanges do
     @moduledoc false
-    defstruct changes: [], xid: nil
+    defstruct changes: [], xid: nil, full_xid: nil
   end
 
   defmodule AppendControl do
@@ -27,7 +29,11 @@ defmodule Electric.Shapes.Consumer.Effects do
 
   defmodule AppendMoveInSnapshot do
     @moduledoc false
-    defstruct [:snapshot_name, :snapshot, row_count: 0, row_bytes: 0]
+    # `skip_rows`: nil, or `{any_row, written_row, keys}` naming the snapshot rows that stay out of
+    # the log: those `any_row` takes out, and among the rows of those keys, those `written_row`
+    # takes out. Each is nil, `:all`, or the patterns of removals for
+    # `MoveBroadcast.removed_by?/3`.
+    defstruct [:snapshot_name, :snapshot, :skip_rows, row_count: 0, row_bytes: 0]
   end
 
   defmodule NotifyFlushed do
@@ -37,14 +43,24 @@ defmodule Electric.Shapes.Consumer.Effects do
 
   defmodule StartMoveInQuery do
     @moduledoc false
-    defstruct [:dnf_plan, :trigger_dep_index, :values, :views_before_move, :views_after_move]
+    defstruct [
+      :dnf_plan,
+      :trigger_dep_index,
+      :values,
+      :views_before_move,
+      :views_after_move,
+      kind: :move_in,
+      query_patterns?: false
+    ]
 
     @type t() :: %__MODULE__{
             dnf_plan: Electric.Shapes.DnfPlan.t(),
             trigger_dep_index: non_neg_integer(),
-            values: list(),
+            values: list() | {list(), list()},
             views_before_move: Electric.Shapes.Consumer.Subqueries.Views.t(),
-            views_after_move: Electric.Shapes.Consumer.Subqueries.Views.t()
+            views_after_move: Electric.Shapes.Consumer.Subqueries.Views.t(),
+            kind: :move_in | :move_out | :replace,
+            query_patterns?: boolean()
           }
   end
 
@@ -99,23 +115,18 @@ defmodule Electric.Shapes.Consumer.Effects do
 
   defp execute_effect(%AppendChanges{changes: [], xid: _}, acc), do: acc
 
-  defp execute_effect(%AppendChanges{changes: changes, xid: xid}, acc) do
+  defp execute_effect(%AppendChanges{changes: changes, xid: xid, full_xid: full_xid}, acc) do
     state = acc.state
 
-    {lines, total_size, state} =
-      Enum.reduce(changes, {[], 0, state}, fn change, {lines, size, state} ->
-        {new_lines, line_size} = change_to_log_lines(change, xid, state.shape)
-        last_offset = new_lines |> List.last() |> elem(0)
-        {lines ++ new_lines, size + line_size, %{state | latest_offset: last_offset}}
-      end)
-
+    {lines, total_size} = LogItems.encode_changes(changes, xid, full_xid, state.shape)
+    last_offset = lines |> List.last() |> line_offset()
     writer = ShapeCache.Storage.append_to_log!(lines, state.writer)
-    state = %{state | writer: writer}
+    state = %{state | writer: writer, latest_offset: last_offset}
 
     %{
       acc
       | state: state,
-        num_changes: acc.num_changes + length(lines),
+        num_changes: acc.num_changes + line_count(lines),
         total_size: acc.total_size + total_size,
         pending_written_offset: state.latest_offset
     }
@@ -144,7 +155,8 @@ defmodule Electric.Shapes.Consumer.Effects do
            snapshot_name: snapshot_name,
            row_count: row_count,
            row_bytes: row_bytes,
-           snapshot: snapshot
+           snapshot: snapshot,
+           skip_rows: skip_rows
          },
          acc
        ) do
@@ -154,32 +166,30 @@ defmodule Electric.Shapes.Consumer.Effects do
       ShapeCache.Storage.append_move_in_snapshot_to_log!(
         snapshot_name,
         state.writer,
-        fn _, _ -> false end
+        skip_row_fun(skip_rows)
       )
 
     state = %{state | writer: writer, latest_offset: inserted_offset}
 
-    if row_count == 0 do
-      %{acc | state: state}
-    else
-      snapshot_end =
-        snapshot
-        |> snapshot_end_message()
-        |> Jason.encode!()
+    # Every move-in query ends with a snapshot-end, even one that found no rows: it is
+    # how a client learns the move-in it saw announced is complete.
+    snapshot_end =
+      snapshot
+      |> snapshot_end_message()
+      |> Jason.encode!()
 
-      {{_, offset}, writer} =
-        ShapeCache.Storage.append_control_message!(snapshot_end, state.writer)
+    {{_, offset}, writer} =
+      ShapeCache.Storage.append_control_message!(snapshot_end, state.writer)
 
-      state = %{state | writer: writer, latest_offset: offset}
+    state = %{state | writer: writer, latest_offset: offset}
 
-      %{
-        acc
-        | state: state,
-          num_changes: acc.num_changes + row_count + 1,
-          total_size: acc.total_size + row_bytes + byte_size(snapshot_end),
-          pending_written_offset: state.latest_offset
-      }
-    end
+    %{
+      acc
+      | state: state,
+        num_changes: acc.num_changes + row_count + 1,
+        total_size: acc.total_size + row_bytes + byte_size(snapshot_end),
+        pending_written_offset: state.latest_offset
+    }
   end
 
   defp execute_effect(%NotifyFlushed{log_offset: log_offset}, acc) do
@@ -242,43 +252,32 @@ defmodule Electric.Shapes.Consumer.Effects do
     %{stack_id: stack_id, shape_handle: shape_handle, shape: shape, storage: storage} =
       consumer_state
 
-    {where, params} =
-      Querying.move_in_where_clause(
-        request.dnf_plan,
-        request.trigger_dep_index,
-        request.views_before_move,
-        request.views_after_move,
-        shape.where.used_refs
-      )
-
-    snapshot_name = Electric.Utils.uuid4()
-
     query_fn = fn conn, _pg_snapshot, lsn ->
-      task_pid = self()
-
-      Querying.query_move_in(conn, stack_id, shape_handle, shape, {where, params},
-        dnf_plan: request.dnf_plan,
-        views: request.views_after_move
-      )
-      |> Stream.transform(
-        fn -> {0, 0} end,
-        fn [_, _, json] = row, {row_count, row_bytes} ->
-          {[row], {row_count + 1, row_bytes + IO.iodata_length(json)}}
-        end,
-        fn {row_count, row_bytes} ->
-          send(task_pid, {:move_in_snapshot_stats, row_count, row_bytes})
+      patterns =
+        if request.query_patterns? do
+          Querying.move_patterns(
+            conn,
+            stack_id,
+            shape_handle,
+            shape,
+            request.dnf_plan,
+            request.trigger_dep_index,
+            request.views_before_move,
+            request.views_after_move,
+            request.kind
+          )
         end
-      )
-      |> Storage.write_move_in_snapshot!(snapshot_name, storage)
 
-      {row_count, row_bytes} =
-        receive do
-          {:move_in_snapshot_stats, row_count, row_bytes} -> {row_count, row_bytes}
+      {snapshot_name, row_count, row_bytes} =
+        if request.kind != :move_out do
+          write_move_in_snapshot(conn, stack_id, shape_handle, shape, storage, request)
+        else
+          {nil, 0, 0}
         end
 
       send(
         consumer_pid,
-        {:query_move_in_complete, snapshot_name, row_count, row_bytes, lsn}
+        {:query_move_in_complete, snapshot_name, row_count, row_bytes, lsn, patterns}
       )
     end
 
@@ -292,17 +291,64 @@ defmodule Electric.Shapes.Consumer.Effects do
     trace_context = OpenTelemetry.get_current_context()
 
     Task.Supervisor.start_child(supervisor, fn ->
-      OpenTelemetry.set_current_context(trace_context)
+      try do
+        OpenTelemetry.set_current_context(trace_context)
 
-      OpenTelemetry.with_span(
-        "shape_snapshot.move_in_task",
-        Shape.otel_attrs(shape_handle, shape, query_reason: "move_in_query"),
-        stack_id,
-        fn -> execute_move_in_query(stack_id, shape_handle, shape, consumer_pid, query_fn) end
-      )
+        OpenTelemetry.with_span(
+          "shape_snapshot.move_in_task",
+          Shape.otel_attrs(shape_handle, shape, query_reason: "move_in_query"),
+          stack_id,
+          fn -> execute_move_in_query(stack_id, shape_handle, shape, consumer_pid, query_fn) end
+        )
+      rescue
+        error -> send(consumer_pid, {:query_move_in_error, error, __STACKTRACE__})
+      catch
+        # A snapshot-pool checkout timeout is an exit, which a rescue does not catch, and this task is
+        # started unlinked and unmonitored -- anything the consumer is not told about leaves it waiting
+        # for a move-in result that nothing will ever send.
+        kind, reason ->
+          send(
+            consumer_pid,
+            {:query_move_in_error, RuntimeError.exception(Exception.format_banner(kind, reason)),
+             __STACKTRACE__}
+          )
+      end
     end)
 
     :ok
+  end
+
+  defp write_move_in_snapshot(conn, stack_id, shape_handle, shape, storage, request) do
+    where =
+      Querying.move_in_where_clause(
+        request.dnf_plan,
+        request.trigger_dep_index,
+        request.views_before_move,
+        request.views_after_move,
+        shape.where.used_refs
+      )
+
+    snapshot_name = Electric.Utils.uuid4()
+    task_pid = self()
+
+    Querying.query_move_in(conn, stack_id, shape_handle, shape, where,
+      dnf_plan: request.dnf_plan,
+      views: request.views_after_move
+    )
+    |> Stream.transform(
+      fn -> {0, 0} end,
+      fn [_, _, json] = row, {row_count, row_bytes} ->
+        {[row], {row_count + 1, row_bytes + IO.iodata_length(json)}}
+      end,
+      fn {row_count, row_bytes} ->
+        send(task_pid, {:move_in_snapshot_stats, row_count, row_bytes})
+      end
+    )
+    |> Storage.write_move_in_snapshot!(snapshot_name, storage)
+
+    receive do
+      {:move_in_snapshot_stats, row_count, row_bytes} -> {snapshot_name, row_count, row_bytes}
+    end
   end
 
   # Synchronous core of query_move_in_async(). Expects the current OTel context to already be set up by the caller.
@@ -317,8 +363,6 @@ defmodule Electric.Shapes.Consumer.Effects do
       end,
       query_fn: query_fn
     )
-  rescue
-    error -> send(consumer_pid, {:query_move_in_error, error, __STACKTRACE__})
   end
 
   defp consider_flushed(state, log_offset) do
@@ -346,20 +390,41 @@ defmodule Electric.Shapes.Consumer.Effects do
     end
   end
 
-  defp change_to_log_lines(change, xid, shape) do
-    lines =
-      change
-      |> LogItems.from_change(
-        xid,
-        Shape.pk(shape, change.relation),
-        shape.replica
-      )
-      |> Enum.map(fn {offset, %{key: key} = log_item} ->
-        {offset, key, log_item.headers.operation, Jason.encode!(log_item)}
-      end)
+  defp line_count(lines) do
+    Enum.reduce(lines, 0, fn
+      %Changes.FramedBlock{count: count}, acc -> acc + count
+      _line, acc -> acc + 1
+    end)
+  end
 
-    size = Enum.reduce(lines, 0, fn {_, _, _, json}, acc -> acc + byte_size(json) end)
-    {lines, size}
+  defp line_offset(%Changes.FramedBlock{last_offset: offset}), do: offset
+  defp line_offset(line), do: elem(line, 0)
+
+  defp skip_row_fun(nil), do: fn _key, _tags, _json -> false end
+
+  defp skip_row_fun({any_row, written_row, keys}) do
+    fn key, tags, json ->
+      removed_by?(any_row, tags, json) or
+        (MapSet.member?(keys, key) and removed_by?(written_row, tags, json))
+    end
+  end
+
+  defp removed_by?(nil, _tags, _json), do: false
+  defp removed_by?(:all, _tags, _json), do: true
+
+  # A row's headers are read only when those patterns reach its tags.
+  defp removed_by?(patterns, tags, json),
+    do: MoveBroadcast.matched_by?(tags, patterns) and conditions_removed_by?(tags, json, patterns)
+
+  # A row whose headers carry no active conditions stays in the log.
+  defp conditions_removed_by?(tags, json, patterns) do
+    case Jason.decode!(json) do
+      %{"headers" => %{"active_conditions" => conditions}} when is_list(conditions) ->
+        MoveBroadcast.removed_by?(tags, conditions, patterns)
+
+      _ ->
+        false
+    end
   end
 
   defp snapshot_end_message({xmin, xmax, xip_list}) do

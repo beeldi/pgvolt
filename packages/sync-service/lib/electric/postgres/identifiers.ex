@@ -134,7 +134,7 @@ defmodule Electric.Postgres.Identifiers do
   end
 
   defp valid_unquoted_identifier?(identifier) do
-    Regex.match?(~r/^[\pL_][\pL\pM_0-9$]*$]*$/u, identifier)
+    Regex.match?(~r/\A[\pL_][\pL\pM_0-9$]*\z/u, identifier)
   end
 
   @doc """

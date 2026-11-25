@@ -375,7 +375,7 @@ defmodule Electric.Replication.LogOffset do
 
       true ->
         with [tx_offset_str, op_offset_str] <- String.split(str, "_"),
-             {tx_offset, ""} <- Integer.parse(tx_offset_str),
+             {tx_offset, ""} <- parse_unsigned(tx_offset_str),
              {op_offset, ""} <- parse_int_or_inf(op_offset_str),
              true <- valid_offset_parts?(tx_offset, op_offset) do
           {:ok, new(tx_offset, op_offset)}
@@ -386,7 +386,15 @@ defmodule Electric.Replication.LogOffset do
   end
 
   defp parse_int_or_inf("inf"), do: {:infinity, ""}
-  defp parse_int_or_inf(int), do: Integer.parse(int)
+  defp parse_int_or_inf(int), do: parse_unsigned(int)
+
+  # `Integer.parse/1` accepts a leading `+`, so it reads "+5" as 5 and would make "+5_0" an alias
+  # for an offset this module only ever renders as "5_0". Every other request parameter refuses a
+  # form the server does not emit -- an unknown handle is a 409 rather than a trim, and `replica`
+  # is case-sensitive -- so a signed offset part is refused rather than canonicalised. A leading `-`
+  # still reaches `valid_offset_parts?/2`, which keeps "-1_0" valid and rejects the rest.
+  defp parse_unsigned(<<?+, _::binary>>), do: :error
+  defp parse_unsigned(int), do: Integer.parse(int)
 
   defp valid_offset_parts?(-1, 0), do: true
 

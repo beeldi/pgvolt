@@ -60,16 +60,42 @@ if Code.ensure_loaded?(Electric.Shapes.Api) do
     end
 
     defp request_to_params(%Fetch.Request{} = request) do
-      Map.merge(
-        request.params,
-        %{
-          "offset" => to_string(request.offset),
-          "handle" => request.shape_handle,
-          "live" => request.live,
-          "replica" => request.replica
-        }
-      )
+      request.params
+      |> nest_bracketed_keys()
+      |> Map.merge(%{
+        "offset" => to_string(request.offset),
+        "handle" => request.shape_handle,
+        "live" => request.live,
+        "replica" => request.replica
+      })
     end
+
+    # Where-clause values arrive as `params[1]`, `params[2]`, ... Over HTTP, Plug nests them
+    # into `%{"params" => %{"1" => ...}}` before `Electric.Shapes.Api` sees them; embedded
+    # mode skips Plug, so nest them here, one level deep.
+    defp nest_bracketed_keys(params) do
+      Enum.reduce(params, %{}, fn {key, value}, acc ->
+        case bracketed_key(key) do
+          {outer, inner} ->
+            Map.update(acc, outer, %{inner => value}, fn
+              %{} = nested -> Map.put(nested, inner, value)
+              _scalar -> %{inner => value}
+            end)
+
+          nil ->
+            Map.put_new(acc, key, value)
+        end
+      end)
+    end
+
+    defp bracketed_key(key) when is_binary(key) do
+      case Regex.run(~r/\A([^\[\]]+)\[([^\[\]]+)\]\z/, key) do
+        [_, outer, inner] -> {outer, inner}
+        nil -> nil
+      end
+    end
+
+    defp bracketed_key(_key), do: nil
 
     defp convert_offset(nil) do
       nil

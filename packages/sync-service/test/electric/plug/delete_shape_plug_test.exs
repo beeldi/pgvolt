@@ -156,6 +156,34 @@ defmodule Electric.Plug.DeleteShapePlugTest do
              }
     end
 
+    # A proxy that authorized the first `where` must not see a different shape deleted.
+    test "returns 400 for a repeated shape parameter, before any shape is looked up", ctx do
+      conn =
+        ctx
+        |> conn("DELETE", "?table=public.users&where=id+%3D+1&where=true")
+        |> call_delete_shape_plug(ctx)
+
+      assert {400, %{"message" => "Invalid request", "errors" => errors}} =
+               {conn.status, Jason.decode!(conn.resp_body)}
+
+      assert errors == %{"where" => ["can't be repeated or spelled another way"]}
+    end
+
+    # A proxy that authorized the first `handle` must not see another shape deleted.
+    for query <- ["handle=a-1&handle=b-2", "HANDLE=a-1&handle=b-2", "handle=a-1&%20handle=b-2"] do
+      test "returns 400 for #{query}, before any shape is looked up", ctx do
+        conn =
+          ctx
+          |> conn("DELETE", "?" <> unquote(query))
+          |> call_delete_shape_plug(ctx)
+
+        assert {400, %{"message" => "Invalid request", "errors" => errors}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+
+        assert errors == %{"handle" => ["can't be repeated or spelled another way"]}
+      end
+    end
+
     test "should clean shape based on shape definition", ctx do
       %{stack_id: stack_id} = ctx
 

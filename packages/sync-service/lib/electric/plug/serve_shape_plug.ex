@@ -17,10 +17,12 @@ defmodule Electric.Plug.ServeShapePlug do
   clause in `call/2` releases it — firing for success, halt, and exception
   paths alike.
 
-  Admission classification uses only `conn.query_params["handle"]` and a
-  single ETS membership check: requests with no handle or an unknown handle
-  are classified as `:initial`; requests with a known handle are `:existing`.
-  This avoids any SQLite access on the admission-control hot path.
+  Admission classification uses only `conn.query_params` and a single ETS
+  membership check: requests with no handle, an unknown handle, or an offset
+  that discards the handle are classified as `:initial`; requests with a known
+  handle are `:existing`. This avoids any SQLite access on the
+  admission-control hot path. Once the request is validated, an `:existing`
+  permit is kept only if the handle names the requested shape definition.
 
   Using `after` (rather than `register_before_send`) is also what makes the
   streaming path correct: `before_send` fires when `send_chunked` starts
@@ -35,15 +37,23 @@ defmodule Electric.Plug.ServeShapePlug do
   alias Electric.Plug.TraceContextPlug
   alias Electric.ShapeCache
   alias Electric.ShapeCache.ShapeStatus
+  alias Electric.Shapes
   alias Electric.Shapes.Api
+  alias Electric.Shapes.Shape
   alias Electric.Telemetry.EmptyResponseSampler
   alias Electric.Telemetry.OpenTelemetry
+  alias Electric.Telemetry.RequestValues
   alias Electric.Utils
   alias Plug.Conn
 
   require Logger
 
   @admission_permit_key {__MODULE__, :admission_permit}
+
+  # TODO(adaptive-admission): base only - `Api.Response` spreads it over [n, 2n] before it reaches
+  # the header. Make it track observed load (P95 latency, queue depth) instead of a constant.
+  @overload_retry_after_seconds 5
+  @handle_discarding_offsets ["-1", "now"]
   @subquery_compaction_error "can't be enabled for shapes with subqueries"
 
   # These plugs are invoked inside the `call/2` function below, after `conn` has been preloaded with
@@ -54,8 +64,11 @@ defmodule Electric.Plug.ServeShapePlug do
   plug :put_resp_content_type, "application/json"
   plug :check_admission
   plug :parse_body
+  plug :reject_ambiguous_shape_params
   plug :validate_request
   plug :reject_subquery_shape_compaction_request
+  plug :serve_source_generation_probe
+  plug :move_unmatched_handle_to_initial
   plug :load_shape
   plug :hold_initial_until_snapshot_started
   # Reclassify off :initial so the :initial admission slot becomes available
@@ -142,7 +155,7 @@ defmodule Electric.Plug.ServeShapePlug do
     OpenTelemetry.record_exception(kind, exception, stack)
 
     status = if kind == :error, do: Plug.Exception.status(exception), else: 500
-    error_str = Exception.format(kind, exception)
+    error_str = RequestValues.format_error(kind, exception)
 
     conn
     |> Conn.put_status(status)
@@ -153,7 +166,7 @@ defmodule Electric.Plug.ServeShapePlug do
   defp handle_specific_error(conn, :error, exception)
        when is_exception(exception, DBConnection.ConnectionError) do
     conn
-    |> put_resp_header("retry-after", "10")
+    |> put_resp_header("retry-after", "#{Api.Response.spread_retry_after(10)}")
     |> put_resp_header("cache-control", "no-store")
     |> put_resp_header("surrogate-control", "no-store")
     |> send_resp(
@@ -166,7 +179,7 @@ defmodule Electric.Plug.ServeShapePlug do
   # stacktrace, internal module paths, library versions, and partial query
   # text) back to the client. The detail is preserved server-side via
   # OpenTelemetry.record_exception/3 in handle_error/4 and the `error.type`
-  # span attribute, so no observability is lost.
+  # span attribute according to the configured request telemetry detail.
   defp handle_specific_error(conn, _kind, _reason) do
     send_resp(conn, conn.status, Jason.encode!(%{error: "Internal server error"}))
   end
@@ -179,7 +192,7 @@ defmodule Electric.Plug.ServeShapePlug do
         assign(conn, :body_params, %{})
 
       {:ok, body, conn} ->
-        case Jason.decode(body) do
+        case decode_body(body) do
           {:ok, body_params} when is_map(body_params) ->
             assign(conn, :body_params, body_params)
 
@@ -190,8 +203,20 @@ defmodule Electric.Plug.ServeShapePlug do
             |> send_resp(400, Jason.encode!(%{error: "Request body must be a JSON object"}))
             |> halt()
 
+          {:error, :duplicate_json_member} ->
+            conn
+            |> send_resp(400, Jason.encode!(%{error: "Duplicate JSON member in request body"}))
+            |> halt()
+
           {:error, %Jason.DecodeError{} = error} ->
-            Logger.debug("Invalid JSON in request body: #{Exception.message(error)}")
+            Logger.debug(fn ->
+              detail =
+                if RequestValues.enabled?(),
+                  do: "#{byte_size(body)} bytes",
+                  else: Exception.message(error)
+
+              "Invalid JSON in request body: #{detail}"
+            end)
 
             conn
             |> send_resp(
@@ -212,7 +237,11 @@ defmodule Electric.Plug.ServeShapePlug do
         |> halt()
 
       {:error, reason} ->
-        Logger.warning("Failed to read request body: #{inspect(reason)}")
+        Logger.warning(fn ->
+          if RequestValues.enabled?(),
+            do: "Failed to read request body",
+            else: "Failed to read request body: #{inspect(reason)}"
+        end)
 
         conn
         |> send_resp(400, Jason.encode!(%{error: "Failed to read request body"}))
@@ -222,30 +251,51 @@ defmodule Electric.Plug.ServeShapePlug do
 
   defp parse_body(conn, _), do: assign(conn, :body_params, %{})
 
+  defp decode_body(body) do
+    with {:ok, %Jason.OrderedObject{} = object} <- Jason.decode(body, objects: :ordered_objects) do
+      {:ok, json_to_plain(object)}
+    end
+  catch
+    :duplicate_json_member -> {:error, :duplicate_json_member}
+  end
+
+  defp json_to_plain(%Jason.OrderedObject{values: pairs}) do
+    Enum.reduce(pairs, %{}, fn {key, value}, object ->
+      if Map.has_key?(object, key), do: throw(:duplicate_json_member)
+      Map.put(object, key, json_to_plain(value))
+    end)
+  end
+
+  defp json_to_plain(values) when is_list(values), do: Enum.map(values, &json_to_plain/1)
+  defp json_to_plain(value), do: value
+
+  defp reject_ambiguous_shape_params(%Conn{assigns: %{config: config}} = conn, _) do
+    Electric.Plug.Utils.reject_ambiguous_shape_params(conn, Access.fetch!(config, :api))
+  end
+
   @subset_keys ~w(where order_by limit offset params where_expr order_by_expr)
+  # The fields the subset schema reads. It ignores the `where_expr` and `order_by_expr` a client
+  # sends with them, so only these can conflict.
+  @subset_fields ~w(where order_by limit offset params)
 
   defp validate_request(%Conn{assigns: %{config: config, body_params: body_params}} = conn, _) do
-    Logger.debug("Query String: #{Electric.Plug.Utils.redact_query_string(conn.query_string)}")
+    Logger.debug(fn ->
+      query =
+        if RequestValues.enabled?(),
+          do: RequestValues.query_summary(conn.query_string),
+          else: Electric.Plug.Utils.redact_query_string(conn.query_string)
+
+      "Query String: #{query}"
+    end)
 
     query_params = Utils.extract_prefixed_keys_into_map(conn.query_params, "subset", "__")
-    merged_params = merge_body_params(query_params, body_params)
-
     api = Access.fetch!(config, :api)
 
-    all_params =
-      Map.merge(merged_params, conn.path_params)
-      |> Map.update("live", "false", &(&1 != "false"))
-      |> Map.update(
-        "live_sse",
-        # TODO: remove experimental_live_sse after proper deprecation
-        Map.get(merged_params, "experimental_live_sse", "false"),
-        &(&1 != "false")
-      )
-
-    case Api.validate_params(api, all_params) do
-      {:ok, request} ->
-        assign(conn, :request, request)
-
+    with {:ok, merged_params} <- merge_body_params(query_params, body_params, api),
+         {:ok, request} <-
+           Api.validate_params(api, request_params(merged_params, conn.path_params)) do
+      assign(conn, :request, request)
+    else
       {:error, response} ->
         conn
         |> Api.Response.send(response)
@@ -253,32 +303,64 @@ defmodule Electric.Plug.ServeShapePlug do
     end
   end
 
-  # Merge body params into query params, handling subset params specially
-  defp merge_body_params(query_params, body_params) when map_size(body_params) == 0 do
-    query_params
+  defp request_params(merged_params, path_params) do
+    Map.merge(merged_params, path_params)
+    |> Map.update("live", "false", &(&1 != "false"))
+    |> Map.update(
+      "live_sse",
+      # TODO: remove experimental_live_sse after proper deprecation
+      Map.get(merged_params, "experimental_live_sse", "false"),
+      &(&1 != "false")
+    )
   end
 
-  defp merge_body_params(query_params, %{"subset" => subset_params} = body_params)
-       when is_map(subset_params) do
-    existing_subset = Map.get(query_params, "subset", %{})
-
-    query_params
-    |> Map.merge(body_params)
-    |> Map.put("subset", Map.merge(existing_subset, subset_params))
+  # The body contributes subset parameters and nothing else. Every shape-defining
+  # parameter — table, where, columns, queryable_columns, replica, secret — is
+  # authoritative in the query string, where an authorizing proxy pins it. Letting a
+  # body key overwrite one lets a client redefine the shape the proxy authorized it
+  # for, so body keys are only ever read into "subset".
+  defp merge_body_params(query_params, body_params, _api) when map_size(body_params) == 0 do
+    {:ok, query_params}
   end
 
-  defp merge_body_params(query_params, body_params) do
-    {subset_params, other_params} = Map.split(body_params, @subset_keys)
+  defp merge_body_params(query_params, body_params, api) do
+    flat_subset = Map.take(body_params, @subset_keys)
 
-    if map_size(subset_params) > 0 do
-      existing_subset = Map.get(query_params, "subset", %{})
+    nested_subset =
+      case Map.fetch(body_params, "subset") do
+        {:ok, subset_params} when is_map(subset_params) -> subset_params
+        _ -> %{}
+      end
 
-      query_params
-      |> Map.merge(other_params)
-      |> Map.put("subset", Map.merge(existing_subset, subset_params))
-    else
-      Map.merge(query_params, body_params)
+    query_subset = Map.get(query_params, "subset", %{})
+
+    cond do
+      map_size(flat_subset) == 0 and map_size(nested_subset) == 0 ->
+        {:ok, query_params}
+
+      # Plug reads `subset=a` as a string and `subset[]=a` as a list, and neither holds fields.
+      not is_map(query_subset) ->
+        {:error, Api.Response.invalid_request(api, errors: %{subset: ["is invalid"]})}
+
+      true ->
+        case subset_conflicts([query_subset, flat_subset, nested_subset]) do
+          [] ->
+            subset = query_subset |> Map.merge(flat_subset) |> Map.merge(nested_subset)
+            {:ok, Map.put(query_params, "subset", subset)}
+
+          fields ->
+            errors = Map.new(fields, &{&1, ["can't be specified in more than one place"]})
+            {:error, Api.Response.invalid_request(api, errors: %{subset: errors})}
+        end
     end
+  end
+
+  defp subset_conflicts(subsets) do
+    subsets
+    |> Enum.flat_map(&Map.keys/1)
+    |> Enum.filter(&(&1 in @subset_fields))
+    |> Enum.frequencies()
+    |> Enum.flat_map(fn {field, count} -> if count > 1, do: [field], else: [] end)
   end
 
   defp reject_subquery_shape_compaction_request(%{assigns: %{request: request}} = conn, _) do
@@ -296,41 +378,69 @@ defmodule Electric.Plug.ServeShapePlug do
     end
   end
 
+  defp serve_source_generation_probe(
+         %Conn{
+           private: %{electric_head_request: true},
+           assigns: %{
+             request: %{
+               params:
+                 %{source_positions: :full_xid, handle: nil, live: false, subset: nil} = params,
+               response: response
+             }
+           }
+         } = conn,
+         _
+       ) do
+    if params.offset == Electric.Replication.LogOffset.before_all() do
+      conn |> Api.Response.send_source_generation(response) |> halt()
+    else
+      conn
+    end
+  end
+
+  defp serve_source_generation_probe(conn, _), do: conn
+
   defp check_admission(%Conn{assigns: %{config: config}} = conn, _) do
     stack_id = get_in(config, [:stack_id])
     kind = admission_kind(conn, stack_id)
     max_concurrent = Map.fetch!(config[:api].max_concurrent_requests, kind)
 
-    case Electric.AdmissionControl.try_acquire(stack_id, kind, max_concurrent: max_concurrent) do
+    case Electric.AdmissionControl.try_acquire_owned(stack_id, kind,
+           max_concurrent: max_concurrent
+         ) do
       :ok ->
         # Stash the acquired permit in the process dictionary so the `after`
         # clause in call/2 releases it on every code path (success, halt, or
-        # uncaught exception).
+        # uncaught exception). A process stopped from outside, such as an
+        # HTTP/2 stream process whose connection closed, never runs that
+        # clause; AdmissionControl releases its permit when it exits.
         Process.put(@admission_permit_key, {stack_id, kind})
         conn
 
       {:error, :overloaded} ->
-        retry_after = calculate_retry_after(stack_id, max_concurrent)
-
-        response =
-          Api.Response.error(
-            get_in(config, [:api]),
-            %{
-              code: "concurrent_request_limit_exceeded",
-              message:
-                "Concurrent #{kind} request limit exceeded (limit: #{max_concurrent}), please retry"
-            },
-            status: 503,
-            known_error: true,
-            retry_after: retry_after
-          )
-
-        conn
-        |> put_resp_header("cache-control", "no-store")
-        |> put_resp_header("surrogate-control", "no-store")
-        |> Api.Response.send(response)
-        |> halt()
+        send_overloaded(conn, config, kind, max_concurrent)
     end
+  end
+
+  defp send_overloaded(conn, config, kind, max_concurrent) do
+    response =
+      Api.Response.error(
+        get_in(config, [:api]),
+        %{
+          code: "concurrent_request_limit_exceeded",
+          message:
+            "Concurrent #{kind} request limit exceeded (limit: #{max_concurrent}), please retry"
+        },
+        status: 503,
+        known_error: true,
+        retry_after: @overload_retry_after_seconds
+      )
+
+    conn
+    |> put_resp_header("cache-control", "no-store")
+    |> put_resp_header("surrogate-control", "no-store")
+    |> Api.Response.send(response)
+    |> halt()
   end
 
   defp admission_kind(conn, stack_id) do
@@ -338,6 +448,7 @@ defmodule Electric.Plug.ServeShapePlug do
 
     cond do
       is_nil(handle) -> :initial
+      conn.query_params["offset"] in @handle_discarding_offsets -> :initial
       ShapeStatus.has_shape_handle?(stack_id, handle) -> :existing
       # Handle is present but unknown locally (stale from another instance,
       # or for a shape this node has not yet recovered/created).
@@ -348,18 +459,39 @@ defmodule Electric.Plug.ServeShapePlug do
     ArgumentError -> :initial
   end
 
-  defp calculate_retry_after(_stack_id, _max_concurrent) do
-    # Simple version: random 5-10 seconds with jitter
-    # This spreads out retry attempts to prevent thundering herd
-    # TODO: Make adaptive based on actual metrics (P95 latency, queue depth, etc.)
-    base = 5
-    jitter = :rand.uniform(5)
-    base + jitter
+  defp move_unmatched_handle_to_initial(
+         %Conn{assigns: %{config: config, request: %{params: params}}} = conn,
+         _
+       ) do
+    with {stack_id, :existing} <- Process.get(@admission_permit_key),
+         false <- handle_matches_definition?(stack_id, params) do
+      max_concurrent = Map.fetch!(config[:api].max_concurrent_requests, :initial)
+
+      case Electric.AdmissionControl.try_swap_owned(stack_id, :existing, :initial,
+             max_concurrent: max_concurrent
+           ) do
+        :ok ->
+          Process.put(@admission_permit_key, {stack_id, :initial})
+          conn
+
+        {:error, :overloaded} ->
+          send_overloaded(conn, config, :initial, max_concurrent)
+      end
+    else
+      _ -> conn
+    end
   end
+
+  defp handle_matches_definition?(stack_id, %{handle: handle, shape_definition: %Shape{} = shape})
+       when is_binary(handle) do
+    Shapes.validate_shape_handle(stack_id, handle, shape) == :ok
+  end
+
+  defp handle_matches_definition?(_stack_id, _params), do: false
 
   defp release_admission_permit do
     case Process.delete(@admission_permit_key) do
-      {stack_id, kind} -> Electric.AdmissionControl.release(stack_id, kind)
+      {stack_id, kind} -> Electric.AdmissionControl.release_owned(stack_id, kind)
       nil -> :ok
     end
   end
@@ -394,7 +526,9 @@ defmodule Electric.Plug.ServeShapePlug do
     with {stack_id, :initial} <- Process.get(@admission_permit_key),
          max = Map.fetch!(config[:api].max_concurrent_requests, :existing),
          :ok <-
-           Electric.AdmissionControl.try_swap(stack_id, :initial, :existing, max_concurrent: max) do
+           Electric.AdmissionControl.try_swap_owned(stack_id, :initial, :existing,
+             max_concurrent: max
+           ) do
       Process.put(@admission_permit_key, {stack_id, :existing})
     end
 
@@ -493,12 +627,18 @@ defmodule Electric.Plug.ServeShapePlug do
   defp get_live_mode(_), do: false
 
   # Used as a metric label for the response-size histogram. The goal is low
-  # cardinality (one value per configured shape root table), so we only emit
-  # the validated `table` from request params. If validation never ran (e.g.
-  # the request was rejected before parse), fall back to nil rather than
-  # echoing back attacker-controlled query string values.
-  defp get_root_table(%{request: %{params: %{table: table}}}, _conn) when is_binary(table),
-    do: table
+  # cardinality (one value per configured shape root table), so the label comes
+  # from the shape definition the request resolved to, never from the raw
+  # `table` parameter: an Api built with a predefined shape does not validate
+  # that parameter, and a spelling of the same table in a different form would
+  # be a label of its own. If the request never resolved a shape (e.g. it was
+  # rejected before parse), fall back to nil rather than echoing back
+  # attacker-controlled query string values.
+  defp get_root_table(
+         %{request: %{params: %{shape_definition: %Shape{root_table: table}}}},
+         _conn
+       ),
+       do: Utils.relation_to_sql(table)
 
   defp get_root_table(_assigns, _conn), do: nil
 
@@ -578,11 +718,18 @@ defmodule Electric.Plug.ServeShapePlug do
         do: conn.query_params["columns"],
         else: Enum.join(params[:columns], ",")
 
+    where = conn.query_params["where"] || params[:where]
+
+    where_attrs =
+      if RequestValues.enabled?(),
+        do: RequestValues.summary("shape_req.where", where),
+        else: %{"shape.where" => where}
+
     OpenTelemetry.get_stack_span_attrs(get_in(conn.assigns, [:config, :stack_id]))
     |> Map.merge(Electric.Plug.Utils.common_open_telemetry_attrs(conn))
+    |> Map.merge(where_attrs)
     |> Map.merge(%{
       "shape.handle" => conn.query_params["handle"] || params[:handle] || request[:handle],
-      "shape.where" => conn.query_params["where"] || params[:where],
       "shape.root_table" => conn.query_params["table"] || params[:table],
       "shape.columns" => columns,
       # # Very verbose info to add to spans - keep out unless we explicitly need it

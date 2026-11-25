@@ -168,12 +168,21 @@ defmodule Support.OracleHarness.ShapeChecker do
       # When retrying transient errors, a window that timed out without a single
       # successful poll means the server was unreachable the whole time. Returning
       # stale state would let a genuinely-down server pass if the oracle happens to
-      # be unchanged for this check, so fail explicitly instead. Otherwise return
-      # state and let assert_consistent! report any data mismatch.
+      # be unchanged for this check, so fail explicitly instead.
       if state.retry_transient_errors? and not polled_ok? do
         flunk(
           "shape=#{state.name}: no successful poll within #{state.timeout_ms}ms " <>
             "(server unreachable for the whole window)"
+        )
+      end
+
+      # The same holds for a stream that never reached up-to-date: its rows can match
+      # an oracle that did not change. Once it was up to date, return state and let
+      # assert_consistent! report the data mismatch.
+      if not state.poll_state.up_to_date? do
+        flunk(
+          "shape=#{state.name} where=#{state.where}: not up to date within " <>
+            "#{state.timeout_ms}ms"
         )
       end
 
@@ -193,7 +202,11 @@ defmodule Support.OracleHarness.ShapeChecker do
         {:must_refetch, messages, new_state} ->
           if state.optimized do
             flunk(
-              "Unexpected 409 (must-refetch) in optimized shape=#{state.name} where=#{state.where}"
+              "Unexpected 409 (must-refetch) in optimized shape=#{state.name} where=#{state.where} " <>
+                "requested handle=#{state.poll_state.shape_handle} " <>
+                "offset=#{inspect(state.poll_state.offset)} " <>
+                "up_to_date?=#{state.poll_state.up_to_date?} " <>
+                "redirected to handle=#{inspect(new_state.shape_handle)}"
             )
           end
 

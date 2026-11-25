@@ -128,6 +128,21 @@ defmodule Electric.Replication.ChangesTest do
   describe "Transaction.visible_in_snapshot?/2" do
     alias Electric.Replication.Changes.Transaction
 
+    test "full xid remains newer than a quiet snapshot across a complete raw xid wrap" do
+      txn = %Transaction{xid: 150, full_xid: 4_294_967_446}
+      refute Transaction.visible_in_snapshot?(txn, {100, 200, []})
+
+      assert Transaction.visible_in_snapshot?(
+               %Transaction{xid: 150, full_xid: 150},
+               {4_294_967_396, 4_294_967_496, [4_294_967_446]}
+             )
+
+      refute Transaction.visible_in_snapshot?(
+               txn,
+               {4_294_967_396, 4_294_967_496, [4_294_967_446]}
+             )
+    end
+
     test "returns true when xid < xmin (completed before snapshot)" do
       txn = %Transaction{xid: 50, lsn: {0, 1}, changes: []}
       snapshot = {100, 200, []}

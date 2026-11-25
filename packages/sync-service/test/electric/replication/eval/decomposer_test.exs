@@ -412,6 +412,74 @@ defmodule Electric.Replication.Eval.DecomposerTest do
       assert message =~ "101 disjuncts"
       assert message =~ "limit of 100"
     end
+
+    # ANDing n binary disjunctions is 2^n disjuncts. Counting them only once the list exists
+    # means this clause is answered by exhausting the node's memory, so the limit has to stop
+    # the cross-product while it is still being built. 40 terms is ~10^12 disjuncts.
+    #
+    # The bound here is the heap, not the clock: the guard trips after ~7 terms and needs a
+    # few hundred words, while a regression to counting the finished list needs terabytes, so
+    # any cap between the two separates them without racing a loaded runner. Parsing happens
+    # outside the capped process — it is not what this is measuring.
+    test "should refuse an exponential cross-product without materializing it" do
+      parsed = 1..40 |> Enum.map_join(" AND ", &"(a = #{&1} OR b = #{&1})") |> prepare()
+
+      task =
+        Task.async(fn ->
+          Process.flag(:max_heap_size, %{size: 1_000_000, kill: true, error_logger: false})
+          Decomposer.decompose(parsed)
+        end)
+
+      assert {:error, message} = Task.await(task, :infinity)
+      assert message =~ "too complex"
+      assert message =~ "limit of 100"
+    end
+
+    test "should still accept a cross-product that stays inside the limit" do
+      # 2^6 = 64 disjuncts, under the limit and so decomposed exactly as before.
+      clause = Enum.map_join(1..6, " AND ", &"(a = #{&1} OR b = #{&1})")
+
+      assert {:ok, decomposition} = clause |> prepare() |> Decomposer.decompose()
+      assert length(decomposition.disjuncts) == 64
+    end
+
+    # The disjunct-count guard is blind to width. One wide AND chain is a single disjunct, so it
+    # sails past the disjunct cap while `expand/1` builds a 1-row, 1001-column matrix that
+    # `to_decomposition/1` then reads back with quadratic `Enum.at`. The position guard stops it.
+    test "should return error when a single disjunct is too wide" do
+      clause = Enum.map_join(1..1001, " AND ", &"a = #{&1}")
+
+      result = clause |> prepare() |> Decomposer.decompose()
+
+      assert {:error, message} = result
+      assert message =~ "1001 expression positions"
+      assert message =~ "limit of 1000"
+    end
+
+    # The matrix's other axis: 100 OR-branches pin the disjunct count at the cap, and each extra
+    # AND-ed conjunct widens every disjunct, so the disjuncts x width matrix (and the CPU spent
+    # walking it) grows with the request while the counted disjuncts never move off 100.
+    test "should return error when the disjuncts x width matrix is too large at the disjunct cap" do
+      ors = Enum.map_join(1..100, " OR ", &"a = #{&1}")
+      ands = Enum.map_join(1..11, " AND ", &"b = #{&1}")
+
+      result = "(#{ors}) AND #{ands}" |> prepare() |> Decomposer.decompose()
+
+      assert {:error, message} = result
+      assert message =~ "expression positions"
+      assert message =~ "limit of 1000"
+    end
+
+    test "should still accept a wide-but-bounded clause under the position limit" do
+      ors = Enum.map_join(1..50, " OR ", &"a = #{&1}")
+      ands = Enum.map_join(1..2, " AND ", &"b = #{&1}")
+
+      assert {:ok, decomposition} =
+               "(#{ors}) AND #{ands}" |> prepare() |> Decomposer.decompose()
+
+      assert length(decomposition.disjuncts) == 50
+      assert decomposition.position_count == 150
+    end
   end
 
   # Helper to prepare a WHERE clause string into a Parser AST

@@ -168,6 +168,30 @@ defmodule ElectricTelemetry.ProcessesTest do
       assert parent_sup_name == proc_type(child_pid)
     end
 
+    test "falls back to the nearest named ancestor past an unnamed parent" do
+      grandparent_name = :"sup_grandparent_#{System.unique_integer([:positive])}"
+
+      grandchild_sup = %{
+        id: :grandchild,
+        type: :supervisor,
+        start: {Supervisor, :start_link, [[], [strategy: :one_for_one]]}
+      }
+
+      child_sup = %{
+        id: :child,
+        type: :supervisor,
+        start: {Supervisor, :start_link, [[grandchild_sup], [strategy: :one_for_one]]}
+      }
+
+      {:ok, sup_pid} =
+        Supervisor.start_link([child_sup], strategy: :one_for_one, name: grandparent_name)
+
+      [{_, child_pid, _, _}] = Supervisor.which_children(sup_pid)
+      [{_, grandchild_pid, _, _}] = Supervisor.which_children(child_pid)
+
+      assert grandparent_name == proc_type(grandchild_pid)
+    end
+
     test "falls back to initial_call when neither registered name nor named ancestor is available" do
       # Run the supervisor from a spawned, unregistered process so the entire $ancestors
       # chain is pids rather than atoms.
@@ -383,6 +407,20 @@ defmodule ElectricTelemetry.ProcessesTest do
 
       types = Enum.map(results, & &1.type)
       assert :with_bin in types
+    end
+
+    # top_process_limit is a single config value shared with top_memory_by_type, so
+    # {:mem_percent, n} reaches this path and must not raise (which would blank the
+    # bin-memory series on every poll).
+    test "mem_percent returns groups sorted by binary_mem without raising" do
+      spawn_with_label(:bin_percent, fn ->
+        Process.put(:bin, :crypto.strong_rand_bytes(2 * 1024 * 1024))
+      end)
+
+      results = top_bin_memory_by_type({:mem_percent, 50})
+
+      binary_mems = Enum.map(results, & &1.binary_mem)
+      assert binary_mems == Enum.sort(binary_mems, :desc)
     end
   end
 

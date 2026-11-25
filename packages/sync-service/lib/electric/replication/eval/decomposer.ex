@@ -108,19 +108,52 @@ defmodule Electric.Replication.Eval.Decomposer do
 
   @max_disjuncts 100
 
+  # `expand/1` builds a disjuncts x total-width matrix and `to_decomposition/1` reads it back with
+  # `Enum.at`, so its cost scales with the number of positions, not the disjunct count. The disjunct
+  # guard leaves that width unbounded: one wide `AND` chain (a single disjunct) or a pinned-100
+  # `(a OR ...) AND b AND ...` both hold the disjunct count at the cap while the position count -- and
+  # the work -- grow with the request. Bounding the positions bounds the matrix on its other axis.
+  @max_positions 1_000
+
   @spec decompose(query :: Parser.tree_part()) :: {:ok, decomposition()} | {:error, term()}
   def decompose(query) do
     internal_dnf = to_dnf(query, false)
+    disjunct_count = length(internal_dnf)
+    position_count = internal_dnf |> Enum.map(&length/1) |> Enum.sum()
 
-    if length(internal_dnf) > @max_disjuncts do
-      {:error,
-       "WHERE clause too complex for DNF decomposition " <>
-         "(#{length(internal_dnf)} disjuncts exceeds limit of #{@max_disjuncts})"}
-    else
-      {expanded, ref_subexpressions} = expand(internal_dnf)
-      {:ok, to_decomposition(expanded, ref_subexpressions)}
+    cond do
+      disjunct_count > @max_disjuncts ->
+        {:error, too_complex(disjunct_count)}
+
+      position_count > @max_positions ->
+        {:error, too_wide(position_count)}
+
+      true ->
+        {expanded, ref_subexpressions} = expand(internal_dnf)
+        {:ok, to_decomposition(expanded, ref_subexpressions)}
     end
+  catch
+    {:too_many_disjuncts, count} -> {:error, too_complex(count)}
   end
+
+  defp too_complex(count) do
+    "WHERE clause too complex for DNF decomposition " <>
+      "(#{count} disjuncts exceeds limit of #{@max_disjuncts})"
+  end
+
+  defp too_wide(count) do
+    "WHERE clause too complex for DNF decomposition " <>
+      "(#{count} expression positions exceed limit of #{@max_positions})"
+  end
+
+  # Counting the disjuncts only after the DNF exists is too late: ANDing n binary disjunctions
+  # produces 2^n of them, so a few dozen of them exhaust the node's memory while it is still
+  # building the list nobody has measured yet. Every step that multiplies or concatenates
+  # disjuncts checks the size it is about to produce first.
+  defp guard_disjunct_count!(count) when count > @max_disjuncts,
+    do: throw({:too_many_disjuncts, count})
+
+  defp guard_disjunct_count!(_count), do: :ok
 
   # Convert AST to internal DNF representation
   # negated? tracks whether we're inside a NOT context (for De Morgan transformations)
@@ -128,7 +161,7 @@ defmodule Electric.Replication.Eval.Decomposer do
     case {name, negated} do
       {"or", false} ->
         # OR: concatenate disjuncts from all branches
-        Enum.flat_map(args, &to_dnf(&1, false))
+        concat_disjuncts(args, false)
 
       {"or", true} ->
         # NOT OR => AND (De Morgan's law)
@@ -144,7 +177,7 @@ defmodule Electric.Replication.Eval.Decomposer do
       {"and", true} ->
         # NOT AND => OR (De Morgan's law)
         # NOT (a AND b) = NOT a OR NOT b
-        Enum.flat_map(args, &to_dnf(&1, true))
+        concat_disjuncts(args, true)
 
       {"not", _} ->
         # NOT: flip the negation state (handles double negation automatically)
@@ -158,12 +191,21 @@ defmodule Electric.Replication.Eval.Decomposer do
     [[{leaf, negated}]]
   end
 
+  defp concat_disjuncts(args, negated) do
+    Enum.reduce(args, [], fn arg, acc ->
+      disjuncts = to_dnf(arg, negated)
+      guard_disjunct_count!(length(acc) + length(disjuncts))
+      acc ++ disjuncts
+    end)
+  end
+
   # Cross-product of multiple DNF forms
   # Used for AND distribution: (A1 OR A2) AND (B1 OR B2) => (A1 AND B1) OR (A1 AND B2) OR (A2 AND B1) OR (A2 AND B2)
   defp cross_product([]), do: [[]]
 
   defp cross_product([dnf | rest]) do
     rest_product = cross_product(rest)
+    guard_disjunct_count!(length(dnf) * length(rest_product))
 
     for disjunct <- dnf, rest_disjunct <- rest_product do
       disjunct ++ rest_disjunct

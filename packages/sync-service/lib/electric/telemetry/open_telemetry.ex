@@ -31,6 +31,7 @@ defmodule Electric.Telemetry.OpenTelemetry do
 
   alias Electric.Telemetry.Sampler
   alias Electric.Telemetry.IntervalTimer
+  alias Electric.Telemetry.RequestValues
 
   require Record
 
@@ -168,12 +169,12 @@ defmodule Electric.Telemetry.OpenTelemetry do
   propagates up unchanged, to be recorded on the enclosing span by its error
   handling (see `record_exception/4`).
 
-  When there is no active span context this is a no-op apart from calling
+  When the current span is not recording this is a no-op apart from calling
   `fun`, avoiding the `Process.info/2` cost on unsampled requests.
   """
   @spec with_flattened_span(attr_name(), (-> t)) :: t when t: term
   def with_flattened_span(name, fun) when is_binary(name) do
-    if in_span_context?() do
+    if recording_span?() do
       start_attrs = prefix_attrs(name, process_memory_attributes(:start))
       start_time = System.monotonic_time()
 
@@ -260,12 +261,13 @@ defmodule Electric.Telemetry.OpenTelemetry do
   Add current-process memory-footprint attributes (see
   `process_memory_attributes/1`) to the current span.
 
-  No-op when called outside a span context, avoiding the `Process.info/2` cost
-  on unsampled requests.
+  No-op when the current span is not recording, avoiding the `Process.info/2`
+  cost on unsampled requests: a sampler that drops a trace still leaves a span
+  context, only one that records nothing.
   """
   @spec add_process_memory_attributes(:start | :end) :: boolean()
   def add_process_memory_attributes(phase) when phase in [:start, :end] do
-    if in_span_context?() do
+    if recording_span?() do
       add_span_attributes(process_memory_attributes(phase))
     else
       false
@@ -404,20 +406,32 @@ defmodule Electric.Telemetry.OpenTelemetry do
   Add an error event to the current span.
   """
   def record_exception(error_str, attributes \\ []) when is_binary(error_str) do
-    add_exception_event("error", error_str, nil, attributes)
+    message = if RequestValues.enabled?(), do: "error", else: error_str
+    add_exception_event("error", message, nil, attributes)
   end
 
   def record_exception(kind, error, stacktrace, attributes \\ []) when is_atom(kind) do
-    type =
-      if is_struct(error) do
-        to_string(error.__struct__)
+    type = RequestValues.error_type(error, :error)
+
+    {message, stacktrace} =
+      if RequestValues.enabled?() do
+        # Stacktrace entries can carry the arguments passed to a function.
+        stacktrace = Enum.map(stacktrace || [], &stacktrace_entry_without_args/1)
+        {type, stacktrace}
       else
-        "error"
+        {Exception.format(kind, error), stacktrace}
       end
 
-    message = Exception.format(kind, error)
     add_exception_event(type, message, stacktrace, attributes)
   end
+
+  defp stacktrace_entry_without_args({module, fun, args, location}) when is_list(args),
+    do: {module, fun, length(args), location}
+
+  defp stacktrace_entry_without_args({fun, args, location}) when is_list(args),
+    do: {fun, length(args), location}
+
+  defp stacktrace_entry_without_args(entry), do: entry
 
   defp add_exception_event(type, message, stacktrace, attributes) do
     semantic_attributes = [
@@ -464,4 +478,7 @@ defmodule Electric.Telemetry.OpenTelemetry do
   defp in_span_context? do
     current_span_context() != :undefined
   end
+
+  # A sampler that drops a trace still leaves a span context, one that records nothing.
+  defp recording_span?, do: in_span_context?() and :otel_span.is_recording(current_span_context())
 end

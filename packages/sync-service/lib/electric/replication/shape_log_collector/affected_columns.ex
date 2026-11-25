@@ -24,6 +24,12 @@ defmodule Electric.Replication.ShapeLogCollector.AffectedColumns do
     case {existing_id, existing_rel} do
       # New relation, register it
       {nil, nil} ->
+        # Publishing this terminates every shape on the table, and the three publishing branches are
+        # indistinguishable downstream -- a reproduction can only tell them apart from here.
+        Logger.debug(fn ->
+          "Relation #{schema}.#{table} (#{id}) is untracked: terminating its shapes as new"
+        end)
+
         {:new, rel, add_relation(state, id, rel)}
 
       # Relation identity matches known, let's compare columns
@@ -34,6 +40,10 @@ defmodule Electric.Replication.ShapeLogCollector.AffectedColumns do
             {:unchanged, rel, state}
 
           affected_cols ->
+            Logger.debug(fn ->
+              "Relation #{schema}.#{table} (#{id}) changed columns #{inspect(affected_cols)}"
+            end)
+
             updated_rel = %{rel | affected_columns: affected_cols}
             {:changed, updated_rel, add_relation(state, id, rel)}
         end

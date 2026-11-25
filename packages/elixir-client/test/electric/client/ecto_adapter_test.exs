@@ -700,6 +700,20 @@ defmodule Electric.Client.EctoAdapterTest do
     end
   end
 
+  test "a value that cannot be cast is logged by column and type, without the value" do
+    mapper = EctoAdapter.for_schema(%{}, TestTable)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert_raise Ecto.CastError, fn ->
+          mapper.(%{"amount" => "row-value-that-must-not-be-logged"})
+        end
+      end)
+
+    assert log =~ ~s|Unable to cast column "amount" to :integer|
+    refute log =~ "row-value-that-must-not-be-logged"
+  end
+
   test "{'t', 'f'} booleans are mapped" do
     mapper = EctoAdapter.for_schema(%{}, TestTable)
 

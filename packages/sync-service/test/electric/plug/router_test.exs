@@ -48,7 +48,11 @@ defmodule Electric.Plug.RouterTest do
     setup :with_complete_stack
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
+
       %{opts: Router.init(build_router_opts(ctx))}
     end
 
@@ -68,7 +72,11 @@ defmodule Electric.Plug.RouterTest do
     setup :with_complete_stack
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
+
       %{opts: Router.init(build_router_opts(ctx))}
     end
 
@@ -187,7 +195,30 @@ defmodule Electric.Plug.RouterTest do
 
       shape_handle = get_resp_shape_handle(conn)
 
-      Process.sleep(500)
+      values_up_to_date = fn ->
+        "0_0"
+        |> Stream.unfold(fn
+          nil ->
+            nil
+
+          offset ->
+            conn =
+              conn("GET", "/v1/shape?table=items&handle=#{shape_handle}&offset=#{offset}")
+              |> Router.call(opts)
+
+            body = Jason.decode!(conn.resp_body)
+
+            next_offset =
+              if Enum.any?(body, &match?(@up_to_date, &1)),
+                do: nil,
+                else: get_resp_header(conn, "electric-offset")
+
+            {body, next_offset}
+        end)
+        |> Enum.flat_map(&for %{"value" => %{"value" => value}} <- &1, do: value)
+      end
+
+      assert Support.TestUtils.wait_until(fn -> "test value 10" in values_up_to_date.() end)
 
       # Here, we should have exactly 10 chunks with data (and 1 chunk with snapshot control messages)
 
@@ -217,13 +248,20 @@ defmodule Electric.Plug.RouterTest do
       Electric.Shapes.Consumer.whereis(opts[:stack_id], shape_handle)
       |> Electric.ShapeCache.Storage.trigger_compaction(storage, 0)
 
-      # If this test is flaking, then the compaction didn't have time to complete - we don't have a good way to wait for it to complete though.
-      Process.sleep(200)
-
-      conn =
+      read_from_start = fn ->
         conn("GET", "/v1/shape?table=items&handle=#{shape_handle}&offset=0_inf")
         |> Router.call(opts)
+      end
 
+      # Until compaction lands, the first chunk still starts at "test value 1".
+      assert Support.TestUtils.wait_until(fn ->
+               match?(
+                 [%{"value" => %{"value" => "test value 10"}}, _],
+                 Jason.decode!(read_from_start.().resp_body)
+               )
+             end)
+
+      conn = read_from_start.()
       assert [%{"value" => %{"value" => "test value 10"}}, _] = Jason.decode!(conn.resp_body)
 
       assert LogOffset.from_string(get_resp_header(conn, "electric-offset")) ==
@@ -678,7 +716,7 @@ defmodule Electric.Plug.RouterTest do
                    "i4" => "20",
                    "i8" => "30",
                    "f8" => "40.5",
-                   "b" => "f",
+                   "b" => "false",
                    "json" => "{\"bar\":\"foo\"}",
                    "jsonb" => "{\"bar\": \"foo\"}",
                    "blob" => "\\xfffe0001",
@@ -732,9 +770,42 @@ defmodule Electric.Plug.RouterTest do
         blob
       ])
 
-      assert {_req, 200, body} = Task.await(task)
+      # The default 5s await is too tight for a 20MB hex payload when journal mode
+      # fsyncs it before the ack; the bound only needs to prove liveness, not speed.
+      assert {_req, 200, body} = Task.await(task, 30_000)
 
       assert [%{"value" => %{"id" => "1", "blob" => ^hex_blob}}, @up_to_date] = body
+    end
+
+    @bool_pk_table "bool_pk_table"
+    @tag with_sql: [
+           "CREATE TABLE #{@bool_pk_table} (flag BOOLEAN PRIMARY KEY, done BOOLEAN NOT NULL)",
+           "INSERT INTO #{@bool_pk_table} VALUES (true, false)"
+         ]
+    test "GET writes a boolean the same way in the snapshot and in later changes",
+         %{opts: opts, db_conn: db_conn} do
+      req = make_shape_req(@bool_pk_table, [])
+
+      assert {req, 200,
+              [
+                %{"key" => key, "value" => %{"flag" => "true", "done" => "false"}},
+                %{"headers" => %{"control" => "snapshot-end"}}
+              ]} = shape_req(req, opts)
+
+      task = live_shape_req(req, opts)
+
+      Postgrex.query!(db_conn, "UPDATE #{@bool_pk_table} SET done = true WHERE flag", [])
+
+      # the update must land on the row the snapshot sent: same key
+      assert {_req, 200,
+              [
+                %{
+                  "key" => ^key,
+                  "headers" => %{"operation" => "update"},
+                  "value" => %{"flag" => "true", "done" => "true"}
+                },
+                @up_to_date
+              ]} = Task.await(task)
     end
 
     @generated_pk_table "generated_pk_table"
@@ -1111,6 +1182,145 @@ defmodule Electric.Plug.RouterTest do
       assert [%{"key" => ^key, "value" => ^value}, _] = Jason.decode!(conn.resp_body)
     end
 
+    @localized_table_sql [
+      ~S|CREATE TABLE "Assessment" (id TEXT PRIMARY KEY, "resultLabel" JSONB NOT NULL, "resultLabel_FR" TEXT GENERATED ALWAYS AS ("resultLabel" ->> 'FR') STORED, "resultLabel_NL" TEXT GENERATED ALWAYS AS (coalesce("resultLabel" ->> 'NL', "resultLabel" ->> 'FR')) STORED)|,
+      ~S|INSERT INTO "Assessment" (id, "resultLabel") VALUES ('a', '{"FR": "Conforme", "NL": "Conform"}')|
+    ]
+
+    @tag with_sql: @localized_table_sql
+    test "GET projects a localized column to the requested locale", %{opts: opts} do
+      conn = conn("GET", "/v1/shape", localized_shape_params(%{})) |> Router.call(opts)
+
+      assert %{status: 200} = conn
+
+      assert [
+               %{"value" => %{"id" => "a", "resultLabel" => "Conform"}},
+               %{"headers" => %{"control" => "snapshot-end"}}
+             ] = Jason.decode!(conn.resp_body)
+
+      assert %{"resultLabel" => %{"type" => "text"}} = get_resp_schema(conn)
+    end
+
+    @tag with_sql: @localized_table_sql
+    test "GET serves the locale as a shape of its own", %{opts: opts} do
+      localized = conn("GET", "/v1/shape", localized_shape_params(%{})) |> Router.call(opts)
+
+      unlocalized =
+        conn(
+          "GET",
+          "/v1/shape",
+          Map.drop(localized_shape_params(%{}), [:locale, :localized_columns])
+        )
+        |> Router.call(opts)
+
+      assert get_resp_shape_handle(localized) != get_resp_shape_handle(unlocalized)
+
+      assert [%{"value" => %{"resultLabel" => stored}}, _] = Jason.decode!(unlocalized.resp_body)
+      assert %{"FR" => "Conforme", "NL" => "Conform"} = Jason.decode!(stored)
+      assert %{"resultLabel" => %{"type" => "jsonb"}} = get_resp_schema(unlocalized)
+    end
+
+    @tag with_sql: @localized_table_sql
+    test "GET projects a live change to the requested locale", %{opts: opts, db_conn: db_conn} do
+      conn = conn("GET", "/v1/shape", localized_shape_params(%{})) |> Router.call(opts)
+      shape_handle = get_resp_shape_handle(conn)
+      next_offset = get_resp_last_offset(conn)
+
+      task =
+        Task.async(fn ->
+          conn(
+            "GET",
+            "/v1/shape",
+            localized_shape_params(%{offset: next_offset, handle: shape_handle, live: "true"})
+          )
+          |> Router.call(opts)
+        end)
+
+      Postgrex.query!(
+        db_conn,
+        ~S|UPDATE "Assessment" SET "resultLabel" = '{"FR": "Correct", "NL": "Goed"}' WHERE id = 'a'|,
+        []
+      )
+
+      assert %{status: 200} = conn = Task.await(task)
+      assert [%{"value" => %{"resultLabel" => "Goed"} = value}, _] = Jason.decode!(conn.resp_body)
+      refute Map.has_key?(value, "resultLabel_NL")
+    end
+
+    @tag with_sql: @localized_table_sql
+    test "GET hides the backing columns of a localized column when every column is selected",
+         %{opts: opts} do
+      conn =
+        conn("GET", "/v1/shape", Map.delete(localized_shape_params(%{}), :columns))
+        |> Router.call(opts)
+
+      assert %{status: 200} = conn
+
+      assert [%{"value" => value}, _] = Jason.decode!(conn.resp_body)
+      assert value == %{"id" => "a", "resultLabel" => "Conform"}
+
+      schema = get_resp_schema(conn)
+      assert Enum.sort(Map.keys(schema)) == ["id", "resultLabel"]
+      assert %{"type" => "text"} = schema["resultLabel"]
+      assert %{"pk_index" => 0} = schema["id"]
+    end
+
+    @tag with_sql: @localized_table_sql
+    test "GET rejects a locale that is not a language tag", %{opts: opts} do
+      conn =
+        conn("GET", "/v1/shape", localized_shape_params(%{locale: "NL'; DROP TABLE x; --"}))
+        |> Router.call(opts)
+
+      assert %{status: 400} = conn
+      assert %{"errors" => %{"locale" => [_ | _]}} = Jason.decode!(conn.resp_body)
+    end
+
+    @queryable_localized_sql [
+      ~S|CREATE TABLE employees (id TEXT PRIMARY KEY, "firmId" TEXT NOT NULL, title JSONB NOT NULL, salary INTEGER NOT NULL, "title_EN" TEXT GENERATED ALWAYS AS (title ->> 'EN') STORED, title_pay TEXT GENERATED ALWAYS AS (salary::text) STORED)|,
+      ~S|INSERT INTO employees VALUES ('e1', 'f1', '{"EN": "Engineer"}', 4200)|
+    ]
+
+    # The locale comes from the request, so it can name any generated column that starts with a
+    # queryable column's name. One left out of queryable_columns must not be served under that name.
+    @tag with_sql: @queryable_localized_sql
+    test "GET serves a localized column as stored when its backing column is not queryable",
+         %{opts: opts} do
+      conn =
+        conn("GET", "/v1/shape", %{
+          table: "employees",
+          offset: "-1",
+          queryable_columns: "id,title",
+          columns: "id,title",
+          locale: "pay",
+          localized_columns: "title"
+        })
+        |> Router.call(opts)
+
+      assert %{status: 200} = conn
+      assert [%{"value" => %{"id" => "e1", "title" => stored}}, _] = Jason.decode!(conn.resp_body)
+      assert %{"EN" => "Engineer"} = Jason.decode!(stored)
+      assert %{"title" => %{"type" => "jsonb"}} = get_resp_schema(conn)
+    end
+
+    @tag with_sql: @queryable_localized_sql
+    test "GET projects a localized column whose backing column is queryable", %{opts: opts} do
+      conn =
+        conn("GET", "/v1/shape", %{
+          table: "employees",
+          offset: "-1",
+          queryable_columns: ~S|id,title,"title_EN"|,
+          columns: "id,title",
+          locale: "EN",
+          localized_columns: "title"
+        })
+        |> Router.call(opts)
+
+      assert %{status: 200} = conn
+
+      assert [%{"value" => %{"id" => "e1", "title" => "Engineer"}}, _] =
+               Jason.decode!(conn.resp_body)
+    end
+
     @tag with_sql: [
            "CREATE TABLE queryable_users (id BIGINT PRIMARY KEY, name TEXT NOT NULL, secret_token TEXT NOT NULL)",
            "INSERT INTO queryable_users VALUES (1, 'Alice', 'supersecret123')"
@@ -1135,6 +1345,24 @@ defmodule Electric.Plug.RouterTest do
                },
                %{"headers" => %{"control" => "snapshot-end"}}
              ] = Jason.decode!(conn.resp_body)
+    end
+
+    test "GET rejects a where clause whose error text looks like an error placeholder", %{
+      opts: opts
+    } do
+      # A quoted identifier survives the parser intact, so the rejection message carries whatever
+      # the request put in it — including the `%{name}` shape the error formatter substitutes.
+      conn =
+        conn("GET", "/v1/shape", %{
+          table: "items",
+          offset: "-1",
+          where: ~s|"%{no_such_atom_in_this_vm}" = 1|
+        })
+        |> Router.call(opts)
+
+      assert %{status: 400} = conn
+      assert %{"errors" => %{"where" => [message]}} = Jason.decode!(conn.resp_body)
+      assert message =~ "unknown reference"
     end
 
     @tag with_sql: [
@@ -1799,6 +2027,32 @@ defmodule Electric.Plug.RouterTest do
       assert conn.resp_body == ""
     end
 
+    @tag with_sql: [
+           "INSERT INTO items SELECT gen_random_uuid(), repeat('snapshot payload ', 32) FROM generate_series(1, 5000)"
+         ]
+    test "full-provenance HEAD does not materialize a populated shape", %{
+      opts: opts,
+      stack_id: stack_id
+    } do
+      Electric.StackConfig.put(stack_id, :full_xid_source_positions_ready, true)
+      Electric.StackConfig.put(stack_id, :full_xid_source_generation, "probe-generation")
+      opts = Keyword.update!(opts, :api, &%{&1 | feature_flags: ["full_xid_source_positions"]})
+
+      assert Electric.ShapeCache.ShapeStatus.list_shapes(stack_id) == []
+
+      response =
+        conn("HEAD", "/v1/shape?table=items&offset=-1&source_positions=full_xid")
+        |> Router.call(opts)
+
+      assert %{status: 200, resp_body: ""} = response
+
+      assert Plug.Conn.get_resp_header(response, "electric-source-generation") == [
+               "probe-generation"
+             ]
+
+      assert Electric.ShapeCache.ShapeStatus.list_shapes(stack_id) == []
+    end
+
     test "OPTIONS receives supported methods", %{opts: opts} do
       conn =
         conn("OPTIONS", "/v1/shape?table=items")
@@ -1910,11 +2164,10 @@ defmodule Electric.Plug.RouterTest do
     @tag with_sql: [
            "CREATE TABLE nullability_test (id INT PRIMARY KEY, value TEXT NOT NULL)"
          ]
-    test "GET returns updated schema in header after column nullability changes", %{
+    test "GET never claims not_null for a column a migration can relax", %{
       opts: opts,
       db_conn: db_conn
     } do
-      # Initial request to create the shape and get the schema
       conn =
         conn("GET", "/v1/shape?table=nullability_test&offset=-1")
         |> Router.call(opts)
@@ -1924,10 +2177,12 @@ defmodule Electric.Plug.RouterTest do
       offset = get_resp_last_offset(conn)
       initial_schema = get_resp_schema(conn)
 
-      assert initial_schema["value"]["not_null"]
+      # The key column cannot be relaxed without dropping the key, so its claim survives; `value`
+      # is NOT NULL in the catalog right now and is deliberately not advertised as such, because a
+      # client latches this schema at subscribe time and only ever sees it once.
+      assert initial_schema["id"]["not_null"]
+      refute initial_schema["value"]["not_null"]
 
-      # Make a write to trigger relation message processing
-      # Use a live request first to ensure the change propagates and cache is cleaned
       task =
         Task.async(fn ->
           conn(
@@ -1937,9 +2192,17 @@ defmodule Electric.Plug.RouterTest do
           |> Router.call(opts)
         end)
 
-      Postgrex.query!(db_conn, "INSERT INTO nullability_test (id, value) VALUES (1, 'test')", [])
+      Postgrex.query!(
+        db_conn,
+        "ALTER TABLE nullability_test ALTER COLUMN value DROP NOT NULL",
+        []
+      )
+
+      Postgrex.query!(db_conn, "INSERT INTO nullability_test (id, value) VALUES (1, NULL)", [])
       assert %{status: 200} = Task.await(task)
 
+      # The row that used to contradict the schema is served on the same shape, and the schema it
+      # was subscribed under still describes it.
       assert %{status: 200} =
                conn =
                conn(
@@ -1948,39 +2211,8 @@ defmodule Electric.Plug.RouterTest do
                )
                |> Router.call(opts)
 
-      assert get_resp_schema(conn)["value"]["not_null"]
-
-      # Alter table to make 'value' nullable
-      Postgrex.query!(
-        db_conn,
-        "ALTER TABLE nullability_test ALTER COLUMN value DROP NOT NULL",
-        []
-      )
-
-      offset = get_resp_last_offset(conn)
-
-      # Make a write to trigger relation message processing
-      # Use a live request first to ensure the change propagates and cache is cleaned
-      task =
-        Task.async(fn ->
-          conn(
-            "GET",
-            "/v1/shape?table=nullability_test&offset=#{offset}&handle=#{shape_handle}&live"
-          )
-          |> Router.call(opts)
-        end)
-
-      Postgrex.query!(db_conn, "INSERT INTO nullability_test (id, value) VALUES (2, NULL)", [])
-      assert %{status: 200} = Task.await(task)
-
-      # Make a non-live request to get the updated schema header
-      conn =
-        conn("GET", "/v1/shape?table=nullability_test&offset=#{offset}&handle=#{shape_handle}")
-        |> Router.call(opts)
-
-      assert %{status: 200} = conn
-      updated_schema = get_resp_schema(conn)
-      refute updated_schema["value"]["not_null"]
+      refute get_resp_schema(conn)["value"]["not_null"]
+      assert get_resp_schema(conn)["id"]["not_null"]
     end
 
     @tag with_sql: [
@@ -2028,8 +2260,21 @@ defmodule Electric.Plug.RouterTest do
 
       Postgrex.query!(db_conn, "INSERT INTO droppability_test (id, value) VALUES (1, 'test')", [])
 
-      # 1 sec timeout to make sure we see the change instead of acting as if no changes have been observed
-      assert %{status: 409} = Task.await(task, 1_000)
+      # The DDL can outlast the long poll on a busy database, and the request then answers
+      # up-to-date with nothing new; a client polls again from the same offset.
+      assert %{status: 409} =
+               [Task.await(task)]
+               |> Stream.concat(
+                 Stream.repeatedly(fn ->
+                   conn(
+                     "GET",
+                     "/v1/shape?table=droppability_test&offset=0_0&handle=#{shape_handle}&live"
+                   )
+                   |> Router.call(opts)
+                 end)
+               )
+               |> Stream.take(6)
+               |> Enum.find(&(&1.status != 200))
 
       assert %{status: 409} =
                conn("GET", "/v1/shape", %{
@@ -2165,6 +2410,80 @@ defmodule Electric.Plug.RouterTest do
                |> Router.call(opts)
     end
 
+    @tag with_sql: [
+           "CREATE TABLE nullability_test (id INT PRIMARY KEY, value INTEGER NOT NULL)"
+         ]
+    test "dropping a column's NOT NULL retires the shape once the reconciler notices", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
+      assert %{status: 200} =
+               conn =
+               conn("GET", "/v1/shape", %{table: "nullability_test", offset: "-1"})
+               |> Router.call(opts)
+
+      shape_handle = get_resp_shape_handle(conn)
+      ref = Process.monitor(Electric.Shapes.Consumer.whereis(stack_id, shape_handle))
+
+      # replication stream can report this. The reconciler comparing column info is the only
+      # thing that can.
+      Postgrex.query!(
+        db_conn,
+        "ALTER TABLE nullability_test ALTER COLUMN value DROP NOT NULL",
+        []
+      )
+
+      Electric.Replication.SchemaReconciler.name(stack_id)
+      |> Electric.Replication.SchemaReconciler.reconcile_now()
+
+      assert_receive {:DOWN, ^ref, :process, _, _}
+
+      assert %{status: 409} =
+               conn("GET", "/v1/shape", %{
+                 table: "nullability_test",
+                 offset: "0_0",
+                 handle: shape_handle
+               })
+               |> Router.call(opts)
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE nullability_test_2 (id INT PRIMARY KEY, value INTEGER)"
+         ]
+    test "adding a column's NOT NULL retires the shape once the reconciler notices", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
+      assert %{status: 200} =
+               conn =
+               conn("GET", "/v1/shape", %{table: "nullability_test_2", offset: "-1"})
+               |> Router.call(opts)
+
+      shape_handle = get_resp_shape_handle(conn)
+      ref = Process.monitor(Electric.Shapes.Consumer.whereis(stack_id, shape_handle))
+
+      Postgrex.query!(
+        db_conn,
+        "ALTER TABLE nullability_test_2 ALTER COLUMN value SET NOT NULL",
+        []
+      )
+
+      Electric.Replication.SchemaReconciler.name(stack_id)
+      |> Electric.Replication.SchemaReconciler.reconcile_now()
+
+      assert_receive {:DOWN, ^ref, :process, _, _}
+
+      assert %{status: 409} =
+               conn("GET", "/v1/shape", %{
+                 table: "nullability_test_2",
+                 offset: "0_0",
+                 handle: shape_handle
+               })
+               |> Router.call(opts)
+    end
+
     test "now offset returns an up-to-date response regardless of existing data", %{
       opts: opts,
       db_conn: db_conn
@@ -2206,7 +2525,10 @@ defmodule Electric.Plug.RouterTest do
     setup :with_complete_stack
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
 
       # Build router opts with low max_concurrent limit for testing
       router_opts =
@@ -2222,7 +2544,11 @@ defmodule Electric.Plug.RouterTest do
     @tag with_sql: [
            "INSERT INTO items VALUES (gen_random_uuid(), 'test value 1')"
          ]
-    test "rejects requests when at capacity with 503", %{opts: opts, db_conn: db_conn} do
+    test "rejects requests when at capacity with 503", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
       # Get initial snapshot to create the shape
       conn = conn("GET", "/v1/shape?table=items&offset=-1") |> Router.call(opts)
       assert %{status: 200} = conn
@@ -2242,8 +2568,9 @@ defmodule Electric.Plug.RouterTest do
           |> Router.call(opts)
         end)
 
-      # Give the live requests time to acquire permits
-      Process.sleep(100)
+      assert Support.TestUtils.wait_until(fn ->
+               match?(%{existing: 2}, Electric.AdmissionControl.get_current(stack_id))
+             end)
 
       # Third request should be rejected with 503
       conn3 =
@@ -2291,10 +2618,10 @@ defmodule Electric.Plug.RouterTest do
       task_existing1 = live_shape_req(req, opts)
       task_existing2 = live_shape_req(req, opts)
 
-      # Give the live requests time to acquire permits
-      Process.sleep(300)
+      assert Support.TestUtils.wait_until(fn ->
+               match?(%{existing: 2}, Electric.AdmissionControl.get_current(stack_id))
+             end)
 
-      # Verify 2 existing permits are held
       assert %{initial: 0, existing: 2} = Electric.AdmissionControl.get_current(stack_id)
 
       # Third existing request should be rejected (limit is 2)
@@ -2418,7 +2745,10 @@ defmodule Electric.Plug.RouterTest do
 
       # Delete the shape so the handle becomes dead
       Electric.ShapeCache.clean_shape(shape_handle, stack_id)
-      Process.sleep(100)
+
+      assert Support.TestUtils.wait_until(fn ->
+               not Electric.ShapeCache.ShapeStatus.has_shape_handle?(stack_id, shape_handle)
+             end)
 
       # Pre-fill both initial admission slots
       :ok = Electric.AdmissionControl.try_acquire(stack_id, :initial, max_concurrent: 2)
@@ -2491,8 +2821,7 @@ defmodule Electric.Plug.RouterTest do
         conn = conn("GET", "/v1/shape?table=items&offset=-1") |> Router.call(opts)
         assert %{status: 200} = conn
 
-        assert_receive {:admission_swap, %{stack_id: ^stack_id, from: :initial, to: :existing}},
-                       1000
+        assert_receive {:admission_swap, %{stack_id: ^stack_id, from: :initial, to: :existing}}
 
         assert %{initial: 0, existing: 0} = Electric.AdmissionControl.get_current(stack_id)
       after
@@ -2507,8 +2836,151 @@ defmodule Electric.Plug.RouterTest do
     setup :with_complete_stack
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
+
       %{opts: Router.init(build_router_opts(ctx))}
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY)",
+           "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, period INTERVAL)",
+           "INSERT INTO parent VALUES (1)",
+           "INSERT INTO child VALUES (1, 1, '29 days'), (2, 1, '31 days'), (3, 2, '29 days'), (4, 1, NULL)"
+         ]
+    test "admits a subquery shape with row-dependent greatest and least", %{
+      opts: opts,
+      db_conn: db_conn
+    } do
+      where = """
+      parent_id IN (SELECT id FROM parent)
+      AND greatest(period, interval '1 month') = interval '1 month'
+      AND least(period, interval '1 month') = period
+      """
+
+      expected = Postgrex.query!(db_conn, "SELECT id::text FROM child WHERE #{where}", []).rows
+      assert expected == [["1"]]
+
+      assert {_, 200, response} = shape_req(make_shape_req("child", where: where), opts)
+      assert for(%{"value" => %{"id" => id}} <- response, do: [id]) == expected
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY)",
+           ~s|CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, name TEXT COLLATE pg_catalog."und-x-icu")|,
+           "INSERT INTO parent VALUES (1)",
+           "INSERT INTO child VALUES (1, 1, 'B'), (2, 1, 'b')"
+         ]
+    test "subquery text extremes require an explicit byte collation", %{
+      opts: opts,
+      db_conn: db_conn
+    } do
+      subquery = " AND parent_id IN (SELECT id FROM parent)"
+
+      for {func, rhs} <- [{"greatest", "name"}, {"least", "'a'"}] do
+        where = "#{func}(name, 'a') = #{rhs}" <> subquery
+
+        assert Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where} ORDER BY id", []).rows ==
+                 [[1], [2]]
+
+        assert {_, 400, %{"errors" => %{"where" => [message]}}} =
+                 shape_req(make_shape_req("child", where: where), opts)
+
+        assert message =~ "COLLATE"
+
+        where = ~s|#{func}(name COLLATE pg_catalog."C", 'a') = #{rhs}| <> subquery
+        assert Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where}", []).rows == [[2]]
+        assert {_, 200, response} = shape_req(make_shape_req("child", where: where), opts)
+        assert for(%{"value" => %{"id" => id}} <- response, do: id) == ["2"]
+      end
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE child (id INT PRIMARY KEY, name TEXT)",
+           "INSERT INTO child VALUES (1, 'z')"
+         ]
+    test "resumes a shape stored with an unqualified byte collation", %{
+      opts: opts,
+      db_conn: db_conn,
+      stack_id: stack_id
+    } do
+      alias Electric.Postgres.Inspector.DirectInspector
+      alias Electric.Shapes.Shape
+
+      for collation <- ["C", "POSIX"] do
+        where = ~s|name COLLATE "#{collation}" > 'a'|
+        shape = Shape.new!("child", where: where, inspector: {DirectInspector, db_conn})
+        legacy_shape = put_in(shape.where.query, where)
+        {handle, _} = Electric.Shapes.get_or_create_shape_handle(stack_id, legacy_shape)
+
+        assert [[1]] = Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where}", []).rows
+
+        assert {%{handle: ^handle}, 200, _} =
+                 shape_req(
+                   make_shape_req("child", where: where, handle: handle, offset: "0_0"),
+                   opts
+                 )
+      end
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY)",
+           "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, a TEXT[], b TEXT[])",
+           "INSERT INTO parent VALUES (1)",
+           "INSERT INTO child VALUES (1, 1, ARRAY['a',NULL], ARRAY['a','b'])"
+         ]
+    test "rejects array extrema in a shape with a subquery", %{opts: opts, db_conn: db_conn} do
+      for {func, result} <- [{"greatest", "a"}, {"least", "b"}] do
+        where =
+          ~s|parent_id IN (SELECT id FROM parent) AND #{func}(a COLLATE "C", b) = #{result}|
+
+        assert [[1]] = Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where}", []).rows
+
+        assert {_, 400, %{"errors" => %{"where" => [_]}}} =
+                 shape_req(make_shape_req("child", where: where), opts)
+      end
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY, at TIMESTAMP)",
+           "CREATE TABLE child (id INT PRIMARY KEY, at TIMESTAMP)",
+           "INSERT INTO parent VALUES (1, '2024-01-02 03:04:05.6')",
+           "INSERT INTO child VALUES (1, '2024-01-02 03:04:05.6'), (2, '2024-01-02 03:04:06')"
+         ]
+    test "rejects a cast with a type modifier", %{opts: opts, db_conn: db_conn} do
+      # Postgres rounds the cast value to the modifier's precision before it compares.
+      for {where, selected} <- [
+            {"at::timestamp(0) IN (SELECT at FROM parent)", []},
+            {"at::timestamp(0) = '2024-01-02 03:04:06'", [[1], [2]]}
+          ] do
+        assert Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where} ORDER BY id", []).rows ==
+                 selected
+
+        assert {_, 400, %{"errors" => %{"where" => [message]}}} =
+                 shape_req(make_shape_req("child", where: where), opts)
+
+        assert message =~ "type modifiers are not supported in a cast"
+      end
+    end
+
+    @tag with_sql: [
+           "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false)",
+           "CREATE TABLE parent (id INT PRIMARY KEY)",
+           "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, name TEXT COLLATE case_insensitive)",
+           "INSERT INTO parent VALUES (1)",
+           "INSERT INTO child VALUES (1, 1, 'a')"
+         ]
+    test "subquery text coalesce requires an explicit byte collation", %{
+      opts: opts,
+      db_conn: db_conn
+    } do
+      where = "coalesce(name, 'x') = 'A' AND parent_id IN (SELECT id FROM parent)"
+      assert [[1]] = Postgrex.query!(db_conn, "SELECT id FROM child WHERE #{where}", []).rows
+
+      assert {_, 400, %{"errors" => %{"where" => [_]}}} =
+               shape_req(make_shape_req("child", where: where), opts)
     end
 
     @tag with_sql: [
@@ -2560,6 +3032,26 @@ defmodule Electric.Plug.RouterTest do
       assert %{status: 200} = conn = Task.await(task)
 
       assert [%{"value" => %{"value" => "30"}}, _] = Jason.decode!(conn.resp_body)
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (id INT PRIMARY KEY, value INT NOT NULL)",
+           "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parent(id), tag TEXT NOT NULL)",
+           "INSERT INTO parent (id, value) VALUES (1, 1), (2, 2)",
+           "INSERT INTO child (id, parent_id, tag) VALUES (1, 1, 'a'), (2, 2, 'b')"
+         ]
+    test "allows an empty typed array beside a subquery in where clause", %{opts: opts} do
+      where = "tag = ANY(ARRAY[]::text[]) OR parent_id IN (SELECT id FROM parent WHERE value = 1)"
+
+      assert %{status: 200} =
+               conn =
+               conn("GET", "/v1/shape", %{table: "child", offset: "-1", where: where})
+               |> Router.call(opts)
+
+      assert [
+               %{"value" => %{"id" => "1", "parent_id" => "1", "tag" => "a"}},
+               %{"headers" => %{"control" => "snapshot-end"}}
+             ] = Jason.decode!(conn.resp_body)
     end
 
     test "return 400 if subquery references unknown table", %{opts: opts} do
@@ -3164,7 +3656,7 @@ defmodule Electric.Plug.RouterTest do
       )
 
       tag =
-        value_tag(ctx.stack_id, req.handle, "user_id:v:2" <> "team_id:v:2")
+        value_tag(ctx.stack_id, req.handle, "3:v:23:v:2")
 
       assert {req, 200,
               [
@@ -3313,7 +3805,16 @@ defmodule Electric.Plug.RouterTest do
           ],
           do: Postgrex.query!(ctx.db_conn, stmt)
 
-      Process.sleep(120)
+      assert Support.TestUtils.wait_until(
+               fn ->
+                 {_, 200, messages} = shape_req(req, ctx.opts)
+
+                 Enum.count(messages, fn message ->
+                   match?(%{"headers" => %{"control" => "snapshot-end"}}, message)
+                 end) == 2
+               end,
+               5_000
+             )
 
       assert {req, 200,
               [
@@ -3382,8 +3883,11 @@ defmodule Electric.Plug.RouterTest do
           ],
           do: Postgrex.query!(ctx.db_conn, stmt)
 
-      # Hard to wait exactly what we want, so this should be OK
-      Process.sleep(1000)
+      # Both move-ins have been served once the log carries two snapshot-ends.
+      assert Support.TestUtils.wait_until(fn ->
+               {_req, 200, body} = shape_req(req, ctx.opts)
+               Enum.count(body, &match?(%{"headers" => %{"control" => "snapshot-end"}}, &1)) == 2
+             end)
 
       tag2 =
         value_tag(ctx.stack_id, req.handle, "v:2")
@@ -3394,28 +3898,53 @@ defmodule Electric.Plug.RouterTest do
       # The reduced move queue keeps the first move-in/move-out pair for
       # dependency row 2, then drops the later move-in/move-out oscillation
       # before dependency row 3 moves in.
-      assert {_req, 200,
-              [
-                %{"headers" => %{"event" => "move-in"}},
-                %{
-                  "headers" => %{"operation" => "insert", "is_move_in" => true, "tags" => [^tag2]},
-                  "value" => %{"id" => "2", "value" => "20"}
-                },
-                %{"headers" => %{"control" => "snapshot-end"}},
-                %{
-                  "headers" => %{
-                    "event" => "move-out",
-                    "patterns" => [%{"pos" => 0, "value" => ^tag2}]
-                  }
-                },
-                %{"headers" => %{"event" => "move-in"}},
-                %{
-                  "headers" => %{"operation" => "insert", "is_move_in" => true, "tags" => [^tag3]},
-                  "value" => %{"id" => "3", "value" => "30"}
-                },
-                %{"headers" => %{"control" => "snapshot-end"}},
-                up_to_date_ctl()
-              ]} = shape_req(req, ctx.opts)
+      assert {_req, 200, [%{"headers" => %{"event" => "move-in"}} | rest]} =
+               shape_req(req, ctx.opts)
+
+      {sent, rest} = Enum.split_while(rest, &match?(%{"headers" => %{"operation" => _}}, &1))
+
+      assert [
+               %{"headers" => %{"control" => "snapshot-end"} = snapshot},
+               %{
+                 "headers" => %{
+                   "event" => "move-out",
+                   "patterns" => [%{"pos" => 0, "value" => ^tag2}],
+                   "txids" => out_txids
+                 }
+               },
+               %{"headers" => %{"event" => "move-in"}},
+               %{
+                 "headers" => %{"operation" => "insert", "is_move_in" => true, "tags" => [^tag3]},
+                 "value" => %{"id" => "3", "value" => "30"}
+               },
+               %{"headers" => %{"control" => "snapshot-end"}},
+               up_to_date_ctl()
+             ] = rest
+
+      # The first move-in's snapshot sends the child of dependency row 2, which
+      # the move-out then takes back, unless the snapshot sees every transaction
+      # the move-out names: Postgres no longer selected the child then. The
+      # queue nets the first removal with the re-add and the second removal, so
+      # a query that ran between them still sends the child, as upstream does,
+      # and the move-out deletes it after.
+      pg_snapshot =
+        {String.to_integer(snapshot["xmin"]), String.to_integer(snapshot["xmax"]),
+         Enum.map(snapshot["xip_list"], &String.to_integer/1)}
+
+      if Enum.all?(out_txids, &Changes.Transaction.visible_in_snapshot?(&1, pg_snapshot)) do
+        assert sent == []
+      else
+        assert [
+                 %{
+                   "headers" => %{
+                     "operation" => "insert",
+                     "is_move_in" => true,
+                     "tags" => [^tag2]
+                   },
+                   "value" => %{"id" => "2", "value" => "20"}
+                 }
+               ] = sent
+      end
     end
 
     @tag with_sql: [
@@ -3623,8 +4152,70 @@ defmodule Electric.Plug.RouterTest do
     setup :with_complete_stack
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
+
       %{opts: Router.init(build_router_opts(ctx))}
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (a TEXT, b TEXT)",
+           "CREATE TABLE child (id INT PRIMARY KEY, a TEXT, b TEXT)",
+           "INSERT INTO parent VALUES ('x', 'y')",
+           "INSERT INTO child VALUES (1, 'x', 'y')"
+         ]
+    test "a subset of a persisted composite shape uses the tags of its existing handle", ctx do
+      where = "(a,b) IN (SELECT a,b FROM parent)"
+
+      shape =
+        Electric.Shapes.Shape.new!("child",
+          inspector: Electric.Postgres.Inspector.for_stack(ctx.stack_id),
+          where: where
+        )
+        |> Map.delete(:composite_tag_encoding)
+
+      {handle, _} = Electric.Shapes.get_or_create_shape_handle(ctx.stack_id, shape)
+      :ok = Electric.ShapeCache.ShapeStatus.ShapeDb.WriteBuffer.flush_sync(ctx.stack_id)
+      tag = value_tag(ctx.stack_id, handle, "a:v:xb:v:y")
+
+      req = make_shape_req("child", where: where)
+
+      assert {%{handle: ^handle} = req, 200, [%{"headers" => %{"tags" => [^tag]}}, _]} =
+               shape_req(req, ctx.opts)
+
+      assert {%{handle: ^handle}, 200, %{"data" => [%{"headers" => %{"tags" => [^tag]}}]}} =
+               shape_req(req, ctx.opts, subset: %{where: "id = 1"})
+
+      task = live_shape_req(req, ctx.opts)
+      Postgrex.query!(ctx.db_conn, "DELETE FROM parent", [])
+
+      assert {%{handle: ^handle}, 200,
+              [
+                %{
+                  "headers" => %{
+                    "event" => "move-out",
+                    "patterns" => [%{"pos" => 0, "value" => ^tag}]
+                  }
+                },
+                up_to_date_ctl()
+              ]} = Task.await(task)
+    end
+
+    @tag with_sql: [
+           "CREATE TABLE parent (a TEXT, b TEXT)",
+           "CREATE TABLE child (id INT PRIMARY KEY, a TEXT, b TEXT)",
+           "INSERT INTO parent VALUES ('x', 'y')",
+           "INSERT INTO child VALUES (1, 'x', 'y')"
+         ]
+    test "a subset requested without a handle carries the tags of its shape log", ctx do
+      req = make_shape_req("child", where: "(a,b) IN (SELECT a,b FROM parent)")
+
+      assert {_, 200, [%{"headers" => %{"tags" => [tag]}}, _]} = shape_req(req, ctx.opts)
+
+      assert {_, 200, %{"data" => [%{"headers" => %{"tags" => [^tag]}}]}} =
+               shape_req(req, ctx.opts, subset: %{where: "id = 1"})
     end
 
     @tag with_sql: [
@@ -3688,6 +4279,84 @@ defmodule Electric.Plug.RouterTest do
                shape_req(req, ctx.opts,
                  subset: %{where: "value ILIKE $1", params: %{"1" => "%2"}}
                )
+    end
+
+    @tag with_sql: [
+           "INSERT INTO items VALUES (gen_random_uuid(), 'a')",
+           "INSERT INTO items VALUES (gen_random_uuid(), 'b')",
+           "INSERT INTO items VALUES (gen_random_uuid(), 'c')"
+         ]
+    test "subsets constrain every disjunct of an OR-shaped base predicate", ctx do
+      req =
+        make_shape_req("items",
+          log: "changes_only",
+          where: "value = 'a' OR value = 'b'"
+        )
+
+      assert {_, 200, %{"metadata" => _, "data" => data}} =
+               shape_req(req, ctx.opts, subset: %{where: "value = 'b'"})
+
+      assert Enum.map(data, & &1["value"]["value"]) == ["b"]
+    end
+
+    test "rejects a subset limit above the cap before inspecting the table", ctx do
+      req = make_shape_req("no_such_table")
+      opts = Router.init(build_router_opts(ctx, subset_max_rows: 2))
+
+      assert {_, 400, %{"errors" => %{"subset" => %{"limit" => ["must be at most 2"]}}}} =
+               shape_req(req, opts, subset: %{limit: 3, order_by: "value"})
+    end
+
+    # One row more than the probe reads, so a probe that read without its limit would find four
+    # rows, not the three it counts as over the cap, and serve them.
+    @tag with_sql: [
+           "INSERT INTO items VALUES (gen_random_uuid(), 'a')",
+           "INSERT INTO items VALUES (gen_random_uuid(), 'b')",
+           "INSERT INTO items VALUES (gen_random_uuid(), 'c')",
+           "INSERT INTO items VALUES (gen_random_uuid(), 'd')"
+         ]
+    test "caps unbounded subset snapshots without truncating the response", ctx do
+      req = make_shape_req("items", log: "changes_only")
+      opts = Router.init(build_router_opts(ctx, subset_max_rows: 2))
+
+      assert {_, 400, %{"errors" => %{"subset" => %{"limit" => [message]}}}} =
+               shape_req(req, opts, subset: %{})
+
+      assert message =~ "add a limit of at most 2"
+
+      assert {_, 200, %{"data" => [%{}, %{}, %{}, %{}]}} = shape_req(req, ctx.opts, subset: %{})
+
+      assert {_, 200, %{"data" => [%{}, %{}]}} =
+               shape_req(req, opts, subset: %{where: "value IN ('a', 'b')"})
+
+      assert {_, 200, %{"data" => [%{}]}} =
+               shape_req(req, opts, subset: %{where: "value = 'a'"})
+
+      assert {_, 200,
+              %{"data" => [%{"value" => %{"value" => "b"}}, %{"value" => %{"value" => "c"}}]}} =
+               shape_req(req, opts, subset: %{limit: 2, offset: 1, order_by: "value"})
+    end
+
+    # A client sends `where_expr` and `order_by_expr` next to the fields they compile to. The
+    # subset ignores both, so one named in the URL and in the body is no conflict.
+    for field <- ~w(where_expr order_by_expr) do
+      @tag with_sql: [
+             "INSERT INTO items VALUES (gen_random_uuid(), 'a')",
+             "INSERT INTO items VALUES (gen_random_uuid(), 'b')"
+           ]
+      test "a POST may name subset #{field} in both the URL and the body", ctx do
+        conn =
+          conn(
+            "POST",
+            "/v1/shape?table=items&offset=-1&log=changes_only&subset__#{unquote(field)}=x",
+            Jason.encode!(%{"where" => "value = 'b'", unquote(field) => "y"})
+          )
+          |> Plug.Conn.put_req_header("content-type", "application/json")
+          |> Router.call(ctx.opts)
+
+        assert {200, %{"data" => [%{"value" => %{"value" => "b"}}]}} =
+                 {conn.status, Jason.decode!(conn.resp_body)}
+      end
     end
 
     @tag with_sql: [
@@ -4028,7 +4697,10 @@ defmodule Electric.Plug.RouterTest do
     setup(ctx, do: %{opts: Router.init(build_router_opts(ctx))})
 
     setup(ctx) do
-      :ok = Electric.StatusMonitor.wait_until_active(ctx.stack_id, timeout: 1000)
+      :ok =
+        Electric.StatusMonitor.wait_until_active(ctx.stack_id,
+          timeout: ExUnit.configuration()[:assert_receive_timeout]
+        )
 
       %{
         api_opts:
@@ -4080,6 +4752,46 @@ defmodule Electric.Plug.RouterTest do
       assert %{status: 400} =
                Router.call(
                  conn("GET", "/v1/shape?secret=#{secret}"),
+                 Keyword.merge([secret: secret], api_opts)
+               )
+    end
+
+    test "accepts the secret in the authorization header for /v1/shape and its subpaths", %{
+      secret: secret,
+      api_opts: api_opts
+    } do
+      opts = Keyword.merge([secret: secret], api_opts)
+
+      for path <- ["/v1/shape", "/v1/shape/"] do
+        assert %{status: 400} =
+                 Router.call(
+                   conn("GET", path)
+                   |> Plug.Conn.put_req_header("authorization", "Bearer #{secret}"),
+                   opts
+                 ),
+               "expected 400 (authenticated) for GET #{path} with a bearer secret"
+      end
+
+      assert %{status: 401} = Router.call(conn("GET", "/v1/shape/multiplex"), opts)
+
+      assert %{status: status} =
+               Router.call(
+                 conn("GET", "/v1/shape/multiplex")
+                 |> Plug.Conn.put_req_header("authorization", "Bearer #{secret}"),
+                 opts
+               )
+
+      assert status != 401, "expected the multiplex socket route to pass the bearer secret"
+    end
+
+    test "refuses a wrong bearer secret on /v1/shape even with the right secret in the query", %{
+      secret: secret,
+      api_opts: api_opts
+    } do
+      assert %{status: 401} =
+               Router.call(
+                 conn("GET", "/v1/shape?secret=#{secret}")
+                 |> Plug.Conn.put_req_header("authorization", "Bearer wrong_secret"),
                  Keyword.merge([secret: secret], api_opts)
                )
     end
@@ -4141,6 +4853,19 @@ defmodule Electric.Plug.RouterTest do
 
   defp get_resp_shape_handle(conn), do: get_resp_header(conn, "electric-handle")
   defp get_resp_last_offset(conn), do: get_resp_header(conn, "electric-offset")
+
+  defp localized_shape_params(extra) do
+    Map.merge(
+      %{
+        table: ~S|"Assessment"|,
+        offset: "-1",
+        columns: ~S|"id","resultLabel"|,
+        locale: "NL",
+        localized_columns: ~S|"resultLabel"|
+      },
+      extra
+    )
+  end
 
   defp get_resp_header(conn, header) do
     assert [val] = Plug.Conn.get_resp_header(conn, header)

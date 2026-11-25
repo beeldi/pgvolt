@@ -269,6 +269,20 @@ defmodule Electric.Shapes.Consumer.InitialSnapshotTest do
       %{shape_storage: shape_storage}
     end
 
+    test "keeps a full-width transaction from a future epoch after a quiet initial snapshot", %{
+      shape_storage: storage
+    } do
+      state = InitialSnapshot.new(%{xmin: 100, xmax: 200, xip_list: []})
+
+      fragment = %Electric.Replication.Changes.TransactionFragment{
+        xid: 150,
+        full_xid: 4_294_967_446
+      }
+
+      assert {:continue, state} = InitialSnapshot.filter(state, storage, fragment)
+      refute state.filtering?
+    end
+
     test "returns :consider_flushed for transactions visible in snapshot", %{
       shape_storage: storage
     } do

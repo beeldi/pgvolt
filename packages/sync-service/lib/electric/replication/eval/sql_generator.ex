@@ -17,7 +17,43 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   """
 
   alias Electric.Replication.Eval.Parser.{Const, Ref, Func, Array, RowExpr}
+  alias Electric.Replication.Eval.Walker
   alias Electric.Replication.PostgresInterop.Casting
+  alias Electric.Utils
+
+  def validate_collation(ast) do
+    case Walker.reduce(ast, &validate_conditional/3, nil) do
+      {:ok, nil} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp validate_conditional(%Func{name: name, type: {:array, _}}, nil, _)
+       when name in ~w(greatest least) do
+    {:error, "#{String.upcase(name)} on arrays is unsupported in a shape with subqueries"}
+  end
+
+  defp validate_conditional(
+         %Func{name: name, type: type, args: [%Array{elements: args}]},
+         nil,
+         _
+       )
+       when name in ~w(coalesce greatest least) do
+    if collatable?(type) and not Enum.any?(args, &byte_collated?/1) do
+      {:error, "#{String.upcase(name)} on text requires COLLATE C or POSIX on an argument"}
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp validate_conditional(_, nil, _), do: {:ok, nil}
+
+  defp collatable?({:array, type}), do: collatable?(type)
+  defp collatable?(type), do: type in [:text, :varchar, :bpchar, :name]
+
+  defp byte_collated?(%Ref{collation: collation}), do: collation in ["C", "POSIX"]
+  defp byte_collated?(%Func{name: name}), do: name in ["COLLATE C", "COLLATE POSIX"]
+  defp byte_collated?(_), do: false
 
   # PostgreSQL operator precedence (higher number = tighter binding)
   # See: https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE
@@ -31,6 +67,7 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   @prec_addition 80
   @prec_multiplication 90
   @prec_exponent 100
+  @prec_collate 105
   @prec_unary 110
   @prec_cast 130
   @prec_atom 1000
@@ -218,9 +255,10 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   defp to_sql_prec(%Func{name: "\"&&\"", args: [left, right]}),
     do: binary_op(left, "&&", right, @prec_other_op)
 
-  # Variadic concat — parser stores arguments as a single Array (see Parser.from_concrete/2).
-  defp to_sql_prec(%Func{name: "concat", args: [%Array{elements: elements}]}),
-    do: {"concat(#{Enum.map_join(elements, ", ", &to_sql/1)})", @prec_atom}
+  # The parser packs variadic arguments into a single Array.
+  defp to_sql_prec(%Func{name: name, args: [%Array{elements: elements}]})
+       when name in ~w(coalesce concat greatest least),
+       do: {"#{name}(#{Enum.map_join(elements, ", ", &to_sql/1)})", @prec_atom}
 
   # Named functions (lower, upper, like, ilike, array_*, justify_*, timezone, casts, etc.)
   # These are Func nodes where the name is a plain identifier (no quotes around operators)
@@ -231,6 +269,9 @@ defmodule Electric.Replication.Eval.SqlGenerator do
     arg_list = Enum.map_join(args, ", ", &to_sql/1)
     {"#{name}(#{arg_list})", @prec_atom}
   end
+
+  defp to_sql_prec(%Func{name: "COLLATE " <> collation, args: [arg]}),
+    do: collate(arg, collation)
 
   # Type cast functions (e.g., "int4_to_bool", "text_to_int4")
   defp to_sql_prec(%Func{name: name, args: [arg]}) when is_binary(name) do
@@ -246,8 +287,11 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   end
 
   # Column references
+  defp to_sql_prec(%Ref{collation: collation} = ref) when is_binary(collation),
+    do: collate(%{ref | collation: nil}, collation)
+
   defp to_sql_prec(%Ref{path: path}) do
-    {Enum.map_join(path, ".", &~s|"#{&1}"|), @prec_atom}
+    {Enum.map_join(path, ".", &Utils.quote_name/1), @prec_atom}
   end
 
   # Constants
@@ -259,15 +303,20 @@ defmodule Electric.Replication.Eval.SqlGenerator do
     {uuid_literal(value), @prec_atom}
   end
 
+  # Postgres cannot type an empty `ARRAY[]` on its own ("cannot determine type
+  # of empty array"), so a constant-folded empty array keeps its element type.
+  defp to_sql_prec(%Const{type: {:array, type}, value: []})
+       when is_atom(type) and type != :unknown do
+    {"ARRAY[]::#{type}[]", @prec_atom}
+  end
+
   defp to_sql_prec(%Const{type: {:array, type}, value: value}) when is_list(value) do
     elements = Enum.map_join(value, ", ", &const_list_element_to_sql(&1, type))
     {"ARRAY[#{elements}]", @prec_atom}
   end
 
-  defp to_sql_prec(%Const{value: value}) when is_binary(value) do
-    escaped = String.replace(value, "'", "''")
-    {"'#{escaped}'", @prec_atom}
-  end
+  defp to_sql_prec(%Const{value: value}) when is_binary(value),
+    do: {string_literal(value), @prec_atom}
 
   defp to_sql_prec(%Const{value: value}) when is_integer(value) or is_float(value),
     do: {"#{value}", @prec_atom}
@@ -315,6 +364,9 @@ defmodule Electric.Replication.Eval.SqlGenerator do
 
   # --- Precedence helpers ---
 
+  defp collate(arg, collation),
+    do: postfix_op(arg, "COLLATE pg_catalog." <> Utils.quote_name(collation), @prec_collate)
+
   # Binary operator, left-associative: left child at prec, right child at prec+1
   defp binary_op(left, op, right, prec) do
     {"#{wrap(left, prec)} #{op} #{wrap(right, prec + 1)}", prec}
@@ -349,10 +401,7 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   defp const_list_element_to_sql(true), do: "true"
   defp const_list_element_to_sql(false), do: "false"
 
-  defp const_list_element_to_sql(value) when is_binary(value) do
-    escaped = String.replace(value, "'", "''")
-    "'#{escaped}'"
-  end
+  defp const_list_element_to_sql(value) when is_binary(value), do: string_literal(value)
 
   defp const_list_element_to_sql(value) when is_integer(value) or is_float(value),
     do: "#{value}"
@@ -373,6 +422,17 @@ defmodule Electric.Replication.Eval.SqlGenerator do
   defp const_list_element_to_sql(value, _type), do: const_list_element_to_sql(value)
 
   defp uuid_literal(value), do: "'#{Casting.uuid_to_string(value)}'::uuid"
+
+  defp string_literal(value) do
+    quotes_escaped = String.replace(value, "'", "''")
+
+    # A plain literal reads a backslash as an escape unless `standard_conforming_strings` is on,
+    # which is a database setting Electric does not own.
+    case String.contains?(value, "\\") do
+      true -> "E'" <> String.replace(quotes_escaped, "\\", "\\\\") <> "'"
+      false -> "'" <> quotes_escaped <> "'"
+    end
+  end
 
   # Helper for ANY/ALL: extract the operator, left operand, and array right operand
   # from a Func with map_over_array_in_pos set

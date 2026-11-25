@@ -7,7 +7,22 @@ defmodule Electric.ShapeCache.Storage do
   alias Electric.Replication.LogOffset
 
   defmodule Error do
-    defexception [:message]
+    @moduledoc """
+    A storage failure, carrying whether the bytes or the system is at fault.
+
+    `:data_loss` means this shape's files cannot be trusted and never will be again --
+    discarding the shape and rebuilding it from Postgres is the repair. `:transient` means the
+    machine could not complete the operation right now: out of file descriptors, out of space,
+    a read that failed. Those recover on their own and rebuilding is the worst possible
+    response, because a rebuild costs more of exactly the resource that ran out, on every shape
+    at once.
+
+    The default is `:transient`, so an error nobody classified can never cost a shape.
+    """
+    defexception [:message, kind: :transient]
+
+    @type kind :: :data_loss | :transient
+    @type t :: %__MODULE__{message: String.t(), kind: kind()}
   end
 
   @type shape_handle :: Electric.shape_handle()
@@ -55,6 +70,13 @@ defmodule Electric.ShapeCache.Storage do
 
   @doc "Prepare the in-process writer state, returning an accumulator."
   @callback init_writer!(shape_opts(), shape_definition :: Shape.t()) :: writer_state()
+
+  @doc """
+  `init_writer!/2` for a shape restored from the catalog, whose storage was created with it. An
+  implementation that can tell refuses storage that is not there, rather than create it anew.
+  """
+  @callback init_restored_writer!(shape_opts(), shape_definition :: Shape.t()) :: writer_state()
+  @optional_callbacks init_restored_writer!: 2
 
   @doc "Retrieve all stored shape handles"
   @callback get_all_stored_shape_handles(compiled_opts()) ::
@@ -113,12 +135,12 @@ defmodule Electric.ShapeCache.Storage do
   the snapshot to match usage of `get_log_stream/3`
 
   An optional `skip_row?` predicate can filter rows during splicing: it receives
-  `(key, tags)` and returns `true` if the row should be skipped.
+  `(key, tags, json)` and returns `true` if the row should be skipped.
   """
   @callback append_move_in_snapshot_to_log!(
               name :: String.t(),
               writer_state(),
-              skip_row? :: (String.t(), [String.t()] -> boolean())
+              skip_row? :: (String.t(), [String.t()], binary() -> boolean())
             ) ::
               {inserted_range :: {LogOffset.t(), LogOffset.t()}, writer_state()} | no_return()
 
@@ -296,6 +318,13 @@ defmodule Electric.ShapeCache.Storage do
   end
 
   @impl __MODULE__
+  def init_restored_writer!({mod, shape_opts}, shape_definition) do
+    if Code.ensure_loaded?(mod) and function_exported?(mod, :init_restored_writer!, 2),
+      do: {mod, mod.init_restored_writer!(shape_opts, shape_definition)},
+      else: init_writer!({mod, shape_opts}, shape_definition)
+  end
+
+  @impl __MODULE__
   def get_all_stored_shape_handles({mod, opts}) do
     mod.get_all_stored_shape_handles(opts)
   end
@@ -344,7 +373,7 @@ defmodule Electric.ShapeCache.Storage do
   def append_move_in_snapshot_to_log!(
         name,
         {mod, writer_state},
-        skip_row? \\ fn _, _ -> false end
+        skip_row? \\ fn _, _, _ -> false end
       ) do
     {inserted_range, new_writer_state} =
       mod.append_move_in_snapshot_to_log!(name, writer_state, skip_row?)

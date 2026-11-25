@@ -89,6 +89,7 @@ cache_stale_age = env!("ELECTRIC_CACHE_STALE_AGE", :integer, nil)
 statsd_host = env!("ELECTRIC_STATSD_HOST", :string?, nil)
 
 chunk_bytes_threshold = env!("ELECTRIC_SHAPE_CHUNK_BYTES_THRESHOLD", :integer, nil)
+compaction_period = env!("ELECTRIC_COMPACTION_PERIOD", :integer, nil)
 
 storage_dir = env!("ELECTRIC_STORAGE_DIR", :string, "./persistent")
 
@@ -169,6 +170,14 @@ shape_suspend_after =
 flush_stall_grace_period =
   env!("ELECTRIC_FLUSH_STALL_GRACE_PERIOD", &Electric.Config.parse_human_readable_time!/1, nil)
 
+flush_stall_boot_grace =
+  env!("ELECTRIC_FLUSH_STALL_BOOT_GRACE", &Electric.Config.parse_human_readable_time!/1, nil)
+
+flush_deferral_round_limit = env!("ELECTRIC_FLUSH_DEFERRAL_ROUND_LIMIT", :integer, nil)
+
+gather_stall_timeout =
+  env!("ELECTRIC_GATHER_STALL_TIMEOUT", &Electric.Config.parse_human_readable_time!/1, nil)
+
 system_metrics_poll_interval =
   env!(
     "ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL",
@@ -190,12 +199,23 @@ stack_telemetry_init_delay =
     nil
   )
 
+# 0 turns the storage directory walk, and with it the storage-used metric, off.
+disk_usage_scan_period =
+  env!(
+    "ELECTRIC_DISK_USAGE_SCAN_PERIOD",
+    fn
+      "0" -> 0
+      str -> Electric.Config.parse_human_readable_time!(str)
+    end,
+    nil
+  )
+
 # The provided database id is relevant if you had used v0.8 and want to keep the storage
 # instead of having hanging files. We use a provided value as stack id, but nothing else.
 provided_database_id = env!("ELECTRIC_DATABASE_ID", :string, nil)
 
 # Handle authentication configuration
-insecure = env!("ELECTRIC_INSECURE", :boolean, false)
+insecure = env!("ELECTRIC_INSECURE", &Electric.Config.parse_insecure!/1, false)
 secret = env!("ELECTRIC_SECRET", :string, nil)
 
 if config_env() != :test do
@@ -217,6 +237,7 @@ config :electric,
   cache_max_age: cache_max_age,
   cache_stale_age: cache_stale_age,
   chunk_bytes_threshold: chunk_bytes_threshold,
+  compaction_period: compaction_period,
   max_shapes:
     env!("ELECTRIC_MAX_SHAPES", :integer, nil) ||
       env!("ELECTRIC_EXPERIMENTAL_MAX_SHAPES", :integer, nil),
@@ -227,8 +248,15 @@ config :electric,
   instance_id: instance_id,
   system_metrics_poll_interval: system_metrics_poll_interval,
   stack_telemetry_init_delay: stack_telemetry_init_delay,
+  disk_usage_scan_period: disk_usage_scan_period,
   otel_export_period: otel_export_period,
   otel_sampling_ratio: env!("ELECTRIC_OTEL_SAMPLING_RATIO", :float, nil),
+  otel_trusted_sample_rates:
+    env!(
+      "ELECTRIC_OTEL_TRUSTED_SAMPLE_RATES",
+      &Electric.Config.parse_otel_trusted_sample_rates!/1,
+      nil
+    ),
   metrics_sampling_ratio: env!("ELECTRIC_METRICS_SAMPLING_RATIO", :float, nil),
   drop_empty_response_spans?: env!("ELECTRIC_DROP_EMPTY_RESPONSE_SPANS", :boolean, nil),
   telemetry_top_process_limit:
@@ -253,9 +281,23 @@ config :electric,
   telemetry_long_message_queue_disable_threshold:
     env!("ELECTRIC_TELEMETRY_LONG_MESSAGE_QUEUE_DISABLE_THRESHOLD", :integer, nil),
   telemetry_statsd_host: statsd_host,
+  telemetry_redact_request_values?:
+    env!("ELECTRIC_TELEMETRY_REDACT_REQUEST_VALUES", :boolean, nil),
   prometheus_port: prometheus_port,
   live_dashboard_port: live_dashboard_port,
   db_pool_size: env!("ELECTRIC_DB_POOL_SIZE", :integer, nil),
+  router_shards: env!("ELECTRIC_ROUTER_SHARDS", :integer, nil),
+  replication_pipeline_window: env!("ELECTRIC_REPLICATION_PIPELINE_WINDOW", :integer, nil),
+  shared_conversion: env!("ELECTRIC_SHARED_CONVERSION", :boolean, nil),
+  shared_payload_arena: env!("ELECTRIC_SHARED_PAYLOAD_ARENA", :boolean, nil),
+  payload_arena_reclaim_min_bytes:
+    env!("ELECTRIC_PAYLOAD_ARENA_RECLAIM_MIN_BYTES", :integer, nil),
+  worker_prepare: env!("ELECTRIC_WORKER_PREPARE", :boolean, nil),
+  shared_fragment_blocks: env!("ELECTRIC_SHARED_FRAGMENT_BLOCKS", :boolean, nil),
+  ack_after_journal: env!("ELECTRIC_ACK_AFTER_JOURNAL", :boolean, nil),
+  keep_shapes_on_promotion: env!("ELECTRIC_KEEP_SHAPES_ON_PROMOTION", :boolean, nil),
+  ingest_priority_high: env!("ELECTRIC_INGEST_PRIORITY_HIGH", :boolean, nil),
+  filter_routing_memo: env!("ELECTRIC_FILTER_ROUTING_MEMO", :boolean, nil),
   db_tcp_keepalive_idle:
     env!(
       "ELECTRIC_DATABASE_TCP_KEEPALIVE_IDLE",
@@ -286,10 +328,16 @@ config :electric,
   service_port: env!("ELECTRIC_PORT", :integer, nil),
   subquery_buffer_max_transactions:
     env!("ELECTRIC_SUBQUERY_BUFFER_MAX_TRANSACTIONS", :integer, nil),
+  subset_max_rows:
+    env!("ELECTRIC_SUBSET_MAX_ROWS", &Electric.Config.parse_subset_max_rows!/1, nil),
+  txn_buffer_max_changes: env!("ELECTRIC_TXN_BUFFER_MAX_CHANGES", :integer, nil),
   shape_hibernate_after: shape_hibernate_after,
   shape_enable_suspend?: shape_enable_suspend?,
   shape_suspend_after: shape_suspend_after,
   flush_stall_grace_period: flush_stall_grace_period,
+  flush_stall_boot_grace: flush_stall_boot_grace,
+  flush_deferral_round_limit: flush_deferral_round_limit,
+  gather_stall_timeout: gather_stall_timeout,
   storage_dir: storage_dir,
   storage: storage_spec,
   cleanup_interval_ms:
@@ -308,9 +356,17 @@ config :electric,
   process_spawn_opts:
     env!("ELECTRIC_PROCESS_SPAWN_OPTS", &Electric.Config.parse_spawn_opts!/1, %{}),
   consumer_gc_heap_threshold: env!("ELECTRIC_CONSUMER_GC_HEAP_THRESHOLD", :integer, nil),
+  stalled_serve_timeout: env!("ELECTRIC_STALLED_SERVE_TIMEOUT", :integer, nil),
   http_api_num_acceptors: env!("ELECTRIC_TWEAKS_HTTP_API_NUM_ACCEPTORS", :integer, 100),
   conn_max_requests: env!("ELECTRIC_TWEAKS_CONN_MAX_REQUESTS", :integer, nil),
+  max_request_line_length: env!("ELECTRIC_TWEAKS_MAX_REQUEST_LINE_LENGTH", :integer, nil),
   handler_fullsweep_after: env!("ELECTRIC_TWEAKS_HANDLER_FULLSWEEP_AFTER", :integer, nil),
+  http2_max_reset_stream_rate:
+    env!(
+      "ELECTRIC_TWEAKS_HTTP2_MAX_RESET_STREAM_RATE",
+      &Electric.Config.parse_http2_max_reset_stream_rate!/1,
+      nil
+    ),
   tcp_send_timeout:
     env!("ELECTRIC_TCP_SEND_TIMEOUT", &Electric.Config.parse_human_readable_time!/1, nil),
   tcp_read_timeout:
@@ -335,11 +391,23 @@ config :electric,
       &Electric.Config.parse_human_readable_time!/1,
       nil
     ),
+  replication_heartbeat_interval:
+    env!(
+      "ELECTRIC_REPLICATION_HEARTBEAT_INTERVAL",
+      &Electric.Config.parse_human_readable_time!/1,
+      nil
+    ),
   shape_db_exclusive_mode: env!("ELECTRIC_SHAPE_DB_EXCLUSIVE_MODE", :boolean, false),
   shape_db_storage_dir: env!("ELECTRIC_SHAPE_DB_STORAGE_DIR", :string, nil),
   shape_db_synchronous: env!("ELECTRIC_SHAPE_DB_SYNCHRONOUS", :string, nil),
   shape_db_cache_size:
     env!("ELECTRIC_SHAPE_DB_CACHE_SIZE", &Electric.Config.parse_human_readable_size!/1, nil),
+  shape_db_boot_read_timeout:
+    env!(
+      "ELECTRIC_SHAPE_DB_BOOT_READ_TIMEOUT",
+      &Electric.Config.parse_human_readable_time!/1,
+      nil
+    ),
   exclude_spans:
     env!("ELECTRIC_EXCLUDE_SPANS", &Electric.Config.parse_comma_separated_set!/1, nil)
 
@@ -350,7 +418,8 @@ if Electric.telemetry_enabled?() do
 
   config :sentry,
     environment_name: config_env(),
-    client: Electric.Telemetry.SentryReqHTTPClient
+    client: Electric.Telemetry.SentryReqHTTPClient,
+    before_send: {Electric.Telemetry.Sentry, :scrub_request_credentials}
 
   if sentry_dsn = env!("SENTRY_DSN", :string, nil) do
     config :sentry, dsn: sentry_dsn
@@ -440,14 +509,16 @@ end
 # Phoenix LiveDashboard Endpoint Configuration
 #
 # WARNING: The dashboard is completely unauthenticated and exposes internal
-# system state (VM metrics, process info, ETS tables, etc.). In production,
-# ensure the dashboard port is firewalled or otherwise restricted to trusted
-# networks only.
+# system state (VM metrics, process info, ETS tables, etc.). It binds to loopback
+# by default so enabling it never publishes that state on a public interface by
+# accident. Set ELECTRIC_LIVE_DASHBOARD_ADDRESS to bind elsewhere only once the
+# port is firewalled or otherwise restricted to trusted networks.
 if live_dashboard_port do
   dashboard_ip =
-    if env!("ELECTRIC_LISTEN_ON_IPV6", :boolean, false),
-      do: {0, 0, 0, 0, 0, 0, 0, 0},
-      else: {0, 0, 0, 0}
+    Electric.Config.parse_dashboard_listen_address!(
+      env!("ELECTRIC_LIVE_DASHBOARD_ADDRESS", :string, nil),
+      env!("ELECTRIC_LISTEN_ON_IPV6", :boolean, false)
+    )
 
   config :electric, Electric.LiveDashboard.Endpoint,
     adapter: Bandit.PhoenixAdapter,

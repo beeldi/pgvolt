@@ -26,8 +26,6 @@ const globalChangePatterns = [
 ]
 
 const packagesThatNeedSharedSyncService = new Set([
-  `packages/experimental`,
-  `packages/react-hooks`,
   `packages/typescript-client`,
 ])
 
@@ -45,7 +43,6 @@ const packagesWithSharedSyncService = packageDirectories.filter((directory) =>
 const packagesWithoutSharedSyncService = packageDirectories.filter(
   (directory) => !packagesThatNeedSharedSyncService.has(directory)
 )
-const exampleDirectories = directoriesFor(affectedWorkspaces, isExample)
 
 const outputs = {
   package_directories: JSON.stringify(packageDirectories),
@@ -55,7 +52,6 @@ const outputs = {
   packages_without_shared_sync_service: JSON.stringify(
     packagesWithoutSharedSyncService
   ),
-  example_directories: JSON.stringify(exampleDirectories),
   has_packages: String(packageDirectories.length > 0),
   has_shared_sync_service_packages: String(
     packagesWithSharedSyncService.length > 0
@@ -63,7 +59,6 @@ const outputs = {
   has_non_shared_sync_service_packages: String(
     packagesWithoutSharedSyncService.length > 0
   ),
-  has_examples: String(exampleDirectories.length > 0),
 }
 
 writeOutputs(outputs)
@@ -129,13 +124,6 @@ function isTsPackage(workspace) {
   return (
     workspace.relativePath.startsWith(`packages/`) &&
     existsSync(`${workspace.path}/tsconfig.json`)
-  )
-}
-
-function isExample(workspace) {
-  return (
-    workspace.relativePath.startsWith(`examples/`) &&
-    existsSync(`${workspace.path}/package.json`)
   )
 }
 

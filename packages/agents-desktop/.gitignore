@@ -1,8 +1,0 @@
-node_modules
-build
-build-mac-icon
-dist
-release
-logs
-*.log
-.DS_Store

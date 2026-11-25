@@ -84,6 +84,15 @@ defmodule Electric.Postgres.Xid do
       iex> is_lt(#{@uint64_xid + 1}, 1)
       true
 
+      An xid8 and the bare 32-bit xid of the same transaction differ by a whole number of epochs,
+      which is the one difference that must not read as a wraparound:
+
+      iex> is_lt(#{@uint64_xid}, #{@uint32_half_max})
+      false
+
+      iex> is_lt(#{@uint32_half_max}, #{@uint64_xid})
+      false
+
       # When both numbers are 64-bit, regular comparison rules apply:
 
       iex> is_lt(#{@uint64_xid + 2}, #{@uint64_xid + 1})
@@ -99,21 +108,11 @@ defmodule Electric.Postgres.Xid do
   #     return signed_diff < 0;
   #
   defguard is_lt(xid_l, xid_r)
-           # Both are 64-bit XIDs - use regular comparison
-           # At least one is 32-bit - use modulo-2^32 comparison
-           # Case 1: xid_l >= xid_r (difference is non-negative)
-           # The unsigned 32-bit difference is >= 2^31, meaning wraparound makes xid_l < xid_r
-           # Case 2: xid_l < xid_r (difference is negative)
-           # rem() returns a negative value, so we add 2^32 to get the unsigned result
-           # Then check if it's >= 2^31 (values 0x80000000-0xFFFFFFFF represent negative signed ints)
            when (not uint32?(xid_l) and not uint32?(xid_r) and xid_l > 0 and xid_r > 0 and
                    xid_l < xid_r) or
                   ((uint32?(xid_l) or uint32?(xid_r)) and xid_l > 0 and xid_r > 0 and
-                     ((xid_l - xid_r >= 0 and
-                         rem(xid_l - xid_r, @uint32_max + 1) >= @uint32_half_max) or
-                        (xid_l - xid_r < 0 and
-                           rem(xid_l - xid_r, @uint32_max + 1) + @uint32_max + 1 >=
-                             @uint32_half_max)))
+                     rem(rem(xid_l - xid_r, @uint32_max + 1) + @uint32_max + 1, @uint32_max + 1) >=
+                       @uint32_half_max)
 
   @doc """
   Guard function to check if xid_l == xid_r using the same wraparound logic as compare/2.
@@ -151,6 +150,9 @@ defmodule Electric.Postgres.Xid do
 
       iex> is_eq(#{@uint64_xid}, 1)
       false
+
+      iex> is_eq(#{@uint64_xid}, #{@uint32_half_max})
+      true
 
       # When both numbers are 64-bit, regular comparison rules apply:
 
@@ -249,6 +251,9 @@ defmodule Electric.Postgres.Xid do
 
   iex> compare(#{@uint64_xid + 1}, 1)
   :lt
+
+  iex> compare(#{@uint64_xid}, #{@uint32_half_max})
+  :eq
 
   # When both numbers are 64-bit, regular comparison rules apply:
 

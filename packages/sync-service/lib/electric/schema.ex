@@ -77,7 +77,16 @@ defmodule Electric.Schema do
     Map.put(schema, :pk_index, idx)
   end
 
-  defp add_nullability(schema, %{not_null: true}), do: Map.put(schema, :not_null, true)
+  # Postgres never reports nullability over logical replication and a client latches this schema
+  # from its first response, so a `not_null` advertised for a column an ordinary migration can
+  # relax outlives the fact it described: after `ALTER COLUMN … DROP NOT NULL` every already-synced
+  # client rejects the first NULL row it is served and that table stops syncing until its shape is
+  # rebuilt. A primary-key column cannot be relaxed without dropping the key, so that is the one
+  # place the claim survives ordinary migrations.
+  defp add_nullability(schema, %{not_null: true, pk_position: pk_position})
+       when not is_nil(pk_position),
+       do: Map.put(schema, :not_null, true)
+
   defp add_nullability(schema, _), do: schema
 
   defp add_modifier(%{type: type} = schema, %{type_mod: type_mod})

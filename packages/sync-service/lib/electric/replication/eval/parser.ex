@@ -34,7 +34,7 @@ defmodule Electric.Replication.Eval.Parser do
   end
 
   defmodule Ref do
-    defstruct [:path, :type, location: 0]
+    defstruct [:path, :type, :collation, location: 0]
 
     defimpl Inspect do
       import Inspect.Algebra
@@ -99,6 +99,52 @@ defmodule Electric.Replication.Eval.Parser do
       def comparable(%Func{} = func),
         do: %{func | location: 0, args: Enum.map(func.args, &Comparable.comparable/1)}
     end
+
+    @doc """
+    Apply a function to already-evaluated arguments.
+
+    Shared by the parser's constant folding and the runner so the two cannot answer the same
+    call differently -- they did, and both were wrong the same way.
+
+    `strict?` is checked per element in the array-mapped case, not once over the whole array.
+    The array itself is not nil, so a caller's own strictness check passes and every element
+    reaches the operator, nils included -- and a strict operator must answer unknown for those
+    rather than compare them.
+    """
+    @spec apply_to(%__MODULE__{}, [term()]) :: term()
+    def apply_to(func, args)
+
+    def apply_to(%__MODULE__{map_over_array_in_pos: nil} = func, args),
+      do: invoke(func.implementation, args)
+
+    def apply_to(%__MODULE__{map_over_array_in_pos: pos} = func, args) do
+      apply_to_element = &invoke(func.implementation, List.replace_at(args, pos, &1))
+
+      mapper =
+        case func.strict? do
+          true ->
+            fn
+              nil -> nil
+              element -> apply_to_element.(element)
+            end
+
+          false ->
+            apply_to_element
+        end
+
+      case Enum.at(args, pos) do
+        # A cast keeps an array's lower bounds, and `ANY`/`ALL` read only its elements.
+        %PgInterop.Array.Bounded{elements: elements} = array ->
+          %{array | elements: Electric.Utils.deep_map(elements, mapper)}
+
+        array ->
+          Electric.Utils.deep_map(array, mapper)
+      end
+    end
+
+    defp invoke({module, fun}, args), do: apply(module, fun, args)
+    defp invoke({module, fun, extra_args}, args), do: apply(module, fun, args ++ extra_args)
+    defp invoke(fun, args), do: apply(fun, args)
   end
 
   @valid_types (Electric.Postgres.supported_types() ++
@@ -108,7 +154,10 @@ defmodule Electric.Replication.Eval.Parser do
   @type tree_part :: %Const{} | %Ref{} | %Func{} | %Array{}
   @type refs_map :: %{optional([String.t(), ...]) => Env.pg_type()}
   @type parse_opt ::
-          {:env, Env.t()} | {:refs, refs_map()} | {:params, %{String.t() => String.t()}}
+          {:env, Env.t()}
+          | {:refs, refs_map()}
+          | {:params, %{String.t() => String.t()}}
+          | {:max_depth, pos_integer() | :infinity}
 
   @prefix_length String.length("SELECT 1 WHERE ")
 
@@ -307,7 +356,38 @@ defmodule Electric.Replication.Eval.Parser do
   def parse_query(query) when is_binary(query), do: get_where_internal_ast(query)
   def parse_query(ast) when is_map(ast), do: {:ok, ast}
 
+  # The clause is turned back into SQL by libpg_query (`rebuild_query_with_substituted_parts/2`),
+  # which recurses on the C stack of the scheduler thread running it, one frame per level, and
+  # checks no depth of its own. This limit keeps that recursion well inside the stack; no
+  # hand-written clause comes near it. Every field is walked, the body of a subquery included,
+  # since the deparser descends into all of them.
+  #
+  # `max_depth: :infinity` is for the text of a clause a shape was created with, read again: it was
+  # turned back into SQL once already, so the limit would only refuse a shape created before it.
+  @max_expression_depth 100
+
   def validate_where_ast(ast, opts) do
+    max_depth = Keyword.get(opts, :max_depth, @max_expression_depth)
+
+    if max_depth == :infinity or nested_within?(ast, max_depth) do
+      validate_shallow_where_ast(ast, opts)
+    else
+      {:error, "the where clause nests deeper than #{max_depth} levels"}
+    end
+  end
+
+  defp nested_within?(%PgQuery.Node{node: {_kind, inner}}, budget),
+    do: budget > 0 and nested_within?(inner, budget - 1)
+
+  defp nested_within?(%_{} = node, budget),
+    do: node |> Map.from_struct() |> Map.values() |> nested_within?(budget)
+
+  defp nested_within?(list, budget) when is_list(list),
+    do: Enum.all?(list, &nested_within?(&1, budget))
+
+  defp nested_within?(_value, _budget), do: true
+
+  defp validate_shallow_where_ast(ast, opts) do
     params = Keyword.get(opts, :params, %{})
     refs = Keyword.get(opts, :refs, %{})
     env = Keyword.get(opts, :env, Env.new())
@@ -316,21 +396,52 @@ defmodule Electric.Replication.Eval.Parser do
       {:ok, value, computed_params} ->
         sublink_queries = Keyword.get(opts, :sublink_queries, %{})
 
-        updated_query =
+        {updated_query, qualified_sql} =
           rebuild_query_with_substituted_parts(ast, {params, computed_params, sublink_queries})
 
-        {:ok,
-         %Expr{
-           query: updated_query,
-           eval: value,
-           returns: value.type,
-           used_refs: find_refs(value)
-         }}
+        used_refs = find_refs(value)
+
+        with :ok <- validate_refs_castable(used_refs, env) do
+          {:ok,
+           %Expr{
+             query: updated_query,
+             qualified_sql: qualified_sql,
+             eval: value,
+             returns: value.type,
+             used_refs: used_refs
+           }}
+        end
 
       {:error, {loc, reason}} ->
         {:error, "At location #{max(loc - @prefix_length, 0)}: #{reason}"}
     end
   end
+
+  # Every reference to a column of the filtered row is cast from its replication-stream text
+  # before the expression runs, and one uncastable reference fails that cast for the whole
+  # expression. Routing reads the failure as a match and the consumer-side evaluation reads it
+  # as a non-match, so the shape would keep serving a snapshot that no live change can ever
+  # update. Refuse the filter instead — the same class as the json/jsonb and bytea drops, closed
+  # at the only point where it is still visible to whoever wrote the filter.
+  defp validate_refs_castable(used_refs, env) do
+    used_refs
+    |> Env.uncastable_refs(env)
+    |> case do
+      [] ->
+        :ok
+
+      uncastable ->
+        {:error,
+         "Cannot filter on " <>
+           Enum.map_join(uncastable, ", ", fn {[column], type} ->
+             ~s|"#{column}" of type #{readable_type(type)}|
+           end) <> ": Electric cannot parse values of that type from the replication stream"}
+    end
+  end
+
+  defp readable_type({:array, subtype}), do: "#{readable_type(subtype)}[]"
+  defp readable_type({:enum, name}), do: to_string(name)
+  defp readable_type(type), do: to_string(type)
 
   @doc """
   Parses and validates a WHERE clause in PostgreSQL SQL syntax.
@@ -952,6 +1063,19 @@ defmodule Electric.Replication.Eval.Parser do
     end
   end
 
+  # A type modifier changes the value a cast returns: `'abc'::varchar(2)` is `ab`,
+  # `'03:04:05.6'::time(0)` is `03:04:06`, `interval '1 day 2 hours' day` is `1 day`. The evaluator
+  # casts to the bare type, so it would compare the value Postgres rounds or cuts: refuse the
+  # modifier instead. A precision of 6 on a time or a timestamp is the one Postgres holds them at,
+  # so it changes no value and the cast is the bare type's.
+  defp node_to_ast(%PgQuery.TypeName{typmods: [_ | _]} = name, %{names: names} = children, a, b) do
+    with {:ok, type} <- get_type_from_pg_name(names, name.location) do
+      if type in [:time, :timetz, :timestamp, :timestamptz] and full_precision?(name.typmods),
+        do: node_to_ast(%{name | typmods: []}, children, a, b),
+        else: {:error, {name.location, "type modifiers are not supported in a cast"}}
+    end
+  end
+
   defp node_to_ast(%PgQuery.TypeName{} = name, %{names: names}, _, _) do
     with {:ok, type} <- get_type_from_pg_name(names, name.location) do
       case name.array_bounds do
@@ -973,12 +1097,53 @@ defmodule Electric.Replication.Eval.Parser do
     {:ok, %RowExpr{elements: args, type: {:row, Enum.map(args, & &1.type)}, location: location}}
   end
 
+  # Postgres orders the snapshot by the database collation; this evaluator filters the live tail
+  # byte-wise and cannot honour any other ordering. `C`/`POSIX` IS byte order, so it is the one
+  # collation both sides agree on, letting a shape pin ordering explicitly.
+  # Refuse the rest rather than byte-compare them anyway, which would silently put snapshot and live
+  # tail on different orderings. The whole qualified name is matched: `C` in another schema is a
+  # collation someone created, and it orders however it was created to.
+  @byte_order_collations [["C"], ["POSIX"], ["pg_catalog", "C"], ["pg_catalog", "POSIX"]]
+
+  defp node_to_ast(%PgQuery.CollateClause{location: loc}, %{arg: arg} = children, _, %{env: env}) do
+    case children |> Map.get(:collname, []) |> List.wrap() do
+      collation when collation in @byte_order_collations ->
+        with {:ok, [arg]} <- cast_unknowns([arg], [:text], env) do
+          {:ok, collate(arg, List.last(collation), loc)}
+        end
+
+      other ->
+        {:error,
+         {loc,
+          "COLLATE #{inspect(Enum.join(other, "."))} is not supported: this evaluator compares byte-wise, so only C and POSIX stay consistent with Postgres"}}
+    end
+  end
+
   # If nothing matched, fail
   defp node_to_ast(%type_module{} = node, _children, _, _) do
     {:error,
      {Map.get(node, :location, 0),
       "#{type_module |> Module.split() |> List.last()} is not supported in this context"}}
   end
+
+  # Keep column references usable as subquery keys and filter index fields.
+  defp collate(%Ref{} = ref, collation, _loc), do: %{ref | collation: collation}
+
+  defp collate(arg, collation, loc) do
+    %Func{
+      name: "COLLATE " <> collation,
+      args: [arg],
+      type: arg.type,
+      implementation: &Function.identity/1,
+      immutable?: false,
+      location: loc
+    }
+  end
+
+  defp full_precision?([%PgQuery.Node{node: {:a_const, %PgQuery.A_Const{val: {:ival, ival}}}}]),
+    do: match?(%PgQuery.Integer{ival: 6}, ival)
+
+  defp full_precision?(_typmods), do: false
 
   defp get_type_from_pg_name(["pg_catalog", type_name], _) when type_name in @valid_types,
     do: {:ok, String.to_existing_atom(type_name)}
@@ -1059,8 +1224,8 @@ defmodule Electric.Replication.Eval.Parser do
 
       {name, impl} =
         case expr.kind do
-          :AEXPR_OP_ANY -> {"any", &Enum.any?/1}
-          :AEXPR_OP_ALL -> {"all", &Enum.all?/1}
+          :AEXPR_OP_ANY -> {"any", &Casting.pg_any/1}
+          :AEXPR_OP_ALL -> {"all", &Casting.pg_all/1}
         end
 
       {:ok,
@@ -1156,6 +1321,7 @@ defmodule Electric.Replication.Eval.Parser do
 
     with {:ok, choices} <- find_available_operators(name, arity, location, env),
          {:ok, concrete} <- Lookups.pick_concrete_operator_overload(choices, args, env),
+         :ok <- validate_comparable_elements(concrete, location, env),
          {:ok, args} <- cast_unknowns(args, concrete.args, env),
          {:ok, args} <- cast_implicit(args, concrete.args, env) do
       {:ok, from_concrete(concrete, args)}
@@ -1164,6 +1330,29 @@ defmodule Electric.Replication.Eval.Parser do
       :error -> {:error, {location, "Could not select an operator overload"}}
     end
   end
+
+  # json, jsonb and bytea values are held as the text Postgres sent (their input functions are
+  # no-ops), so no operator over them exists. The array operators are generic over the element
+  # type and would compare that text: a bytea literal in upper-case hex would differ from the
+  # lower-case hex the replication stream carries, and so would a jsonb object written with its
+  # keys in another order. Null tests stay available, as for a single value. A clause parsed with
+  # `allow_enums`, a subset's, runs only in Postgres, which compares these values itself.
+  @raw_text_types [:json, :jsonb, :bytea]
+
+  defp validate_comparable_elements(_concrete, _location, %Env{allow_enums: true}), do: :ok
+
+  defp validate_comparable_elements(%{returns: :bool, args: args}, location, _env) do
+    case Enum.find(args, &match?({:array, type} when type in @raw_text_types, &1)) do
+      nil -> :ok
+      type -> {:error, {location, "Cannot compare values of type #{readable(type)}"}}
+    end
+  end
+
+  defp validate_comparable_elements(_concrete, _location, _env), do: :ok
+
+  # A shape's query writes an array constant as `ARRAY[...]`, which has no lower bounds, so Postgres
+  # would compare another value than the one the where clause names.
+  @bounded_constant_error "array constants with lower bounds other than 1 are not supported"
 
   defp explicit_cast_const(
          %Const{type: type, value: value, meta: meta} = const,
@@ -1174,6 +1363,9 @@ defmodule Electric.Replication.Eval.Parser do
       case try_applying(%{func | args: [value]}) do
         {:ok, result_const} ->
           {:ok, %{result_const | meta: meta}}
+
+        {:error, {_location, @bounded_constant_error}} = error ->
+          error
 
         {:error, _} ->
           {:error,
@@ -1385,6 +1577,7 @@ defmodule Electric.Replication.Eval.Parser do
 
        %UnknownConst{value: value, location: loc, meta: meta}, type ->
          case Env.parse_const(env, value, type) do
+           {:ok, %PgInterop.Array.Bounded{}} -> throw({:error, {loc, @bounded_constant_error}})
            {:ok, value} -> %Const{type: type, location: loc, value: value, meta: meta}
            :error -> throw({:error, {loc, "invalid syntax for type #{readable(type)}: #{value}"}})
          end
@@ -1411,7 +1604,7 @@ defmodule Electric.Replication.Eval.Parser do
         {:ok, %Const{type: :int8, value: value, location: loc}}
 
       {:fval, value} ->
-        {:ok, %Const{type: :numeric, value: String.to_float(value), location: loc}}
+        make_numeric_const(value, loc)
 
       {:boolval, value} ->
         {:ok, %Const{type: :bool, value: value, location: loc}}
@@ -1423,6 +1616,65 @@ defmodule Electric.Replication.Eval.Parser do
         {:error, {loc, "BitString values are not supported"}}
     end
   end
+
+  # pg_query's ival field is a 32-bit int and Postgres renders FCONST verbatim, so everything wider
+  # than int4 arrives here as its literal text: bigints, exponents, a bare leading or trailing decimal
+  # point, PG16 digit separators and radix prefixes.
+  defp make_numeric_const(literal, loc) do
+    digits = String.replace(literal, "_", "")
+
+    case parse_pg_integer(digits) do
+      {:ok, value} when is_pg_int4(value) ->
+        {:ok, %Const{type: :int4, value: value, location: loc}}
+
+      {:ok, value} when is_pg_int8(value) ->
+        {:ok, %Const{type: :int8, value: value, location: loc}}
+
+      {:ok, value} ->
+        {:ok, %Const{type: :numeric, value: value * 1.0, location: loc}}
+
+      :error ->
+        case Float.parse(pad_decimal_point(digits)) do
+          {value, ""} ->
+            value = unsign_numeric_zero(value, digits)
+            {:ok, %Const{type: :numeric, value: value, location: loc}}
+
+          _ ->
+            {:error, {loc, "unsupported numeric literal #{literal}"}}
+        end
+    end
+  rescue
+    ArithmeticError -> {:error, {loc, "numeric literal #{literal} is out of range"}}
+  end
+
+  defp pad_decimal_point(digits) do
+    digits
+    |> String.replace(~r/^(-?)\./, "\\g{1}0.")
+    |> String.replace(~r/\.(?=[^0-9]|$)/, ".0")
+  end
+
+  defp parse_pg_integer("-" <> digits) do
+    with {:ok, value} <- parse_pg_integer(digits), do: {:ok, -value}
+  end
+
+  defp parse_pg_integer(<<?0, radix, digits::binary>>) when radix in ~c"xXoObB" do
+    parse_in_base(digits, base_of(radix))
+  end
+
+  defp parse_pg_integer(digits), do: parse_in_base(digits, 10)
+
+  defp parse_in_base("", _base), do: :error
+
+  defp parse_in_base(digits, base) do
+    case Integer.parse(digits, base) do
+      {value, ""} -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp base_of(radix) when radix in ~c"xX", do: 16
+  defp base_of(radix) when radix in ~c"oO", do: 8
+  defp base_of(radix) when radix in ~c"bB", do: 2
 
   defp from_concrete(concrete, args) do
     # Commutative overload is an operator overload that accepts same arguments
@@ -1463,7 +1715,7 @@ defmodule Electric.Replication.Eval.Parser do
       end
 
     %Func{
-      implementation: concrete.implementation,
+      implementation: implementation(concrete),
       name: concrete.name,
       args: args,
       type: concrete.returns,
@@ -1473,6 +1725,24 @@ defmodule Electric.Replication.Eval.Parser do
       immutable?: Map.get(concrete, :immutable?, true)
     }
   end
+
+  # `=`, `<>`, `@>`, `<@` and `&&` between two arrays compare elements, and their definitions see
+  # only Elixir terms, which tell apart values the element type calls equal: `-0.0` and `0.0` in a
+  # float array, the integer an explicit `ARRAY[0]::float8[]` keeps, two spellings of one time or
+  # interval. Each of them gets the element type its `anyarray` arguments resolved to.
+  @element_typed_array_comparisons %{
+    ~s|"="| => :array_equal?,
+    ~s|"<>"| => :array_not_equal?,
+    ~s|"@>"| => :left_array_contains_right?,
+    ~s|"<@"| => :right_array_contains_left?,
+    ~s|"&&"| => :arrays_overlap?
+  }
+
+  defp implementation(%{args: [{:array, type}, {:array, type}], name: name})
+       when is_map_key(@element_typed_array_comparisons, name),
+       do: {Env.KnownFunctions, Map.fetch!(@element_typed_array_comparisons, name), [type]}
+
+  defp implementation(concrete), do: concrete.implementation
 
   defp do_maybe_reduce(%Func{} = fun), do: maybe_reduce(fun)
   defp do_maybe_reduce(%Const{} = const), do: {:ok, const}
@@ -1520,8 +1790,12 @@ defmodule Electric.Replication.Eval.Parser do
           {value, {any_nils? or Enum.any?(value, &is_nil/1), all_const?}}
 
         # Seeing an unreduced array guarantees that one of the elements is not a constant
-        {%Array{elements: elements}, _}, {any_nils?, _all_const?} ->
+        {%Array{elements: elements}, ^position}, {any_nils?, _all_const?} ->
           {elements, {any_nils? or Enum.any?(elements, &match?(%Const{value: nil}, &1)), false}}
+
+        # Anywhere else it is an `ARRAY[...]` argument, which a NULL element does not make NULL.
+        {%Array{}, _}, {any_nils?, _all_const?} ->
+          {:not_used, {any_nils?, false}}
 
         {%Const{value: nil}, _}, {_any_nils?, all_const?} ->
           {nil, {true, all_const?}}
@@ -1548,40 +1822,19 @@ defmodule Electric.Replication.Eval.Parser do
     end
   end
 
-  defp try_applying(
-         %Func{args: args, implementation: impl, map_over_array_in_pos: map_over_array_in_pos} =
-           func
-       ) do
-    value =
-      case {impl, map_over_array_in_pos} do
-        {{module, function}, nil} ->
-          apply(module, function, args)
+  defp try_applying(%Func{args: args} = func) do
+    case Func.apply_to(func, args) do
+      %PgInterop.Array.Bounded{} ->
+        {:error, {func.location, @bounded_constant_error}}
 
-        {function, nil} ->
-          apply(function, args)
-
-        {{module, function}, 0} ->
-          Utils.deep_map(hd(args), &apply(module, function, [&1 | tl(args)]))
-
-        {function, 0} ->
-          Utils.deep_map(hd(args), &apply(function, [&1 | tl(args)]))
-
-        {{module, function}, pos} ->
-          Utils.deep_map(
-            Enum.at(args, pos),
-            &apply(module, function, List.replace_at(args, pos, &1))
-          )
-
-        {function, pos} ->
-          Utils.deep_map(Enum.at(args, pos), &apply(function, List.replace_at(args, pos, &1)))
-      end
-
-    {:ok,
-     %Const{
-       value: value,
-       type: func.type,
-       location: func.location
-     }}
+      value ->
+        {:ok,
+         %Const{
+           value: value,
+           type: func.type,
+           location: func.location
+         }}
+    end
   rescue
     e ->
       Logger.warning(Exception.format(:error, e, __STACKTRACE__))
@@ -1700,23 +1953,60 @@ defmodule Electric.Replication.Eval.Parser do
              %{encountered_sublinks: 0},
              ctx
            ) do
-      %PgQuery.ParseResult{
-        version: 170_007,
-        stmts: [
-          %PgQuery.RawStmt{
-            stmt: %PgQuery.Node{
-              node:
-                {:select_stmt,
-                 %PgQuery.SelectStmt{
-                   where_clause: rebuilt_protobuf
-                 }}
-            }
-          }
-        ]
-      }
-      |> PgQuery.protobuf_to_query!()
-      |> String.replace_prefix("SELECT WHERE ", "")
+      query = deparse_where(rebuilt_protobuf)
+
+      qualified_sql =
+        if String.contains?(query, " COLLATE ") do
+          qualified = qualify_byte_collations(rebuilt_protobuf)
+          if qualified != rebuilt_protobuf, do: deparse_where(qualified)
+        end
+
+      {query, qualified_sql}
     end
+  end
+
+  defp deparse_where(where_clause) do
+    %PgQuery.ParseResult{
+      version: 170_007,
+      stmts: [
+        %PgQuery.RawStmt{
+          stmt: %PgQuery.Node{
+            node: {:select_stmt, %PgQuery.SelectStmt{where_clause: where_clause}}
+          }
+        }
+      ]
+    }
+    |> PgQuery.protobuf_to_query!()
+    |> String.replace_prefix("SELECT WHERE ", "")
+  end
+
+  # Keep the normalized spelling in the shape identity and qualify only the SQL we execute.
+  defp qualify_byte_collations(ast) do
+    {:ok, qualified} = Walker.fold(ast, &qualify_byte_collation/3)
+    qualified
+  end
+
+  defp qualify_byte_collation(
+         %PgQuery.CollateClause{} = clause,
+         %{arg: arg, collname: [%PgQuery.Node{node: {:string, %{sval: name}}} = collation]},
+         _
+       )
+       when name in ["C", "POSIX"] do
+    schema = %PgQuery.Node{node: {:string, %PgQuery.String{sval: "pg_catalog"}}}
+    {:ok, %{clause | arg: arg, collname: [schema, collation]}}
+  end
+
+  defp qualify_byte_collation(
+         %PgQuery.SubLink{subselect: %{node: {:select_stmt, stmt}} = subselect} = sublink,
+         children,
+         _
+       ) do
+    stmt = %{stmt | where_clause: qualify_byte_collations(stmt.where_clause)}
+    {:ok, %{Map.merge(sublink, children) | subselect: %{subselect | node: {:select_stmt, stmt}}}}
+  end
+
+  defp qualify_byte_collation(node, children, _) do
+    replace_query_parts(node, children, nil, nil)
   end
 
   defp replace_query_parts(

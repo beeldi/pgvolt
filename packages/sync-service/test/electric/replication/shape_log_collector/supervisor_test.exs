@@ -39,21 +39,21 @@ defmodule Electric.Replication.ShapeLogCollector.SupervisorTest do
 
   test "shuts down when processor is shut down normally", %{monitor_ref: ref} = ctx do
     ctx.stack_id |> ShapeLogCollector.name() |> GenServer.stop()
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
   end
 
   test "shuts down when processor is shut down abnormally", %{monitor_ref: ref} = ctx do
     ctx.stack_id |> ShapeLogCollector.name() |> GenServer.stop(:whatever)
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
   end
 
   test "shuts down when registrator is shut down normally", %{monitor_ref: ref} = ctx do
     ctx.stack_id |> ShapeLogCollector.name() |> GenServer.stop()
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
   end
 
   test "shuts down when registrator is shut down abnormally", %{monitor_ref: ref} = ctx do
     ctx.stack_id |> ShapeLogCollector.name() |> GenServer.stop(:whatever)
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}, 1000
+    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
   end
 end

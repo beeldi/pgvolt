@@ -57,9 +57,6 @@ defmodule ElectricTelemetry.Processes do
     |> Enum.take(count)
   end
 
-  # When sorting by binary mem, processes double-count the same refc binary, so it doesn't
-  # make sense to talk about a "percentage of the total" in that case.
-  # Instead, for binary memory telemetry the low cutoff threshold should be provided.
   defp top_by(:proc_mem, process_list, {:mem_percent, percent})
        when is_valid_mem_percent(percent) do
     # :processes_used excludes memory allocated but not yet used by process heaps,
@@ -70,6 +67,20 @@ defmodule ElectricTelemetry.Processes do
     process_list
     |> sorted_groups(:proc_mem)
     |> take_until_target(:proc_mem, target, @min_group_memory)
+  end
+
+  # A single top_process_limit feeds both the process and binary-memory series, so binary
+  # memory has to honour :mem_percent too. Per-process binary figures double-count a refc
+  # binary shared across processes, so the percentage is measured against the VM-wide
+  # :binary total (each shared binary counted once) rather than the summed per-group figures.
+  defp top_by(:binary_mem, process_list, {:mem_percent, percent})
+       when is_valid_mem_percent(percent) do
+    total_binary_memory = :erlang.memory(:binary)
+    target = total_binary_memory * percent / 100
+
+    process_list
+    |> sorted_groups(:binary_mem)
+    |> take_until_target(:binary_mem, target, @min_group_memory)
   end
 
   defp top_by(sort_key, process_list, {:at_least_bytes, low_cutoff})
@@ -185,9 +196,10 @@ defmodule ElectricTelemetry.Processes do
     with [] <- info[:registered_name], do: nil
   end
 
+  # The nearest named ancestor: an unnamed parent puts its pid ahead of the names above it.
   defp ancestor_name(info) do
     case dictionary_value(info, @ancestors_key) do
-      [name | _] when is_atom(name) and not is_nil(name) -> name
+      ancestors when is_list(ancestors) -> Enum.find(ancestors, &(is_atom(&1) and not is_nil(&1)))
       _ -> nil
     end
   end
