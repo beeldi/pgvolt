@@ -1,0 +1,89 @@
+name: Release sync-service Docker Image
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (for example v1.8.0-pgvolt.1)'
+        required: true
+        type: string
+      also_latest:
+        description: 'Also update the latest tag'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ensure_image:
+    uses: ./.github/workflows/ensure_sync_service_image.yml
+    permissions:
+      contents: read
+      packages: write
+
+  tag_release:
+    needs: ensure_image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate release tag
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_LATEST: ${{ inputs.also_latest }}
+        run: |
+          if [ "$EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_TAG"
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              latest="false"
+            else
+              latest="true"
+            fi
+          else
+            tag="$INPUT_TAG"
+            latest="$INPUT_LATEST"
+          fi
+
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish release tags without rebuilding
+        env:
+          SOURCE_IMAGE: ${{ needs.ensure_image.outputs.image }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          ALSO_LATEST: ${{ steps.meta.outputs.latest }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}/sync-service"
+          if [ "$ALSO_LATEST" = "true" ]; then
+            docker buildx imagetools create \
+              -t "${image}:${RELEASE_TAG}" \
+              -t "${image}:latest" \
+              "$SOURCE_IMAGE"
+          else
+            docker buildx imagetools create \
+              -t "${image}:${RELEASE_TAG}" \
+              "$SOURCE_IMAGE"
+          fi
