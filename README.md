@@ -104,34 +104,54 @@ need joins the list in the merge commit.
 - [About this fork](#about-this-fork)
   - [Branches](#branches)
   - [Merging upstream](#merging-upstream)
-- [What is Electric?](#what-is-electric)
+- [How it works](#how-it-works)
 - [Getting Started](#getting-started)
 - [HTTP API Docs](#http-api-docs)
 - [Phoenix LiveDashboard](#phoenix-livedashboard)
-- [Developing Electric](#developing-electric)
+- [Developing PgVolt](#developing-pgvolt)
   - [Mac setup](#mac-setup)
   - [Running Tests](#running-tests)
 - [Contributing](#contributing)
 - [Support](#support)
 
-## What is Electric?
+## How it works
 
-Sync is the magic ingredient behind fast, modern software. From apps like Figma and Linear to AI agents running on live local data.
+Sync is the magic ingredient behind fast, modern software, from apps like Figma and Linear to AI agents running on live local data.
 
-Electric is a Postgres sync engine. It solves the hard problems of sync for you, including partial replication, fan-out, and data delivery. So you can build awesome software, without rolling your own sync.
+PgVolt is a Postgres sync engine, forked from [Electric](https://github.com/electric-sql/electric). It solves the hard problems of sync for you, including partial replication, fan-out, and data delivery, so you can build fast software without rolling your own sync.
 
-Specifically, Electric is a read-path sync engine for Postgres. It syncs data out of Postgres into ... anything you like. The core sync protocol is based on a low-level [HTTP API](https://electric-sql.com/docs/api/http). This integrates with CDNs for highly-scalable data delivery.
+Specifically, it is a read-path sync engine for Postgres. It syncs data out of Postgres into anything you like. The core sync protocol is based on a low-level [HTTP API](https://electric-sql.com/docs/api/http) that integrates with CDNs for highly-scalable data delivery.
 
-Partial replication is managed using [Shapes](https://electric-sql.com/docs/guides/shapes). Sync can be consumed directly or via [client libraries](https://electric-sql.com/docs/api/clients/typescript) and [framework integrations](https://electric-sql.com/docs/api/integrations/react).
+Partial replication is managed using [Shapes](https://electric-sql.com/docs/guides/shapes). Sync can be consumed directly or via upstream [client libraries](https://electric-sql.com/docs/api/clients/typescript) and [framework integrations](https://electric-sql.com/docs/api/integrations/react).
 
 ## Getting Started
 
 See the [Quickstart guide](https://electric-sql.com/docs/quickstart) to get up and running. In short, you need to:
 
-1. have a Postgres database with logical replication enabled; and then to
-2. run Electric in front of it, connected via `DATABASE_URL`
+1. have a Postgres database with logical replication enabled; and then
+2. run PgVolt in front of it, connected via `DATABASE_URL`
 
-For example, using [Docker Compose](https://docs.docker.com/compose/) from the root of this repo. `--build` builds the sync service from this checkout; without it Compose pulls upstream's image:
+### Drop-in container image
+
+Replace upstream's `electricsql/electric` image with PgVolt's published `linux/amd64` image from [GitHub Packages](https://github.com/beeldi/pgvolt/pkgs/container/pgvolt%2Fsync-service) (pin a release tag from [Releases](https://github.com/beeldi/pgvolt/releases), or use `latest`):
+
+```yaml
+services:
+  pgvolt:
+    # Drop-in replacement for electricsql/electric:1.8.0
+    image: ghcr.io/beeldi/pgvolt/sync-service:v1.8.0-pgvolt.1
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/electric?sslmode=disable
+      ELECTRIC_SECRET: your-secret
+    ports:
+      - '3000:3000'
+```
+
+> **Switching from upstream:** The release image is distroless `cc-debian12` and runs as `65534:65534` (not root). `chown -R 65534:65534` any existing storage volume first, configure health checks against `/v1/health` (there is no `curl` in the image), and check [Before you switch](fork/CHANGES.md#before-you-switch) for default differences.
+
+### Local Docker Compose from source
+
+Using [Docker Compose](https://docs.docker.com/compose/) from the root of this repo. `--build` builds the sync service from this checkout; without it Compose pulls upstream's image:
 
 ```sh
 docker compose -f .support/docker-compose.yml up --build
@@ -169,7 +189,7 @@ The HTTP API is defined in an [OpenAPI spec](https://swagger.io/specification/) 
 
 ## Phoenix LiveDashboard
 
-Electric includes an optional [Phoenix LiveDashboard](https://github.com/phoenixframework/phoenix_live_dashboard) for real-time monitoring of the running system (VM metrics, process info, ETS tables, etc.).
+PgVolt includes an optional [Phoenix LiveDashboard](https://github.com/phoenixframework/phoenix_live_dashboard) for real-time monitoring of the running system (VM metrics, process info, ETS tables, etc.).
 
 To enable it, set the `ELECTRIC_LIVE_DASHBOARD_PORT` environment variable:
 
@@ -179,11 +199,11 @@ ELECTRIC_LIVE_DASHBOARD_PORT=4000
 
 The dashboard will be available at `http://localhost:4000` (or whichever port you choose). When the variable is not set, the dashboard is not started.
 
-In this fork the dashboard listens on loopback only, `127.0.0.1` or `::1` with `ELECTRIC_LISTEN_ON_IPV6=true`. Set `ELECTRIC_LIVE_DASHBOARD_ADDRESS`, for example to `0.0.0.0`, to reach it from another host.
+In PgVolt, the dashboard listens on loopback only, `127.0.0.1` or `::1` with `ELECTRIC_LISTEN_ON_IPV6=true`. Set `ELECTRIC_LIVE_DASHBOARD_ADDRESS`, for example to `0.0.0.0`, to reach it from another host.
 
 > **WARNING: The LiveDashboard endpoint is completely unauthenticated.** Anyone with network access to the port can view internal system state. Before listening on another address, you **must** restrict access to this port using firewall rules, network policies, or similar controls. Do not expose it to the public internet.
 
-## Developing Electric
+## Developing PgVolt
 
 We use [asdf](https://asdf-vm.com/) to install Elixir, Erlang, and Node.js. Versions are defined in [.tool-versions](.tool-versions).
 
@@ -202,7 +222,7 @@ You'll probably need to fiddle with your bash/zsh/etc rc file to load the right 
 
 ### Running Tests
 
-Electric has comprehensive test suites for both Elixir and TypeScript components.
+PgVolt has comprehensive test suites for both Elixir and TypeScript components.
 
 #### Prerequisites
 
@@ -285,5 +305,5 @@ See the:
 
 ## Support
 
-Open an issue in this repository for bugs in the fork. Questions about Electric in general are
+Open an issue in this repository for bugs in PgVolt. Questions about upstream Electric in general are
 better served by upstream's documentation and community.
